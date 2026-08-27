@@ -24,12 +24,25 @@ DEFAULT_MODEL = "gemini-3.7-flash"
 PACKAGE_NAME = "com.tencent.hunyuan.app.chat"
 ALLOWED_ACTIONS = {"tap", "swipe", "type", "key", "wait", "done"}
 MAX_STEPS = 20
+HISTORY_SUMMARY_LIMIT = 500
 NUMERIC_KEYCODES = {
     "4": "KEYCODE_BACK",
     "61": "KEYCODE_TAB",
     "66": "KEYCODE_ENTER",
     "67": "KEYCODE_DEL",
 }
+
+SYSTEM_PROMPT = (
+    "你是 Android 无障碍操作代理。每次只返回一个 JSON 对象，不要 markdown，不要解释。\n"
+    "允许 action: tap(x,y), swipe(x1,y1,x2,y2,duration_ms), type(text), "
+    "key(keycode), wait(seconds), done。坐标是当前截图的像素坐标，屏幕左上角为 0,0。\n"
+    "必须优先使用截图中可见文字/控件；不要猜测屏幕外坐标。状态没有变化时不要重复同一动作。\n"
+    "福利中心的‘去提问’点击后可能关闭网页并返回‘我们’页；此时要点击底部‘问元宝’进入输入页。\n"
+    "在‘我们’页，‘福利中心’按钮位于截图约 (640,486)，不要把上方‘录音’卡片当成福利中心。\n"
+    "在福利中心，顶部‘每日问元宝得积分’区域的‘去提问’约为 (670,361)；返回‘我们’后，底部‘问元宝’约为 (111,1290)。\n"
+    "只有确认消息列表出现用户发送的数字 1 且输入框恢复占位符后，才返回 "
+    '{"action":"done","reason":"..."}。'
+)
 
 
 @dataclass(frozen=True)
@@ -138,6 +151,27 @@ def encode_image(image: bytes) -> str:
     return "data:image/png;base64," + base64.b64encode(image).decode("ascii")
 
 
+def append_history(
+    history: list[dict[str, Any]], step: int, ui: str, action: dict[str, Any]
+) -> None:
+    """归档已完成回合的最小文本信息，不把旧截图或完整层级带入下一请求。"""
+    stage = screen_stage(ui)
+    summary = (
+        f"历史回合 {step} 的观测摘要（无截图，当前页面以最新截图为准）："
+        f"页面阶段={stage}"
+    )[:HISTORY_SUMMARY_LIMIT]
+    history.extend(
+        [
+            {"role": "user", "content": summary},
+            {"role": "assistant", "content": action_signature(action)},
+            {
+                "role": "user",
+                "content": "编排器已执行上一动作；下一步必须以最新屏幕观测为准。",
+            },
+        ]
+    )
+
+
 def parse_action(text: str) -> dict[str, Any]:
     """解析模型输出，允许模型包裹在 markdown JSON 代码块中。"""
     candidate = text.strip()
@@ -219,32 +253,22 @@ def ask_model(
     ui: str,
     goal: str,
     size: tuple[int, int],
-    previous_action: dict[str, Any] | None = None,
+    history: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     width, height = size
-    system = (
-        "你是 Android 无障碍操作代理。每次只返回一个 JSON 对象，不要 markdown，不要解释。\n"
-        "允许 action: tap(x,y), swipe(x1,y1,x2,y2,duration_ms), type(text), "
-        "key(keycode), wait(seconds), done。坐标是当前截图的像素坐标，屏幕左上角为 0,0。\n"
-        "必须优先使用截图中可见文字/控件；不要猜测屏幕外坐标。状态没有变化时不要重复同一动作。\n"
-        "福利中心的‘去提问’点击后可能关闭网页并返回‘我们’页；此时要点击底部‘问元宝’进入输入页。\n"
-        "在‘我们’页，‘福利中心’按钮位于截图约 (640,486)，不要把上方‘录音’卡片当成福利中心。\n"
-        "在福利中心，顶部‘每日问元宝得积分’区域的‘去提问’约为 (670,361)；返回‘我们’后，底部‘问元宝’约为 (111,1290)。\n"
-        "只有确认消息列表出现用户发送的数字 1 且输入框恢复占位符后，才返回 "
-        "{\"action\":\"done\",\"reason\":\"...\"}。"
-    )
+    history = history or []
     stage = screen_stage(ui)
-    previous = action_signature(previous_action) if previous_action else "(无)"
     user_text = (
         f"目标：{goal}\n当前屏幕尺寸：{width}x{height}\n"
-        f"根据层级推断的页面阶段：{stage}\n上一步动作：{previous}\n"
+        f"根据层级推断的页面阶段：{stage}\n"
         "以下是压缩后的无障碍层级，仅作为辅助，截图是最终依据：\n"
         f"{ui or '(无可用层级信息)'}"
     )
     response = client.chat.completions.create(
         model=model,
         messages=[
-            {"role": "system", "content": system},
+            {"role": "system", "content": SYSTEM_PROMPT},
+            *history,
             {
                 "role": "user",
                 "content": [
@@ -276,7 +300,7 @@ def main() -> int:
     width, height = device.display_size()
     print(f"设备={args.device} 屏幕={width}x{height} 模型={args.model}")
 
-    previous_action: dict[str, Any] | None = None
+    history: list[dict[str, Any]] = []
     previous_state: str | None = None
     previous_action_key: str | None = None
     repeated_observation_count = 0
@@ -291,7 +315,7 @@ def main() -> int:
             ui,
             args.goal,
             (width, height),
-            previous_action,
+            history,
         )
         print(f"步骤 {step}: {json.dumps(action, ensure_ascii=False)}")
 
@@ -317,7 +341,7 @@ def main() -> int:
             return 0
         previous_state = current_state
         previous_action_key = current_action_key
-        previous_action = action
+        append_history(history, step, ui, action)
         time.sleep(0.8)
 
     raise RuntimeError("达到最大步骤数，未收到 done")

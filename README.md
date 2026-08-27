@@ -2,6 +2,8 @@
 
 这是一个使用本地视觉大模型，通过 Android 截图、无障碍层级和 ADB 操作腾讯元宝的自动化示例。模型每轮只提出一个白名单动作；Python 编排器负责阶段、前置条件、重试、任务计数、兑换证据和完成断言。
 
+同一次 `run_once`（通常是当天的一轮任务）会保留压缩后的观测、动作和结果历史；通用原型也采用同样的回合内历史布局。两条路径都只发送最新截图，不把历史图片或账号信息写入请求上下文，并保持静态提示和工具定义不变，以便支持前缀缓存的模型复用更长上文。
+
 [![测试](https://github.com/1deaaa/yuanbao-auto-daily/actions/workflows/test.yml/badge.svg)](https://github.com/1deaaa/yuanbao-auto-daily/actions/workflows/test.yml)
 
 ## 设备支持
@@ -70,6 +72,7 @@ systemctl --user enable --now yuanbao-daily.timer
 - [Waydroid 安装、网络与登录排查记录](元宝_Waydroid_安装网络与登录问题排查记录.md)：本机 Ubuntu KDE/Wayland 的问题证据和时间线，属于案例记录。
 - [视觉安卓代理调研](视觉安卓代理调研.md)：操控方案比较、视觉代理边界和后续演进方向。
 - [每日任务提示词](每日任务提示词.md)：模型工具协议和元宝任务流程。
+- [请求前缀缓存与上下文](docs/请求前缀缓存与上下文.md)：同轮历史消息、请求抓包和 token 前缀验证。
 
 ## 使用边界
 

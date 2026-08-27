@@ -47,6 +47,8 @@ DEFAULT_STOP_WAYDROID_AFTER_RUN = True
 WAYDROID_START_TIMEOUT = 90
 WAYDROID_STOP_TIMEOUT = 45
 WAYDROID_POLL_INTERVAL = 1.0
+MAX_HISTORY_SUMMARY_CHARS = 1200
+MAX_HISTORY_RESULT_CHARS = 1200
 IGNORED_TASKS = ("邀请新用户", "使用推荐模板做同款")
 
 
@@ -1435,11 +1437,16 @@ class VisionModel:
         self.config = config
         self.client = OpenAI(api_key=config.api_key, base_url=config.base_url)
         self.tools_supported = True
-        self.last_result: str = ""
-        self.system_prompt = load_prompt(config.prompt_path)
-
-    def _system(self, context: str) -> str:
-        return f"{self.system_prompt}\n\n当前编排状态：\n{context}"
+        # 系统提示必须在同一轮请求中完全一致；动态状态放到最新 user 消息末尾。
+        # 端点不支持 tools 时也沿用同一份静态协议，避免降级请求改变前缀。
+        self.system_prompt = (
+            load_prompt(config.prompt_path).rstrip()
+            + '\n\n协议兼容说明：若当前端点不支持 tools，请只输出'
+            + ' {"tool":"工具名","arguments":{}}；支持 tools 时仍只调用一个工具。'
+        )
+        self.history: list[dict[str, Any]] = []
+        self._pending_turn: dict[str, Any] | None = None
+        self._turn_number = 0
 
     def _request(self, messages: list[dict[str, Any]]) -> Any:
         kwargs: dict[str, Any] = {
@@ -1467,16 +1474,7 @@ class VisionModel:
             if self.tools_supported and isinstance(exc, BadRequestError) and tools_unsupported:
                 # 一些 OpenAI 兼容端点实现了视觉输入却没有 function tools，降级为严格 JSON。
                 self.tools_supported = False
-                return self.client.chat.completions.create(
-                    model=self.config.model_id,
-                    messages=messages
-                    + [
-                        {
-                            "role": "system",
-                            "content": "当前端点不支持 tools；请只输出 JSON：{\"tool\":工具名,\"arguments\":{}}。",
-                        }
-                    ],
-                )
+                return self.client.chat.completions.create(model=self.config.model_id, messages=messages)
             raise exc
 
     def _with_retries(self, operation: Callable[[], Any], label: str) -> Any:
@@ -1492,15 +1490,44 @@ class VisionModel:
                 time.sleep(self.config.retry_cooldown_seconds)
         raise AgentError(f"{label}连续失败：{type(last).__name__ if last else '未知错误'}") from last
 
-    def next_tool(self, observation: Observation, context: str) -> tuple[str, dict[str, Any], str]:
+    @staticmethod
+    def _result_json(result: ToolResult) -> str:
+        payload = {"ok": result.ok, "message": result.message, **result.data}
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))[
+            :MAX_HISTORY_RESULT_CHARS
+        ]
+
+    @staticmethod
+    def _action_json(name: str, args: dict[str, Any]) -> str:
+        return json.dumps(
+            {"tool": name, "arguments": args},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    @staticmethod
+    def _history_summary(context: str, observation: Observation, turn_number: int) -> str:
+        # 历史只保留编排状态和页面定位信息；截图、完整 UI 和可能的用户输入不回放。
+        summary = (
+            f"历史回合 {turn_number} 的观测摘要（仅作上下文，当前页面以最新截图为准）：\n"
+            f"编排状态：{context}\n"
+            f"Activity：{observation.activity or '(未知)'}\n"
+            f"页面阶段：{observation.stage or '(未知)'}"
+        )
+        return summary[:MAX_HISTORY_SUMMARY_CHARS]
+
+    @staticmethod
+    def _current_observation(observation: Observation, context: str) -> dict[str, Any]:
         user_text = (
-            f"{context}\n当前 Activity：{observation.activity}\n当前页面阶段：{observation.stage}\n"
+            "当前屏幕观测（这是本轮唯一的最新页面依据）：\n"
+            f"编排状态：{context}\n"
+            f"当前 Activity：{observation.activity or '(未知)'}\n"
+            f"当前页面阶段：{observation.stage or '(未知)'}\n"
             "以下无障碍层级只作辅助，截图是最终依据：\n"
             f"{observation.ui or '(无可用层级信息)'}"
         )
-        if self.last_result:
-            user_text += f"\n上一动作执行结果（只作状态参考）：{self.last_result}"
-        user_message: dict[str, Any] = {
+        return {
             "role": "user",
             "content": [
                 {"type": "text", "text": user_text},
@@ -1513,8 +1540,12 @@ class VisionModel:
                 },
             ],
         }
+
+    def next_tool(self, observation: Observation, context: str) -> tuple[str, dict[str, Any], str]:
+        user_message = self._current_observation(observation, context)
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": self._system(context)},
+            {"role": "system", "content": self.system_prompt},
+            *self.history,
             user_message,
         ]
         response = self._with_retries(lambda: self._request(messages), "视觉模型调用")
@@ -1530,10 +1561,22 @@ class VisionModel:
                 raise AgentError("模型工具参数不是有效 JSON") from exc
             if not isinstance(args, dict):
                 raise AgentError("模型工具参数必须是 JSON 对象")
+            self._pending_turn = {
+                "context": context,
+                "observation": observation,
+                "name": call.function.name,
+                "args": args,
+            }
             return call.function.name, args, call.id
         content = message.content or ""
         action = self._parse_json_tool(content)
         call_id = "fallback-current"
+        self._pending_turn = {
+            "context": context,
+            "observation": observation,
+            "name": action[0],
+            "args": action[1],
+        }
         return action[0], action[1], call_id
 
     @staticmethod
@@ -1566,12 +1609,33 @@ class VisionModel:
         return name, args
 
     def record_tool_result(self, call_id: str, result: ToolResult) -> None:
-        content = json.dumps(
-            {"ok": result.ok, "message": result.message, **result.data},
-            ensure_ascii=False,
+        pending = self._pending_turn
+        if pending is None:
+            return
+        self._turn_number += 1
+        observation = pending["observation"]
+        self.history.extend(
+            [
+                {
+                    "role": "user",
+                    "content": self._history_summary(
+                        pending["context"], observation, self._turn_number
+                    ),
+                },
+                {
+                    "role": "assistant",
+                    "content": self._action_json(pending["name"], pending["args"]),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "编排器已执行上一动作，结果如下；下一步必须以最新屏幕观测为准：\n"
+                        + self._result_json(result)
+                    ),
+                },
+            ]
         )
-        # 下一轮只携带状态文本，不回放 tool_calls/tool 消息，兼容 Gemini 的轮次约束。
-        self.last_result = content
+        self._pending_turn = None
 
 
 @dataclass
@@ -1594,9 +1658,7 @@ class Workflow:
         )
         return (
             f"阶段={self.phase}; 当前目标={self.target or '无'}; 今日问元宝已完成={self.daily_done}; "
-            f"任务进度={progress}; 当前页面={observation.stage}; "
-            f"奖励使用证据={self.executor.reward_use_confirmed}; "
-            "永久忽略任务=邀请新用户、使用推荐模板做同款。"
+            f"任务进度={progress}; 奖励使用证据={self.executor.reward_use_confirmed}"
         )
 
     def _parse_report(self, args: dict[str, Any]) -> ToolResult:

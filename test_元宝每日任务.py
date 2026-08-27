@@ -1,4 +1,5 @@
 import os
+import json
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -7,6 +8,7 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 import 元宝每日任务 as task
+import 视觉安卓代理 as prototype
 
 
 class 假设备:
@@ -274,6 +276,129 @@ class 元宝任务测试(unittest.TestCase):
         self.assertEqual(
             task.VisionModel._parse_json_tool('```json\n{"tool":"open_welfare","arguments":{}}\n```'),
             ("open_welfare", {}),
+        )
+
+    def test_视觉请求保留同轮历史但只发送最新截图(self):
+        class 请求记录器:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, **kwargs):
+                self.calls.append(kwargs)
+                call_id = f"call-{len(self.calls)}"
+                call = SimpleNamespace(
+                    id=call_id,
+                    function=SimpleNamespace(name="wait_5s", arguments="{}"),
+                )
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(tool_calls=[call], content=None)
+                        )
+                    ]
+                )
+
+        recorder = 请求记录器()
+        fake_client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=recorder))
+        )
+        with patch("元宝每日任务.OpenAI", return_value=fake_client):
+            model = task.VisionModel(self.配置())
+        observations = [
+            task.Observation(
+                f"png-{index}".encode(),
+                f"xml-{index}",
+                f"ui-{index}",
+                (),
+                f"Activity/{index}",
+                "welfare",
+            )
+            for index in range(3)
+        ]
+        for index, observation in enumerate(observations):
+            name, args, call_id = model.next_tool(observation, f"phase={index}")
+            self.assertEqual((name, args), ("wait_5s", {}))
+            model.record_tool_result(call_id, task.ToolResult(index != 1, f"result-{index}"))
+
+        first, second, third = [item["messages"] for item in recorder.calls]
+        self.assertEqual([item["role"] for item in first], ["system", "user"])
+        self.assertEqual(
+            [item["role"] for item in second],
+            ["system", "user", "assistant", "user", "user"],
+        )
+        self.assertEqual(
+            [item["role"] for item in third],
+            ["system", "user", "assistant", "user", "user", "assistant", "user", "user"],
+        )
+        self.assertEqual(first[0]["content"], second[0]["content"])
+        self.assertEqual(recorder.calls[0]["tools"], recorder.calls[1]["tools"])
+        self.assertEqual(recorder.calls[1]["tools"], recorder.calls[2]["tools"])
+        self.assertEqual(recorder.calls[0]["tool_choice"], "auto")
+        self.assertEqual(recorder.calls[1]["tool_choice"], "auto")
+        self.assertIn("协议兼容说明", first[0]["content"])
+        self.assertNotIn("phase=0", first[0]["content"])
+        self.assertNotIn("ui-0", json.dumps(second[1:-1], ensure_ascii=False))
+        self.assertFalse(
+            any(
+                isinstance(message.get("content"), list)
+                and any(block.get("type") == "image_url" for block in message["content"])
+                for message in second[1:-1]
+            )
+        )
+        self.assertTrue(
+            any(block.get("type") == "image_url" for block in second[-1]["content"])
+        )
+        self.assertNotIn("上一动作执行结果", second[-1]["content"][0]["text"])
+        self.assertEqual(
+            json.dumps(second[:4], ensure_ascii=False, sort_keys=True),
+            json.dumps(third[:4], ensure_ascii=False, sort_keys=True),
+        )
+
+    def test_通用原型请求保留压缩历史(self):
+        class 请求记录器:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, **kwargs):
+                self.calls.append(kwargs)
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(
+                                content='{"action":"wait","seconds":1}'
+                            )
+                        )
+                    ]
+                )
+
+        recorder = 请求记录器()
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=recorder))
+        )
+        history = []
+        first = prototype.ask_model(
+            client, "test-model", b"png-1", "ui-1", "测试目标", (750, 1333), history
+        )
+        prototype.append_history(history, 1, "ui-1", first)
+        second = prototype.ask_model(
+            client, "test-model", b"png-2", "ui-2", "测试目标", (750, 1333), history
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(
+            [item["role"] for item in recorder.calls[1]["messages"]],
+            ["system", "user", "assistant", "user", "user"],
+        )
+        self.assertEqual(
+            recorder.calls[0]["messages"][0]["content"],
+            recorder.calls[1]["messages"][0]["content"],
+        )
+        self.assertNotIn("ui-1", json.dumps(recorder.calls[1]["messages"][1:-1]))
+        self.assertFalse(
+            any(
+                isinstance(message.get("content"), list)
+                and any(block.get("type") == "image_url" for block in message["content"])
+                for message in recorder.calls[1]["messages"][1:-1]
+            )
         )
 
 

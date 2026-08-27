@@ -1,0 +1,10 @@
+[Unit]
+Description=每天北京时间五点运行元宝任务
+
+[Timer]
+OnCalendar=*-*-* 05:00:00 Asia/Shanghai
+Persistent=true
+Unit=yuanbao-daily.service
+
+[Install]
+WantedBy=timers.target

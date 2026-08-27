@@ -1,0 +1,15 @@
+[Unit]
+Description=腾讯元宝每日任务
+After=graphical-session.target
+Wants=graphical-session.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/auto-daily
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=%h/auto-daily/.env
+ExecStart=%h/auto-daily/.venv/bin/python %h/auto-daily/元宝每日任务.py --once
+TimeoutStartSec=45min
+
+[Install]
+WantedBy=default.target

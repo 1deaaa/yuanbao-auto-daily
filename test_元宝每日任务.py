@@ -166,6 +166,37 @@ class 元宝任务测试(unittest.TestCase):
             timeout=30,
         )
 
+    def test_Waydroid刚启动时等待应用入口就绪(self):
+        device = task.Device("192.168.240.112:5555")
+        with (
+            patch.object(
+                device,
+                "adb",
+                side_effect=[
+                    b"priority=0 preferredOrder=0 match=0x108000 specificIndex=-1 isDefault=false\n",
+                    b"priority=0 preferredOrder=0 match=0x108000 specificIndex=-1 isDefault=false\n"
+                    b"com.example.test/.MainActivity\n",
+                    b"Starting: Intent { cmp=com.example.test/.MainActivity }",
+                ],
+            ) as adb,
+            patch("元宝每日任务.time.sleep"),
+        ):
+            device.launch_app("com.example.test")
+        self.assertEqual(adb.call_count, 3)
+        self.assertEqual(adb.call_args_list[0], adb.call_args_list[1])
+        self.assertEqual(adb.call_args_list[2].args[-1], "com.example.test/.MainActivity")
+
+    def test_后台Waydroid任务临时保持唤醒并恢复设置(self):
+        device = task.Device("192.168.240.112:5555")
+        with patch.object(device, "adb", side_effect=[b"0\n", b"", b"", b"7\n"]) as adb:
+            previous = device.keep_awake()
+            device.restore_keep_awake(previous)
+        self.assertEqual(previous, "0")
+        self.assertEqual(adb.call_args_list[0].args[-2:], ("global", "stay_on_while_plugged_in"))
+        self.assertEqual(adb.call_args_list[1].args[-3:], ("power", "stayon", "true"))
+        self.assertEqual(adb.call_args_list[2].args[-3:], ("power", "stayon", "false"))
+        self.assertEqual(adb.call_args_list[3].args[-3:], ("global", "stay_on_while_plugged_in", "0"))
+
     def test_显式设备发现不读取Waydroid状态(self):
         runtime = task.WaydroidRuntime()
         with (

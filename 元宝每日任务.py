@@ -47,6 +47,8 @@ DEFAULT_STOP_WAYDROID_AFTER_RUN = True
 WAYDROID_START_TIMEOUT = 90
 WAYDROID_STOP_TIMEOUT = 45
 WAYDROID_POLL_INTERVAL = 1.0
+APP_RESOLVE_TIMEOUT = 45
+APP_RESOLVE_POLL_INTERVAL = 1.0
 MAX_HISTORY_SUMMARY_CHARS = 1200
 MAX_HISTORY_RESULT_CHARS = 1200
 IGNORED_TASKS = ("邀请新用户", "使用推荐模板做同款")
@@ -352,6 +354,30 @@ class Device:
     def input(self, *args: str) -> None:
         self.adb("shell", "input", *args, timeout=15)
 
+    def keep_awake(self) -> str:
+        """临时阻止后台 Waydroid 因屏幕超时冻结，并返回原始设置。"""
+        previous = self.adb(
+            "shell", "settings", "get", "global", "stay_on_while_plugged_in", timeout=10
+        ).decode("utf-8", errors="replace").strip()
+        self.adb("shell", "svc", "power", "stayon", "true", timeout=10)
+        return previous
+
+    def restore_keep_awake(self, previous: str) -> None:
+        """恢复 keep_awake 修改过的 Android 全局设置。"""
+        self.adb("shell", "svc", "power", "stayon", "false", timeout=10)
+        if previous in {"", "null", "None"}:
+            self.adb("shell", "settings", "delete", "global", "stay_on_while_plugged_in", timeout=10)
+        else:
+            self.adb(
+                "shell",
+                "settings",
+                "put",
+                "global",
+                "stay_on_while_plugged_in",
+                previous,
+                timeout=10,
+            )
+
     def screenshot(self) -> bytes:
         image = self.adb("exec-out", "screencap", "-p", timeout=20)
         if not image.startswith(b"\x89PNG"):
@@ -396,27 +422,45 @@ class Device:
         """通过标准 Android Intent 启动应用，不依赖 Waydroid 命令。"""
         if not re.fullmatch(r"[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+", package_name):
             raise AgentError(f"应用包名格式错误：{package_name!r}")
+        deadline = time.monotonic() + APP_RESOLVE_TIMEOUT
+        resolved_activity: str | None = None
+        last_output = ""
+        last_error: AgentError | None = None
         try:
-            resolved = self.adb(
-                "shell",
-                "cmd",
-                "package",
-                "resolve-activity",
-                "--brief",
-                "-a",
-                "android.intent.action.MAIN",
-                "-c",
-                "android.intent.category.LAUNCHER",
-                package_name,
-                timeout=20,
-            )
-            match = re.search(
-                r"(?m)^([A-Za-z0-9_.$]+/[A-Za-z0-9_.$]+)\s*$",
-                resolved.decode("utf-8", errors="replace"),
-            )
-            if match is None or not match.group(1).startswith(package_name + "/"):
-                raise AgentError(f"应用没有可启动的 MAIN/LAUNCHER Activity：{package_name}")
-            self.adb("shell", "am", "start", "-n", match.group(1), timeout=30)
+            while time.monotonic() < deadline:
+                try:
+                    resolved = self.adb(
+                        "shell",
+                        "cmd",
+                        "package",
+                        "resolve-activity",
+                        "--brief",
+                        "-a",
+                        "android.intent.action.MAIN",
+                        "-c",
+                        "android.intent.category.LAUNCHER",
+                        package_name,
+                        timeout=20,
+                    )
+                    last_output = resolved.decode("utf-8", errors="replace")
+                except AgentError as exc:
+                    last_error = exc
+                    time.sleep(APP_RESOLVE_POLL_INTERVAL)
+                    continue
+                match = re.search(
+                    r"(?m)^([A-Za-z0-9_.$]+/[A-Za-z0-9_.$]+)\s*$",
+                    last_output,
+                )
+                if match is not None and match.group(1).startswith(package_name + "/"):
+                    resolved_activity = match.group(1)
+                    break
+                time.sleep(APP_RESOLVE_POLL_INTERVAL)
+            if resolved_activity is None:
+                detail = last_output.strip()[:180] or str(last_error or "无输出")
+                raise AgentError(
+                    f"应用没有可启动的 MAIN/LAUNCHER Activity：{package_name}（等待 {APP_RESOLVE_TIMEOUT} 秒后仍未就绪；{detail}）"
+                )
+            self.adb("shell", "am", "start", "-n", resolved_activity, timeout=30)
         except AgentError as exc:
             raise AgentError(f"无法通过 ADB 启动应用 {package_name}：{exc}") from exc
         time.sleep(2)
@@ -1868,9 +1912,14 @@ class Workflow:
 def run_once(config: Config) -> None:
     runtime = WaydroidRuntime()
     completed = False
+    device: Device | None = None
+    previous_stay_awake: str | None = None
     try:
         device = runtime.discover_device(config.device)
         print(f"设备={device.serial} 模型={config.model_id} 端点={config.base_url}")
+        if runtime.managed:
+            # 后台会话没有可见窗口，Android 屏幕超时会通过 Waydroid hardware 服务冻结容器。
+            previous_stay_awake = device.keep_awake()
         device.launch_app(PACKAGE_NAME)
         executor = ToolExecutor(config, device)
         workflow = Workflow(config, executor)
@@ -1916,6 +1965,9 @@ def run_once(config: Config) -> None:
                     time.sleep(config.retry_cooldown_seconds)
         raise AgentError(f"达到单轮最大步骤数 {config.max_steps}，未完成每日任务")
     finally:
+        if device is not None and previous_stay_awake is not None:
+            with contextlib.suppress(AgentError):
+                device.restore_keep_awake(previous_stay_awake)
         if completed and config.stop_waydroid_after_run and runtime.managed:
             print("每日任务已完成，正在关闭 Waydroid 以释放内存")
             if not runtime.stop():

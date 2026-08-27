@@ -349,7 +349,7 @@ lxc.cgroup2.memory.max = 4294967296
 `元宝每日任务.py` 现在由 `WaydroidRuntime` 管理一轮任务：
 
 1. `ANDROID_DEVICE=auto` 时检查 `waydroid status`；会话停止则后台启动 `waydroid session start`。
-2. 轮询当前容器 IP，使用 `IP:5555` 连接 ADB，确认设备状态为 `device` 后启动元宝，才开始视觉模型操作。
+2. 轮询当前容器 IP，使用 `IP:5555` 连接 ADB，确认设备状态为 `device` 后，再等待目标应用的 MAIN/LAUNCHER Activity 可解析，才启动元宝并开始视觉模型操作；这是冷启动时包管理器晚于 ADB 就绪的竞态保护。
 3. 只有 `complete_task` 的全部任务、兑换和绑定使用断言成功后，才调用 `waydroid session stop`，并等待 `Session: STOPPED`；Waydroid 在没有用户会话时会省略 `Container` 行，若仍输出该行则必须也是 `Container: STOPPED`，随后才结束本轮，确保 Android payload 已退出并释放内存。
 4. 模型或工具失败时不自动关闭现场，便于保留截图、日志和登录状态排查；下次运行会再次尝试启动/连接。
 

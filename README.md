@@ -53,11 +53,13 @@ PROMPT_PATH=每日任务提示词.md
 STATE_PATH=.yuanbao_daily_state.json
 ```
 
+任务包含每日问元宝和四项常规能力任务，另加“使用推荐模板做同款”三次；“邀请新用户”始终跳过。兑换优先使用 1 天卡，缺少时检查配置的 3 天卡和积分，积分不足则不扣分并返回“我们”页完成本轮。
+
 Windows PowerShell 或其他 ADB 主机只需把 `ANDROID_DEVICE` 改成在线设备序列号，使用对应的 Python 虚拟环境运行同一个脚本；不需要安装 Waydroid。设备必须已经安装 `com.tencent.hunyuan.app.chat` 并完成 ADB 授权。
 
 ## 定时运行
 
-`yuanbao-daily.service` 和 `yuanbao-daily.timer` 是 Linux 用户级 systemd 示例，默认按 `Asia/Shanghai` 每天 05:00 运行。服务单元按 `~/auto-daily` 和项目内 `.venv` 编写；如果仓库放在其他目录，请在复制前修改单元中的三处路径。`ANDROID_DEVICE=auto` 时任务成功后停止 Waydroid；显式 ADB 设备模式不会关闭外部模拟器或真机。
+`yuanbao-daily.service` 和 `yuanbao-daily.timer` 是 Linux 用户级 systemd 示例，默认按 `Asia/Shanghai` 每天 05:00 运行。服务单元按 `~/auto-daily` 和项目内 `.venv` 编写；如果仓库放在其他目录，请在复制前修改单元中的三处路径。服务失败会自动重试最多 5 次；`ANDROID_DEVICE=auto` 时任务成功后停止 Waydroid；显式 ADB 设备模式不会关闭外部模拟器或真机。
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -65,6 +67,22 @@ cp yuanbao-daily.service yuanbao-daily.timer ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now yuanbao-daily.timer
 ```
+
+Waydroid 路线还可以安装 `ops/` 中的 root 级恢复配置。它会在容器管理器异常退出时由 systemd 拉起，每 10 分钟检查空闲实例的文件句柄，并在每天 04:50、仅当 Android 容器未运行时重启一次管理器，避免句柄泄漏影响 05:00 冷启动：
+
+```bash
+sudo install -Dm755 ops/waydroid-container-healthcheck.sh /usr/local/sbin/waydroid-container-healthcheck
+sudo install -Dm644 ops/waydroid-container.service.d/recovery.conf /etc/systemd/system/waydroid-container.service.d/recovery.conf
+sudo install -Dm644 ops/waydroid-container-watchdog.service ops/waydroid-container-daily-reset.service /etc/systemd/system/
+sudo install -Dm644 ops/waydroid-container-watchdog.timer ops/waydroid-container-daily-reset.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now waydroid-container-watchdog.timer waydroid-container-daily-reset.timer
+mkdir -p ~/.config/systemd/user/yuanbao-daily.service.d
+install -Dm644 ops/yuanbao-daily-recovery.conf ~/.config/systemd/user/yuanbao-daily.service.d/recovery.conf
+systemctl --user daemon-reload
+```
+
+健康检查阈值默认为空闲管理器 800 个文件句柄；可通过 `WAYDROID_FD_THRESHOLD` 调整。检查脚本不会在 `Container: RUNNING` 时重启实例。
 
 ## 文档索引
 

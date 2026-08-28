@@ -1,0 +1,7 @@
+[Unit]
+Description=Waydroid 容器管理器句柄健康检查
+After=waydroid-container.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/waydroid-container-healthcheck --watch

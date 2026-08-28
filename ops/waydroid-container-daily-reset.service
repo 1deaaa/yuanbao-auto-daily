@@ -1,0 +1,7 @@
+[Unit]
+Description=每日任务前清理空闲 Waydroid 容器管理器
+After=waydroid-container.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/waydroid-container-healthcheck --daily

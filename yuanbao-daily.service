@@ -2,6 +2,8 @@
 Description=腾讯元宝每日任务
 After=graphical-session.target
 Wants=graphical-session.target
+StartLimitIntervalSec=2h
+StartLimitBurst=5
 
 [Service]
 Type=oneshot
@@ -10,6 +12,9 @@ Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=%h/auto-daily/.env
 ExecStart=%h/auto-daily/.venv/bin/python %h/auto-daily/元宝每日任务.py --once
 TimeoutStartSec=45min
+# Type=oneshot 仅在失败时重试，成功后不会常驻运行。
+Restart=on-failure
+RestartSec=90s
 
 [Install]
 WantedBy=default.target

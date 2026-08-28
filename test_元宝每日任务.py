@@ -4,7 +4,7 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
 import 元宝每日任务 as task
@@ -19,6 +19,7 @@ class 假设备:
 class 假执行器:
     def __init__(self):
         self.reward_use_confirmed = True
+        self.reward_unavailable = False
         self.calls = []
 
     def execute(self, name, args):
@@ -27,6 +28,17 @@ class 假执行器:
 
     def _find_send(self, observation):
         return None
+
+    def _find_input(self, observation):
+        return task.Node(
+            "已自动填充模板内容",
+            "",
+            "edConversationInput",
+            "android.widget.EditText",
+            True,
+            True,
+            task.Bounds(20, 1000, 720, 1300),
+        )
 
 
 class 元宝任务测试(unittest.TestCase):
@@ -93,6 +105,22 @@ class 元宝任务测试(unittest.TestCase):
         connect.assert_called_once_with()
         self.assertEqual(device.serial, "192.168.240.112:5555")
         self.assertTrue(runtime.managed)
+
+    def test_Waydroid冷启动失败清理半启动会话(self):
+        runtime = task.WaydroidRuntime(start_timeout=0, poll_interval=0)
+        with (
+            patch.object(
+                runtime,
+                "_status",
+                return_value="Session:\tSTOPPED\nContainer:\tSTOPPED\n",
+            ),
+            patch.object(runtime, "_start_session") as start_session,
+            patch.object(runtime, "stop") as stop,
+        ):
+            with self.assertRaises(task.AgentError):
+                runtime.discover_device("auto")
+        start_session.assert_called_once_with()
+        stop.assert_called_once_with()
 
     def test_Waydroid停止等待会话退出(self):
         runtime = task.WaydroidRuntime(stop_timeout=1, poll_interval=0)
@@ -197,6 +225,26 @@ class 元宝任务测试(unittest.TestCase):
         self.assertEqual(adb.call_args_list[2].args[-3:], ("power", "stayon", "false"))
         self.assertEqual(adb.call_args_list[3].args[-3:], ("global", "stay_on_while_plugged_in", "0"))
 
+    def test_冷启动首页导航等待层级就绪并点击实际节点(self):
+        executor = task.ToolExecutor.__new__(task.ToolExecutor)
+        executor.width = 750
+        executor.height = 1333
+        calls = []
+        executor.device = SimpleNamespace(input=lambda *args: calls.append(args))
+        ours = task.Node("我们", "", "", "android.widget.TextView", False, True, task.Bounds(620, 1265, 659, 1304))
+        observations = iter(
+            [
+                task.Observation(b"", "", "", (), "com.tencent.hunyuan.app.chat/.home.v2.YBHomeActivityV2", "unknown"),
+                task.Observation(b"", "", "", (ours,), "com.tencent.hunyuan.app.chat/.home.v2.YBHomeActivityV2", "chat"),
+                task.Observation(b"", "", "", (ours,), "com.tencent.hunyuan.app.chat/.home.v2.YBHomeActivityV2", "ours"),
+            ]
+        )
+        executor.observe = Mock(side_effect=lambda: next(observations))
+        with patch("元宝每日任务.time.sleep"):
+            result = executor._go_to_ours()
+        self.assertEqual(result.stage, "ours")
+        self.assertEqual(calls, [("tap", "639", "1284")])
+
     def test_显式设备发现不读取Waydroid状态(self):
         runtime = task.WaydroidRuntime()
         with (
@@ -218,6 +266,7 @@ class 元宝任务测试(unittest.TestCase):
             "writing": 3,
             "image": 3,
             "photo_question": 3,
+            "same_template": 3,
         }
         self.assertTrue(workflow.dispatch("open_welfare", {}, observation).ok)
         result = workflow.dispatch("report_tasks", report, observation)
@@ -226,6 +275,85 @@ class 元宝任务测试(unittest.TestCase):
         result = workflow.dispatch("open_exchange", {}, observation)
         self.assertTrue(result.ok)
         self.assertEqual(workflow.phase, "redeem")
+
+    def test_做同款必须先点福利入口再点推荐模板(self):
+        executor = 假执行器()
+        workflow = task.Workflow(self.配置(), executor)
+        workflow.phase = "open_target"
+        workflow.target = "same_template"
+        welfare_button = task.Node(
+            "做同款", "", "", "android.widget.Button", True, True, task.Bounds(620, 700, 718, 750)
+        )
+        recommendation_button = task.Node(
+            "+ 做同款", "", "", "android.widget.Button", True, True, task.Bounds(268, 1110, 350, 1160)
+        )
+        welfare = task.Observation(b"", "", "", (welfare_button,), "", "welfare")
+        recommendation = task.Observation(
+            b"", "", "", (recommendation_button,), "", "app"
+        )
+        result = workflow.dispatch("tap", {"x": 670, "y": 725}, welfare)
+        self.assertTrue(result.ok)
+        self.assertEqual(workflow.substate, {"entry_clicked": True})
+        result = workflow.dispatch("send_message", {}, recommendation)
+        self.assertFalse(result.ok)
+        result = workflow.dispatch("tap", {"x": 310, "y": 1135}, recommendation)
+        self.assertTrue(result.ok)
+        self.assertEqual(workflow.substate["template_clicked"], True)
+        result = workflow.dispatch("send_message", {}, recommendation)
+        self.assertTrue(result.ok)
+        result = workflow.dispatch("wait_5s", {}, recommendation)
+        self.assertTrue(result.ok)
+        self.assertEqual(workflow.phase, "claim")
+
+    def test_积分不足时返回我们页仍可完成(self):
+        executor = 假执行器()
+        executor.reward_use_confirmed = False
+        executor.reward_unavailable = True
+        workflow = task.Workflow(self.配置(), executor)
+        workflow.daily_done = True
+        workflow.progress = {key: 3 for key in task.TASK_ORDER}
+        workflow.phase = "complete"
+        result = workflow.dispatch("complete_task", {}, task.Observation(b"", "", "", (), "", "ours"))
+        self.assertTrue(result.ok)
+        self.assertTrue(workflow.finished)
+
+    def test_兑换积分和备用商品价格读取(self):
+        config = self.配置()
+        executor = task.ToolExecutor.__new__(task.ToolExecutor)
+        executor.config = config
+        product = task.Node(
+            "QQ超级会员3天卡", "", "", "android.widget.TextView", False, True, task.Bounds(380, 300, 720, 700)
+        )
+        points = task.Node("15000", "", "", "android.widget.TextView", False, True, task.Bounds(610, 70, 700, 110))
+        cost = task.Node("30000积分", "", "", "android.widget.TextView", False, True, task.Bounds(500, 720, 620, 760))
+        observation = task.Observation(b"", "", "", (points, product, cost), "", "exchange")
+        self.assertEqual(executor._read_exchange_points(observation), 15000)
+        self.assertEqual(executor._read_product_cost(observation, product), 30000)
+
+    def test_无文字发送箭头优先于上传图标(self):
+        executor = task.ToolExecutor.__new__(task.ToolExecutor)
+        executor.width = 750
+        executor.height = 1333
+        upload = task.Node(
+            "",
+            "",
+            "ic_upload",
+            "android.widget.ImageView",
+            True,
+            True,
+            task.Bounds(550, 1190, 610, 1250),
+        )
+        arrow = task.Node(
+            "",
+            "",
+            "",
+            "android.widget.ImageView",
+            True,
+            True,
+            task.Bounds(647, 1239, 715, 1307),
+        )
+        observation = task.Observation(b"", "", "", (upload, arrow), "", "app")
+        self.assertIs(task.ToolExecutor._find_send(executor, observation), arrow)
 
     def test_未确认固定输入时禁止发送(self):
         executor = 假执行器()

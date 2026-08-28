@@ -1,0 +1,10 @@
+[Unit]
+Description=每十分钟检查 Waydroid 容器管理器
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=10min
+Unit=waydroid-container-watchdog.service
+
+[Install]
+WantedBy=timers.target

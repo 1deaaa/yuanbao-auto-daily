@@ -42,6 +42,7 @@ DEFAULT_RETRY_COOLDOWN = 10
 DEFAULT_MAX_STEPS = 260
 DEFAULT_GENERATION_TIMEOUT = 180
 DEFAULT_CARD_NAME = "QQ超级会员1天卡"
+DEFAULT_FALLBACK_CARD_NAME = "QQ超级会员3天卡"
 DEFAULT_STATE_PATH = ROOT / ".yuanbao_daily_state.json"
 DEFAULT_STOP_WAYDROID_AFTER_RUN = True
 WAYDROID_START_TIMEOUT = 90
@@ -49,9 +50,13 @@ WAYDROID_STOP_TIMEOUT = 45
 WAYDROID_POLL_INTERVAL = 1.0
 APP_RESOLVE_TIMEOUT = 45
 APP_RESOLVE_POLL_INTERVAL = 1.0
+OURS_NAV_TIMEOUT = 30
+OURS_NAV_POLL_INTERVAL = 1.0
+WELFARE_LOAD_TIMEOUT = 15
+WELFARE_LOAD_POLL_INTERVAL = 1.5
 MAX_HISTORY_SUMMARY_CHARS = 1200
 MAX_HISTORY_RESULT_CHARS = 1200
-IGNORED_TASKS = ("邀请新用户", "使用推荐模板做同款")
+IGNORED_TASKS = ("邀请新用户",)
 
 
 TASK_LABELS = {
@@ -59,6 +64,7 @@ TASK_LABELS = {
     "writing": "使用写作能力",
     "image": "使用P图能力",
     "photo_question": "使用拍题能力",
+    "same_template": "使用推荐模板做同款",
 }
 TASK_ORDER = tuple(TASK_LABELS)
 
@@ -127,6 +133,7 @@ class Config:
     test_prompt: str
     test_image_path: Path
     card_name: str
+    fallback_card_name: str
     prompt_path: Path
     state_path: Path
 
@@ -171,6 +178,9 @@ class Config:
             test_prompt=_first_env("TEST_PROMPT", default=DEFAULT_TEST_PROMPT),
             test_image_path=test_image,
             card_name=_first_env("EXCHANGE_PRODUCT", default=DEFAULT_CARD_NAME),
+            fallback_card_name=_first_env(
+                "EXCHANGE_FALLBACK_PRODUCT", default=DEFAULT_FALLBACK_CARD_NAME
+            ),
             prompt_path=prompt_path,
             state_path=state_path,
         )
@@ -479,6 +489,7 @@ class WaydroidRuntime:
         self.stop_timeout = stop_timeout
         self.poll_interval = poll_interval
         self._session_process: Any | None = None
+        self._session_started = False
         self.managed = False
 
     @staticmethod
@@ -535,28 +546,36 @@ class WaydroidRuntime:
         status = self._status()
         if not self._extract_ip(status) and not self._session_running(status):
             self._start_session()
+            self._session_started = True
 
-        deadline = time.monotonic() + self.start_timeout
-        last_error: AgentError | None = None
-        while time.monotonic() < deadline:
-            status = self._status()
-            ip = self._extract_ip(status)
-            if ip:
-                device = Device(f"{ip}:5555")
-                try:
-                    device.connect()
-                    return device
-                except AgentError as exc:
-                    last_error = exc
+        try:
+            deadline = time.monotonic() + self.start_timeout
+            last_error: AgentError | None = None
+            while time.monotonic() < deadline:
+                status = self._status()
+                ip = self._extract_ip(status)
+                if ip:
+                    device = Device(f"{ip}:5555")
+                    try:
+                        device.connect()
+                        return device
+                    except AgentError as exc:
+                        last_error = exc
 
-            if self._session_process is not None and self._session_process.poll() is not None:
-                if not self._session_running(status):
-                    break
-            time.sleep(self.poll_interval)
+                if self._session_process is not None and self._session_process.poll() is not None:
+                    if not self._session_running(status):
+                        break
+                time.sleep(self.poll_interval)
 
-        if last_error is not None:
-            raise AgentError(f"Waydroid 启动后 ADB 未就绪：{last_error}") from last_error
-        raise AgentError("Waydroid 启动超时，未获得容器 IP")
+            if last_error is not None:
+                raise AgentError(f"Waydroid 启动后 ADB 未就绪：{last_error}") from last_error
+            raise AgentError("Waydroid 启动超时，未获得容器 IP")
+        except AgentError:
+            # 冷启动失败时清理本轮新建的会话，允许 systemd 的下一次重试从干净状态开始。
+            if self._session_started:
+                print("Waydroid 冷启动失败，正在清理半启动会话")
+                self.stop()
+            raise
 
     def stop(self) -> bool:
         """停止用户会话及其容器，并等待状态变为 STOPPED。"""
@@ -593,6 +612,7 @@ class WaydroidRuntime:
                 with contextlib.suppress(OSError, subprocess.TimeoutExpired):
                     self._session_process.wait(timeout=2)
             self._session_process = None
+        self._session_started = False
 
         if result.returncode != 0:
             return False
@@ -630,7 +650,9 @@ def detect_stage(nodes: Iterable[Node], activity: str) -> str:
         for marker in ("每日问元宝得积分", "去写作", "去p图", "去拍题", "问元宝任意问题累计")
     ):
         return "welfare"
-    if "兑换商城" in text or "qq超级会员1天卡" in text:
+    if "兑换商城" in text or any(
+        marker in text for marker in ("qq超级会员1天卡", "qq超级会员3天卡")
+    ):
         return "exchange"
     # “我们”页的抽屉中有福利中心和任务；聊天页虽然也有底部导航，但没有这组内容。
     if "福利中心" in text and "任务" in text:
@@ -670,6 +692,8 @@ class ToolExecutor:
         self.exchange_confirmed = False
         self.prize_records_opened = False
         self.reward_use_clicked = False
+        self.reward_card_name = config.card_name
+        self.reward_unavailable = False
 
     def _read_state(self) -> dict[str, Any]:
         try:
@@ -678,7 +702,7 @@ class ToolExecutor:
             return {}
         return value if isinstance(value, dict) else {}
 
-    def _write_state(self, exchange_status: str) -> None:
+    def _write_state(self, exchange_status: str, card_name: str | None = None) -> None:
         """保存仅用于同日恢复的非敏感状态，不写入账号、令牌或截图。"""
         path = self.config.state_path
         try:
@@ -688,7 +712,7 @@ class ToolExecutor:
                 json.dumps(
                     {
                         "date": self.today,
-                        "card": self.config.card_name,
+                        "card": card_name or self.reward_card_name,
                         "exchange_status": exchange_status,
                     },
                     ensure_ascii=False,
@@ -704,12 +728,13 @@ class ToolExecutor:
             # 状态文件是恢复优化，不能因目录权限问题阻断已经成功的兑换。
             print(f"状态文件写入失败：{type(exc).__name__}")
 
-    def _today_exchange_status(self) -> str | None:
+    def _today_exchange_status(self, card_name: str | None = None) -> str | None:
         state = self._read_state()
-        if state.get("date") != self.today or state.get("card") != self.config.card_name:
+        expected_card = card_name or self.reward_card_name
+        if state.get("date") != self.today or state.get("card") != expected_card:
             return None
         status = state.get("exchange_status")
-        return status if status in {"pending", "used"} else None
+        return status if status in {"pending", "used", "unavailable"} else None
 
     def _dismiss_android_warning(self, nodes: Iterable[Node]) -> bool:
         """只关闭已知的 Android 系统兼容性提示，不替模型处理业务弹窗。"""
@@ -781,11 +806,44 @@ class ToolExecutor:
             and (
                 "发送" in node.text
                 or "发送" in node.content_desc
-                or "send" in node.resource_id.lower()
                 or "send" in node.content_desc.lower()
+                or (
+                    (rid := node.resource_id.lower())
+                    and (
+                        "send" in rid
+                        or "submit" in rid
+                        or "arrow_up" in rid
+                        or "arrowup" in rid
+                        or ("ic_up" in rid and "upload" not in rid)
+                    )
+                )
             )
         ]
-        return max(preferred, key=lambda node: node.bounds.area, default=None)
+        if preferred:
+            return max(preferred, key=lambda node: node.bounds.area)
+        # Compose 版本的绿色上箭头有时没有文字和资源 ID，只暴露为右下角可点击图标。
+        # 仅在底部区域寻找较小控件，避免误点页面上的其它大按钮。
+        bottom_right = [
+            node
+            for node in nodes
+            if node.clickable
+            and node.bounds.top >= self.height * 0.72
+            and node.bounds.center[0] >= self.width * 0.72
+            and node.bounds.area <= 40_000
+            and not any(
+                marker in f"{node.text} {node.content_desc}".lower()
+                for marker in ("上传", "相册", "键盘", "收起", "关闭")
+            )
+        ]
+        return min(
+            bottom_right,
+            key=lambda node: (
+                abs(node.bounds.center[0] - (self.width - 60))
+                + abs(node.bounds.center[1] - (self.height - 60)),
+                -node.bounds.area,
+            ),
+            default=None,
+        )
 
     def _input_fixed_prompt(self, observation: Observation) -> ToolResult:
         if observation.stage == "ours":
@@ -852,17 +910,26 @@ class ToolExecutor:
             time.sleep(5)
 
     def _go_to_ours(self) -> Observation:
-        for _ in range(5):
+        """等待首页导航就绪后进入“我们”，避免冷启动时过早返回或误按。"""
+        deadline = time.monotonic() + OURS_NAV_TIMEOUT
+        while time.monotonic() < deadline:
             observation = self.observe()
             if observation.stage == "ours":
                 return observation
             ours_node = find_node(observation.nodes, "我们", exact=True)
             if ours_node is not None:
-                self._tap_point(self.width - 110, self.height - 43)
+                # 不假设固定分辨率；部分设备的底部导航高度和横向边距不同。
+                self._tap_node(ours_node)
                 time.sleep(1.5)
                 continue
-            self.device.input("keyevent", "KEYCODE_BACK")
-            time.sleep(1.2)
+            # 应用冷启动或 WebView 首次恢复时层级可能暂时为空。
+            # 先给首页最多约 8 秒加载时间，避免 BACK 把尚未就绪的应用退出。
+            elapsed = OURS_NAV_TIMEOUT - max(0.0, deadline - time.monotonic())
+            if elapsed >= 8:
+                self.device.input("keyevent", "KEYCODE_BACK")
+                time.sleep(1.2)
+            else:
+                time.sleep(OURS_NAV_POLL_INTERVAL)
         observation = self.observe()
         if observation.stage != "ours":
             raise AgentError("无法回到元宝“我们”页面")
@@ -875,15 +942,14 @@ class ToolExecutor:
             self._tap_point(640, 486)
         else:
             self._tap_node(welfare_node)
-        time.sleep(3)
-        observation = self.observe()
-        if observation.stage != "welfare":
-            # WebView 初次加载时层级可能暂时为空，给页面一次额外刷新时间。
-            time.sleep(2)
+        # WebView 从详情页返回时偶尔需要数秒恢复层级；在执行层内等待，避免把临时加载状态交给模型。
+        deadline = time.monotonic() + WELFARE_LOAD_TIMEOUT
+        while time.monotonic() < deadline:
             observation = self.observe()
-        if observation.stage != "welfare":
-            raise AgentError("福利中心没有加载出任务页面")
-        return observation
+            if observation.stage == "welfare":
+                return observation
+            time.sleep(WELFARE_LOAD_POLL_INTERVAL)
+        raise AgentError("福利中心没有加载出任务页面")
 
     def _ensure_picker_image(self) -> ToolResult:
         if not self.image_pushed:
@@ -981,10 +1047,13 @@ class ToolExecutor:
         time.sleep(2)
         return True
 
-    def _find_card_and_button(self, observation: Observation) -> tuple[Node, Node] | None:
-        product = find_node(observation.nodes, self.config.card_name, exact=True)
+    def _find_card_and_button(
+        self, observation: Observation, card_name: str | None = None
+    ) -> tuple[Node, Node] | None:
+        wanted_card = card_name or self.reward_card_name
+        product = find_node(observation.nodes, wanted_card, exact=True)
         if product is None:
-            product = find_node(observation.nodes, self.config.card_name)
+            product = find_node(observation.nodes, wanted_card)
         if product is None:
             return None
         buttons = [
@@ -1002,20 +1071,94 @@ class ToolExecutor:
             for node in buttons
             if abs(node.bounds.center[0] - px) < 220 and node.bounds.center[1] >= product.bounds.bottom
         ]
-        return product, min(same_card or buttons, key=lambda node: abs(node.bounds.center[1] - py))
+        if not same_card:
+            # 商品卡片可能仍在视口边缘，不能把别的商品按钮误配给它。
+            return None
+        return product, min(same_card, key=lambda node: abs(node.bounds.center[1] - py))
+
+    def _read_exchange_points(self, observation: Observation) -> int | None:
+        """读取兑换页顶部的当前积分，无法确认时返回 None。"""
+        labelled: list[tuple[int, int]] = []
+        plain: list[tuple[int, int]] = []
+        for node in observation.nodes:
+            if node.bounds.area <= 0 or node.bounds.top > 120:
+                continue
+            value = node.text.strip().replace(",", "")
+            match = re.fullmatch(r"(\d+)(?:\s*积分)?", value)
+            if match is None:
+                continue
+            item = (node.bounds.left, int(match.group(1)))
+            if "积分" in value:
+                labelled.append(item)
+            else:
+                plain.append(item)
+        candidates = labelled or plain
+        if not candidates:
+            return None
+        # 积分数字紧邻“我的积分：”，通常是顶部最靠左的纯数字节点。
+        return min(candidates, key=lambda item: item[0])[1]
+
+    def _read_product_cost(self, observation: Observation, product: Node) -> int | None:
+        """读取目标商品卡片下方的积分价格。"""
+        px, py = product.bounds.center
+        candidates = []
+        for node in observation.nodes:
+            if node.bounds.area <= 0:
+                continue
+            value = node.text.strip().replace(",", "")
+            match = re.fullmatch(r"(\d+)(?:\s*积分)?", value)
+            if match is None:
+                continue
+            nx, ny = node.bounds.center
+            if ny < product.bounds.bottom or ny > product.bounds.bottom + 130:
+                continue
+            if abs(nx - px) > 180:
+                continue
+            candidates.append((abs(ny - product.bounds.bottom), int(match.group(1))))
+        return min(candidates, default=(0, None), key=lambda item: item[0])[1]
+
+    def _exchange_to_top(self, observation: Observation) -> Observation:
+        """把兑换商城列表复位到顶部，供备用商品从同一滚动起点重新扫描。"""
+        top_button = find_node(observation.nodes, "回到顶部", clickable_only=True)
+        if top_button is not None:
+            self._tap_node(top_button)
+            time.sleep(1)
+            return self.observe()
+        # 某些版本不暴露“回到顶部”按钮，反向滑动若干次也能回到首屏。
+        for _ in range(8):
+            self.device.input(
+                "swipe",
+                str(self.width // 2),
+                "450",
+                str(self.width // 2),
+                "1150",
+                "500",
+            )
+            time.sleep(0.6)
+            observation = self.observe()
+        return observation
 
     def _recover_exchange_state(self, observation: Observation) -> str | None:
         """从同日状态文件恢复兑换流程，避免服务重启后重复扣积分。"""
-        status = self._today_exchange_status()
-        if status is None:
-            return None
-        self.exchange_confirmed = True
-        if status == "used":
-            self.prize_records_opened = True
-            self.reward_use_clicked = True
-            self.reward_use_confirmed = True
-            return status
-        return "pending"
+        candidates = [self.config.card_name]
+        if self.config.fallback_card_name and self.config.fallback_card_name not in candidates:
+            candidates.append(self.config.fallback_card_name)
+        for card_name in candidates:
+            status = self._today_exchange_status(card_name)
+            if status is None:
+                continue
+            self.reward_card_name = card_name
+            self.exchange_confirmed = True
+            if status == "used":
+                self.prize_records_opened = True
+                self.reward_use_clicked = True
+                self.reward_use_confirmed = True
+                return status
+            if status == "unavailable":
+                self.reward_unavailable = True
+                return status
+            return "pending"
+        return None
 
     def _redeem_card(self) -> ToolResult:
         observation = self.observe()
@@ -1024,6 +1167,8 @@ class ToolExecutor:
             if not result.ok:
                 return result
             observation = self.observe()
+        self.reward_card_name = self.config.card_name
+        self.reward_unavailable = False
         recovered = self._recover_exchange_state(observation)
         if recovered == "used":
             return self._result(
@@ -1039,6 +1184,13 @@ class ToolExecutor:
                 stage=observation.stage,
                 prize_records_opened=False,
             )
+        if recovered == "unavailable":
+            return self._result(
+                True,
+                "已从同日状态恢复：备用兑换商品积分不足，跳过兑换并返回“我们”页",
+                stage=observation.stage,
+                reward_unavailable=True,
+            )
         if self._has_exchange_success(observation):
             self.exchange_confirmed = True
             self._write_state("pending")
@@ -1048,24 +1200,59 @@ class ToolExecutor:
                 stage=observation.stage,
                 prize_records_opened=False,
             )
-        found = self._find_card_and_button(observation)
-        for _ in range(3):
+        found = self._find_card_and_button(observation, self.reward_card_name)
+        for _ in range(6):
             if found:
                 break
             self.device.input("swipe", str(self.width // 2), "1150", str(self.width // 2), "450", "500")
             time.sleep(1)
             observation = self.observe()
-            found = self._find_card_and_button(observation)
+            found = self._find_card_and_button(observation, self.reward_card_name)
+        if not found and self.config.fallback_card_name:
+            # 1 天卡下架时继续扫描 3 天卡；只有读到积分和价格后才允许决定是否跳过。
+            fallback = self.config.fallback_card_name
+            observation = self._exchange_to_top(observation)
+            self.reward_card_name = fallback
+            found = self._find_card_and_button(observation, fallback)
+            for _ in range(6):
+                if found:
+                    break
+                self.device.input("swipe", str(self.width // 2), "1150", str(self.width // 2), "450", "500")
+                time.sleep(1)
+                observation = self.observe()
+                found = self._find_card_and_button(observation, fallback)
+            if found:
+                product, _ = found
+                points = self._read_exchange_points(observation)
+                cost = self._read_product_cost(observation, product)
+                if points is None or cost is None:
+                    return self._result(
+                        False,
+                        f"已找到备用商品“{fallback}”，但无法确认积分或价格，拒绝盲目兑换",
+                        stage=observation.stage,
+                    )
+                if points < cost:
+                    self.reward_unavailable = True
+                    self._write_state("unavailable", fallback)
+                    return self._result(
+                        True,
+                        f"未找到“{self.config.card_name}”；备用商品“{fallback}”需要 {cost} 积分，当前仅 {points}，跳过兑换并返回“我们”页",
+                        stage=observation.stage,
+                        reward_unavailable=True,
+                        points=points,
+                        cost=cost,
+                    )
         if not found:
-            return self._result(False, f"没有找到目标商品：{self.config.card_name}")
+            self.reward_card_name = self.config.card_name
+            return self._result(False, f"没有找到目标商品：{self.config.card_name}，备用商品也不可用")
         product, button = found
         self._tap_node(button)
         time.sleep(2)
         self.exchange_target_clicked = True
-        return self._result(True, f"已点击目标商品“{self.config.card_name}”的兑换按钮", stage=self.observe().stage)
+        return self._result(True, f"已点击目标商品“{self.reward_card_name}”的兑换按钮", stage=self.observe().stage)
 
     def _find_reward_use_button(self, observation: Observation) -> Node | None:
-        product = find_node(observation.nodes, self.config.card_name)
+        product = find_node(observation.nodes, self.reward_card_name)
         if product is None:
             return None
         buttons = [
@@ -1107,10 +1294,11 @@ class ToolExecutor:
 
     def _has_reward_use_success(self, observation: Observation) -> bool:
         """只接受目标卡片附近的使用状态，避免把顶部“已使用”筛选标签当成结果。"""
+        reward_card_name = getattr(self, "reward_card_name", self.config.card_name)
         card_nodes = [
             node
             for node in observation.nodes
-            if self.config.card_name.lower() in node.searchable and node.bounds.area > 0
+            if reward_card_name.lower() in node.searchable and node.bounds.area > 0
         ]
         for card in card_nodes:
             nearby_status = [
@@ -1182,9 +1370,13 @@ class ToolExecutor:
                     if observation.stage == "writing":
                         fallback_y = 754
                     elif input_node is not None:
-                        fallback_y = input_node.bounds.center[1]
+                        # 输入框通常延伸到屏幕底部；发送箭头位于其右下角，而不是输入框中心。
+                        fallback_y = min(
+                            self.height - 45,
+                            max(self.height // 2, input_node.bounds.bottom - 35),
+                        )
                     else:
-                        fallback_y = self.height - 105
+                        fallback_y = self.height - 60
                     self._tap_point(self.width - 60, fallback_y)
                 else:
                     self._tap_node(button)
@@ -1299,8 +1491,16 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "writing": {"type": "integer", "minimum": 0, "maximum": 3},
                     "image": {"type": "integer", "minimum": 0, "maximum": 3},
                     "photo_question": {"type": "integer", "minimum": 0, "maximum": 3},
+                    "same_template": {"type": "integer", "minimum": 0, "maximum": 3},
                 },
-                "required": ["daily_done", "question", "writing", "image", "photo_question"],
+                "required": [
+                    "daily_done",
+                    "question",
+                    "writing",
+                    "image",
+                    "photo_question",
+                    "same_template",
+                ],
                 "additionalProperties": False,
             },
         },
@@ -1413,7 +1613,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "redeem_qq_card",
-            "description": "只定位并点击配置指定的 QQ 超级会员 1 天卡，不点击其他商品。",
+            "description": "优先定位配置指定的 QQ 超级会员 1 天卡；若页面没有该商品则查找配置的 3 天卡，积分不足时安全跳过兑换。",
             "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
         },
     },
@@ -1761,6 +1961,11 @@ class Workflow:
             return all(self.substate.get(name, False) for name in ("image", "sent", "waited"))
         if kind == "photo_question":
             return all(self.substate.get(name, False) for name in ("image", "confirmed", "waited"))
+        if kind == "same_template":
+            return all(
+                self.substate.get(name, False)
+                for name in ("entry_clicked", "template_clicked", "sent", "waited")
+            )
         return False
 
     def _valid_phase(self, name: str) -> str | None:
@@ -1795,16 +2000,36 @@ class Workflow:
 
     @staticmethod
     def _ignored_welfare_tap(args: dict[str, Any], observation: Observation) -> bool:
-        """在福利中心拦截两项永久忽略任务的整行点击。"""
+        """在福利中心拦截唯一明确忽略的邀请任务整行点击。"""
         try:
             x, y = int(args["x"]), int(args["y"])
         except (KeyError, TypeError, ValueError):
             return False
         for node in observation.nodes:
             label = node.searchable
-            if not any(marker in label for marker in ("邀请新用户", "推荐模板", "去邀请", "做同款")):
+            if not any(marker in label for marker in ("邀请新用户", "去邀请")):
                 continue
             if node.bounds.top - 55 <= y <= node.bounds.bottom + 55:
+                return True
+        return False
+
+    @staticmethod
+    def _tap_hits_label(args: dict[str, Any], observation: Observation, *markers: str) -> bool:
+        """判断模型点击是否落在当前观测中带指定语义的控件附近。"""
+        try:
+            x, y = int(args["x"]), int(args["y"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        wanted = tuple(marker.lower() for marker in markers)
+        for node in observation.nodes:
+            if not node.enabled or node.bounds.area <= 0:
+                continue
+            if not any(marker in node.searchable for marker in wanted):
+                continue
+            if (
+                node.bounds.left - 45 <= x <= node.bounds.right + 45
+                and node.bounds.top - 45 <= y <= node.bounds.bottom + 45
+            ):
                 return True
         return False
 
@@ -1814,11 +2039,14 @@ class Workflow:
         incomplete = [TASK_LABELS[key] for key in TASK_ORDER if self.progress.get(key) != 3]
         if incomplete:
             return ToolResult(False, f"仍有未完成任务：{'、'.join(incomplete)}")
-        if not self.executor.reward_use_confirmed:
+        reward_unavailable = bool(getattr(self.executor, "reward_unavailable", False))
+        if not self.executor.reward_use_confirmed and not reward_unavailable:
             return ToolResult(False, "尚未确认 QQ 超级会员卡已对绑定账号使用成功")
         if self.phase != "complete":
             return ToolResult(False, "尚未回到“我们”页面")
         self.finished = True
+        if reward_unavailable:
+            return ToolResult(True, "每日任务已完成；备用兑换商品积分不足，已返回“我们”页面")
         return ToolResult(True, "每日任务与奖品使用均已完成，本轮进入下一次等待")
 
     def dispatch(self, name: str, args: dict[str, Any], observation: Observation) -> ToolResult:
@@ -1832,13 +2060,34 @@ class Workflow:
         ):
             return ToolResult(False, "当前已在系统图片选择器，必须调用 select_local_image 选择测试图片")
         if name == "tap" and observation.stage == "welfare" and self._ignored_welfare_tap(args, observation):
-            return ToolResult(False, "永久忽略“邀请新用户”和“使用推荐模板做同款”，已拒绝该行点击")
+            return ToolResult(False, "已拒绝点击“邀请新用户”任务")
+        if name == "tap" and self.target == "same_template":
+            if self.phase == "open_target" and not self._tap_hits_label(args, observation, "做同款"):
+                return ToolResult(False, "请点击福利中心中“做同款”任务入口")
+            if self.phase == "perform":
+                if self.substate.get("template_clicked", False):
+                    return ToolResult(False, "推荐模板已经点击，下一步应直接发送并等待生成")
+                if not self.substate.get("entry_clicked", False):
+                    if observation.stage != "welfare" or not self._tap_hits_label(args, observation, "做同款"):
+                        return ToolResult(False, "请先点击福利中心中“做同款”任务入口")
+                elif not self._tap_hits_label(args, observation, "做同款"):
+                    return ToolResult(False, "请在推荐模板页点击任意一个“做同款”按钮")
         if name == "send_message" and self.target in {"daily_question", "question", "writing"}:
             if not self.substate.get("input", False):
                 return ToolResult(False, "当前提问/写作任务尚未确认固定测试文本，必须先调用 input_test_prompt")
         if name == "send_message" and self.target == "image":
             if not self.substate.get("image", False):
                 return ToolResult(False, "当前 P 图任务尚未确认图片，必须先调用 select_local_image")
+        if name == "send_message" and self.target == "same_template":
+            if not self.substate.get("template_clicked", False):
+                return ToolResult(False, "尚未点击推荐模板，不能发送")
+            if (
+                self.executor._find_input(observation) is None
+                and self.executor._find_send(observation) is None
+                and "aitemplatedetailactivity" not in observation.activity.lower()
+                and observation.stage not in {"app", "chat"}
+            ):
+                return ToolResult(False, "模板详情页尚未加载输入框或发送控件，请重新观察后再发送")
         if name == "confirm_image" and self.target in {"image", "photo_question"}:
             if not self.substate.get("image", False):
                 return ToolResult(False, "尚未选择图片，不能确认图片")
@@ -1848,6 +2097,7 @@ class Workflow:
             "writing",
             "image",
             "photo_question",
+            "same_template",
         }:
             if not self.substate.get("sent", False):
                 if self.target == "photo_question" and self.substate.get("confirmed", False):
@@ -1869,6 +2119,8 @@ class Workflow:
         elif self.phase == "open_target" and name in {"tap", "swipe", "press_back"}:
             self.phase = "perform"
             self.substate = {}
+            if self.target == "same_template" and name == "tap":
+                self.substate["entry_clicked"] = True
         elif self.phase == "perform":
             if name == "input_test_prompt":
                 self.substate["input"] = True
@@ -1876,6 +2128,11 @@ class Workflow:
                 self.substate["image"] = True
             elif name == "confirm_image":
                 self.substate["confirmed"] = True
+            elif name == "tap" and self.target == "same_template":
+                if not self.substate.get("entry_clicked", False):
+                    self.substate["entry_clicked"] = True
+                else:
+                    self.substate["template_clicked"] = True
             elif name == "send_message":
                 self.substate["sent"] = True
             elif name == "wait_5s":
@@ -1889,7 +2146,12 @@ class Workflow:
         elif self.phase == "open_exchange" and name == "open_exchange":
             self.phase = "redeem"
         elif self.phase == "redeem" and name == "redeem_qq_card":
-            if result.data.get("reward_use_confirmed") or self.executor.reward_use_confirmed:
+            if (
+                result.data.get("reward_use_confirmed")
+                or self.executor.reward_use_confirmed
+                or result.data.get("reward_unavailable")
+                or getattr(self.executor, "reward_unavailable", False)
+            ):
                 self.phase = "return_ours"
             elif result.data.get("prize_records_opened") is False:
                 self.phase = "prize_records"

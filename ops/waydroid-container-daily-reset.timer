@@ -1,0 +1,10 @@
+[Unit]
+Description=每天北京时间四点五十分清理 Waydroid
+
+[Timer]
+OnCalendar=*-*-* 04:50:00 Asia/Shanghai
+Persistent=true
+Unit=waydroid-container-daily-reset.service
+
+[Install]
+WantedBy=timers.target

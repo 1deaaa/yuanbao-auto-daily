@@ -295,12 +295,12 @@ sudo rm \
 ### 10.1 实现内容
 
 - `元宝每日任务.py` 使用本地 OpenAI 兼容视觉端点，接收当前截图和精简无障碍层级，每轮只允许一个白名单工具。
-- 首步固定进入“我们”页的福利中心；模型只报告四个需要完成的任务，永久忽略“邀请新用户”和“使用推荐模板做同款”。
+- 首步固定进入“我们”页的福利中心；模型报告每日问元宝和五个需要完成的重复任务，仅永久忽略“邀请新用户”；“使用推荐模板做同款”按推荐模板详情页自动填充、发送、等待的流程执行。
 - 提问、写作使用预置英文测试主题；P 图和拍题使用本地脱敏图片。每次生成都必须调用 `wait_5s`，执行层会继续检查终止按钮。
 - 每个子任务完成后先处理奖励弹窗，再回到福利中心重新报告进度；计数没有增加时不会假设成功。
-- 兑换流程只允许“QQ超级会员1天卡”，要求明确的兑换成功证据、奖品记录、绑定账号使用成功证据，最后回到“我们”页才接受 `complete_task`。
+- 兑换流程优先使用“QQ超级会员1天卡”；找不到时检查“QQ超级会员3天卡”和当前积分，积分不足则不扣分，返回“我们”页后接受 `complete_task`。正常兑换仍要求明确的兑换成功证据、奖品记录、绑定账号使用成功证据，最后回到“我们”页才接受 `complete_task`。
 - `.env` 解耦模型 ID、Base URL、密钥、运行时间、重试次数和冷却时间；每日用户级 systemd 定时器按 `Asia/Shanghai` 05:00 触发。
-- `.yuanbao_daily_state.json` 只保存当天商品兑换状态，用于进程中断后的幂等恢复，不保存账号、令牌、验证码或截图。
+- `.yuanbao_daily_state.json` 只保存当天商品兑换状态（包括兑换中、已使用或备用商品积分不足），用于进程中断后的幂等恢复，不保存账号、令牌、验证码或截图。
 
 ### 10.2 实测中发现并修复的问题
 
@@ -316,12 +316,19 @@ sudo rm \
 ### 10.3 2026-08-27 真实闭环证据
 
 1. Waydroid `<WAYDROID_IP>:5555` 在线，最终元宝页面回到“我们”。
-2. 福利中心最终观察到：问元宝 `3/3`、写作 `3/3`、P 图 `3/3`、拍题 `3/3`；两项永久忽略任务未被点击。
+2. 福利中心最终观察到：问元宝 `3/3`、写作 `3/3`、P 图 `3/3`、拍题 `3/3`；该次旧版本实测尚未纳入“做同款”，因此只记录了当时被忽略的两项。当前版本已将“做同款”列为第五项任务。
 3. 兑换弹窗出现 `恭喜兑换成功` 和目标商品 `QQ超级会员1天卡`；奖品记录中显示 `奖励已绑定`、绑定账号和 `立即使用`。
 4. 使用后奖品记录显示 `已使用`，执行层设置 `reward_use_confirmed=true`，写入当天幂等状态。
 5. 随后真实运行日志显示：`return_to_ours` 成功，`complete_task` 成功，消息为“每日任务与奖品使用均已完成，本轮进入下一次等待”。
 
-### 10.4 验证命令
+### 10.4 2026-08-28 做同款流程与幂等恢复证据
+
+1. 首次正式运行中，模型读取福利中心并将 `same_template` 从 `0/3` 完成到 `3/3`；执行层拒绝了一次不符合当前阶段的误点，模型随后自行修正。
+2. 当天积分为 `16500`，商城没有 QQ 超级会员 1 天卡，3 天卡价格为 `30000`；因此未兑换商品，状态文件记录 `exchange_status=unavailable`。
+3. 由于首次运行在兑换阶段被服务中断，重启后脚本重新启动 Waydroid，读取同日 `unavailable` 状态，不重复做同款或兑换，依次完成 `return_to_ours` 和 `complete_task`，服务退出码为 0。
+4. 本次恢复运行结束后 `waydroid status` 为 `Session: STOPPED`，验证了“任务完成后关闭 Waydroid、下一轮再自动启动”的完整闭环。
+
+### 10.5 验证命令
 
 ```bash
 python3 -m unittest -v test_元宝每日任务.py
@@ -330,7 +337,7 @@ systemctl --user list-timers yuanbao-daily.timer
 adb -s <WAYDROID_IP>:5555 get-state
 ```
 
-本次验证结果为 17 项单元测试通过、Python 编译通过、定时器启用且下一次触发时间为北京时间次日 05:00。
+本次验证结果为 26 项单元测试通过、Python 编译通过、定时器启用且下一次触发时间为北京时间次日 05:00。
 
 ## 11. 4GB 内存限制与每日任务生命周期
 
@@ -354,3 +361,29 @@ lxc.cgroup2.memory.max = 4294967296
 4. 模型或工具失败时不自动关闭现场，便于保留截图、日志和登录状态排查；下次运行会再次尝试启动/连接。
 
 默认配置 `STOP_WAYDROID_AFTER_RUN=true`。如需调试期间保持图形界面，可临时设为 `false`；调试结束应恢复为 `true`。
+
+### 11.3 Waydroid 常驻服务文件句柄耗尽
+
+2026-08-28 11:54 的一次冷启动在脚本逻辑之前失败，日志为 `OSError: [Errno 24] Too many open files`。排查发现 `/usr/bin/waydroid container start` 常驻进程自前一晚启动后一直未重启，约持有 1021 个文件描述符，软上限为 1024；其中大量是 `eventpoll`。这是 Waydroid 26.04 容器管理器在多次会话启动/停止后累积选择器句柄的已知形态，和元宝网络、ADB 或模型无关。
+
+处理步骤：
+
+1. 使用 `sudo systemctl restart waydroid-container.service` 清理旧的容器管理进程；确认新进程初始文件描述符很少且 Waydroid 为 `Session: STOPPED`。
+2. 在 `/etc/systemd/system/waydroid-container.service.d/limits.conf` 写入以下 drop-in，并执行 `sudo systemctl daemon-reload`。这样即使未来再次出现句柄累积，也不会在第二次会话启动时立即触发 1024 上限：
+
+```ini
+[Service]
+LimitNOFILE=524288
+```
+
+3. 重新运行 `systemctl --user start yuanbao-daily.service`，确认日志依次出现 `report_tasks`、状态恢复、`complete_task` 和 `Finished ... status=0/SUCCESS`；任务结束后 `waydroid status` 应为 `Session: STOPPED`。
+
+该 drop-in 属于宿主机 Waydroid 配置，不在项目仓库内维护；升级 Waydroid 后若再次观察到文件句柄增长，应先检查该文件是否仍存在以及 `systemctl show waydroid-container.service -p LimitNOFILESoft` 是否为 `524288`。
+
+### 11.4 每日定时启动的恢复层
+
+仅有 `Persistent=true` 只能补跑关机或睡眠期间错过的触发，不能处理“05:00 服务启动后失败”。因此用户级 `yuanbao-daily.service` 增加 `Restart=on-failure`、90 秒间隔和 2 小时内最多 5 次启动；任务脚本在 Waydroid 冷启动拿不到 IP 时会清理本轮新建的半启动会话，使下一次重试从干净状态开始。
+
+Waydroid root 服务同时使用 `ops/waydroid-container.service.d/recovery.conf` 的崩溃自动重启。`ops/waydroid-container-watchdog.timer` 每 10 分钟检查空闲容器管理器的文件句柄，默认达到 800 个才重启；`ops/waydroid-container-daily-reset.timer` 每天北京时间 04:50 只在 `Container` 非 RUNNING 时重启管理器，专门覆盖前一轮留下的句柄。两项检查都不会主动停止正在运行的 Android 容器。
+
+这套机制可以自动恢复已知的启动竞态、Waydroid 管理器崩溃和句柄泄漏；不能保证上游应用改版、外网不可用、本地模型网关故障、宿主机掉电或整体 OOM 时任务一定成功。此类异常仍需查看 `journalctl --user -u yuanbao-daily.service` 和 `journalctl -u waydroid-container.service`。

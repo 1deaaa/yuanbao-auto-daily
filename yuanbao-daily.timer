@@ -1,8 +1,8 @@
 [Unit]
-Description=每天北京时间五点运行元宝任务
+Description=每天北京时间零点五分运行元宝任务
 
 [Timer]
-OnCalendar=*-*-* 05:00:00 Asia/Shanghai
+OnCalendar=*-*-* 00:05:00 Asia/Shanghai
 Persistent=true
 Unit=yuanbao-daily.service
 

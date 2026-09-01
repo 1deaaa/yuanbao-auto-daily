@@ -53,7 +53,7 @@ class 元宝任务测试(unittest.TestCase):
             return f'<hierarchy><node text="{text}" enabled="true" bounds="[0,0][100,100]" /></hierarchy>'
 
         self.assertEqual(task.detect_stage(task.parse_nodes(xml("每日问元宝得积分 兑换商城")), ""), "welfare")
-        self.assertEqual(task.detect_stage(task.parse_nodes(xml("兑换商城 QQ超级会员1天卡")), ""), "exchange")
+        self.assertEqual(task.detect_stage(task.parse_nodes(xml("兑换商城 QQ超级会员3天卡")), ""), "exchange")
         self.assertEqual(task.detect_stage(task.parse_nodes(xml("奖品记录")), ""), "prize_records")
         self.assertEqual(task.detect_stage([], "com.tencent.hunyuan.app.chat/com.tencent.hunyuan.deps.camera.ui.activity.CameraResultActivity"), "photo_preview")
         self.assertEqual(task.detect_stage(task.parse_nodes(xml("相机胶卷")), "com.tencent.hunyuan.app.chat/com.tencent.hunyuan.app.PictureSelectorSupporterActivity"), "picker")
@@ -61,13 +61,16 @@ class 元宝任务测试(unittest.TestCase):
 
     def test_配置和北京时间调度(self):
         config = self.配置()
-        self.assertEqual(config.run_time, "05:00")
+        self.assertEqual(config.run_time, "00:05")
         self.assertEqual(config.timezone_name, "Asia/Shanghai")
+        self.assertEqual(config.card_name, "QQ超级会员3天卡")
+        self.assertEqual(config.model_request_timeout_seconds, 90)
         self.assertTrue(config.stop_waydroid_after_run)
         self.assertTrue(config.test_image_path.is_file())
-        before = datetime(2026, 8, 27, 4, 59, tzinfo=ZoneInfo("Asia/Shanghai"))
-        after = datetime(2026, 8, 27, 5, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
-        self.assertEqual(task.next_run_at(config, before).hour, 5)
+        before = datetime(2026, 8, 27, 0, 4, tzinfo=ZoneInfo("Asia/Shanghai"))
+        after = datetime(2026, 8, 27, 0, 5, tzinfo=ZoneInfo("Asia/Shanghai"))
+        self.assertEqual(task.next_run_at(config, before).hour, 0)
+        self.assertEqual(task.next_run_at(config, before).minute, 5)
         self.assertEqual(task.next_run_at(config, after).day, 28)
 
     def test_已知Android系统提示自动消除(self):
@@ -87,6 +90,38 @@ class 元宝任务测试(unittest.TestCase):
         self.assertTrue(executor._dismiss_android_warning(nodes))
         self.assertEqual(calls, [("tap", "600", "739")])
 
+    def test_元宝更新提示自动消除(self):
+        executor = task.ToolExecutor.__new__(task.ToolExecutor)
+        executor.width = 750
+        executor.height = 1333
+        calls = []
+        executor.device = SimpleNamespace(input=lambda *args: calls.append(args))
+        nodes = task.parse_nodes(
+            '<hierarchy>'
+            '<node text="元宝新版本" resource-id="com.tencent.hunyuan.app.chat:id/title" '
+            'class="android.widget.TextView" enabled="true" bounds="[305,295][445,337]" />'
+            '<node resource-id="com.tencent.hunyuan.app.chat:id/upgrade_dialog" '
+            'class="android.view.ViewGroup" enabled="true" bounds="[56,229][694,687]" />'
+            '<node resource-id="com.tencent.hunyuan.app.chat:id/skip" '
+            'class="android.widget.ImageView" clickable="true" enabled="true" '
+            'bounds="[350,636][401,687]" />'
+            '</hierarchy>'
+        )
+        self.assertTrue(executor._dismiss_upgrade_prompt(nodes))
+        self.assertEqual(calls, [("tap", "375", "661")])
+
+    def test_更新提示不会误判为拍题页面(self):
+        nodes = task.parse_nodes(
+            '<hierarchy>'
+            '<node text="新版本 v2.83.10" resource-id="com.tencent.hunyuan.app.chat:id/version" '
+            'enabled="true" bounds="[300,300][450,340]" />'
+            '<node resource-id="com.tencent.hunyuan.app.chat:id/upgrade_dialog" '
+            'enabled="true" bounds="[56,229][694,687]" />'
+            '<node text="拍题输入文字都能讲" enabled="true" bounds="[100,400][600,520]" />'
+            '</hierarchy>'
+        )
+        self.assertEqual(task.detect_stage(nodes, ""), "app")
+
     def test_Waydroid停止时自动启动并等待ADB(self):
         runtime = task.WaydroidRuntime(start_timeout=1, poll_interval=0)
         statuses = iter(
@@ -99,10 +134,12 @@ class 元宝任务测试(unittest.TestCase):
             patch.object(runtime, "_status", side_effect=lambda: next(statuses)),
             patch.object(runtime, "_start_session") as start_session,
             patch.object(task.Device, "connect") as connect,
+            patch.object(task.Device, "wait_ready") as wait_ready,
         ):
             device = runtime.discover_device("auto")
         start_session.assert_called_once_with()
         connect.assert_called_once_with()
+        wait_ready.assert_called_once()
         self.assertEqual(device.serial, "192.168.240.112:5555")
         self.assertTrue(runtime.managed)
 
@@ -155,6 +192,25 @@ class 元宝任务测试(unittest.TestCase):
                 "Session:\tSTOPPED\nContainer:\tRUNNING\n"
             )
         )
+
+    def test_Waydroid冻结容器先解冻再发现设备(self):
+        runtime = task.WaydroidRuntime(start_timeout=1, poll_interval=0)
+        statuses = iter(
+            [
+                "Session:\tRUNNING\nContainer:\tFROZEN\nIP address:\t192.168.240.112\n",
+                "Session:\tRUNNING\nContainer:\tRUNNING\nIP address:\t192.168.240.112\n",
+                "Session:\tRUNNING\nContainer:\tRUNNING\nIP address:\t192.168.240.112\n",
+            ]
+        )
+        with (
+            patch.object(runtime, "_status", side_effect=lambda: next(statuses)),
+            patch.object(runtime, "_unfreeze_container") as unfreeze,
+            patch.object(task.Device, "connect"),
+            patch.object(task.Device, "wait_ready"),
+        ):
+            device = runtime.discover_device("auto")
+        unfreeze.assert_called_once_with()
+        self.assertEqual(device.serial, "192.168.240.112:5555")
 
     def test_显式ADB设备启动应用不调用Waydroid(self):
         device = task.Device("emulator-5554")
@@ -245,6 +301,46 @@ class 元宝任务测试(unittest.TestCase):
         self.assertEqual(result.stage, "ours")
         self.assertEqual(calls, [("tap", "639", "1284")])
 
+    def test_模板详情Activity被归类为app时仍会返回(self):
+        executor = task.ToolExecutor.__new__(task.ToolExecutor)
+        executor.width = 750
+        executor.height = 1333
+        calls = []
+        executor.device = SimpleNamespace(input=lambda *args: calls.append(args))
+        nested = task.Observation(
+            b"",
+            "",
+            "",
+            (),
+            "com.tencent.hunyuan.app.chat/com.tencent.hunyuan.app.AITemplateDetailActivity",
+            "app",
+        )
+        ours = task.Observation(b"", "", "", (), "com.tencent.hunyuan.app.chat/.home.v2.YBHomeActivityV2", "ours")
+        # 导航等待每轮读取两次时钟；连续观察到详情页超过 12 秒后应返回首页。
+        observations = iter([nested] * 7 + [ours])
+        executor.observe = Mock(side_effect=lambda: next(observations))
+        clock = iter(range(0, 40))
+        with patch("元宝每日任务.time.monotonic", side_effect=lambda: next(clock)), patch(
+            "元宝每日任务.time.sleep"
+        ):
+            result = executor._go_to_ours()
+        self.assertEqual(result.stage, "ours")
+        self.assertIn(("keyevent", "KEYCODE_BACK"), calls)
+
+    def test_福利WebView无障碍树为空仍交给模型确认(self):
+        observation = task.Observation(
+            b"png",
+            "",
+            "",
+            (),
+            "com.tencent.hunyuan.app.chat/com.tencent.yuanbao.mp.components.websdk.ext.ui.WebBrowserActivity",
+            "app",
+        )
+        with patch("元宝每日任务.time.monotonic", return_value=4):
+            result = task.ToolExecutor._welfare_webview_observation(observation, 0)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.stage, "welfare")
+
     def test_显式设备发现不读取Waydroid状态(self):
         runtime = task.WaydroidRuntime()
         with (
@@ -305,6 +401,24 @@ class 元宝任务测试(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(workflow.phase, "claim")
 
+    def test_福利WebView空层级允许视觉点击做同款入口(self):
+        executor = 假执行器()
+        workflow = task.Workflow(self.配置(), executor)
+        workflow.phase = "open_target"
+        workflow.target = "same_template"
+        observation = task.Observation(
+            b"png",
+            "",
+            "",
+            (),
+            "com.tencent.yuanbao.WebBrowserActivity",
+            "welfare",
+        )
+        result = workflow.dispatch("tap", {"x": 620, "y": 980}, observation)
+        self.assertTrue(result.ok)
+        self.assertEqual(workflow.phase, "perform")
+        self.assertTrue(workflow.substate["entry_clicked"])
+
     def test_积分不足时返回我们页仍可完成(self):
         executor = 假执行器()
         executor.reward_use_confirmed = False
@@ -317,7 +431,7 @@ class 元宝任务测试(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertTrue(workflow.finished)
 
-    def test_兑换积分和备用商品价格读取(self):
+    def test_兑换积分和三天卡价格读取(self):
         config = self.配置()
         executor = task.ToolExecutor.__new__(task.ToolExecutor)
         executor.config = config
@@ -407,7 +521,7 @@ class 元宝任务测试(unittest.TestCase):
         config = self.配置()
         executor = task.ToolExecutor.__new__(task.ToolExecutor)
         executor.config = config
-        card = task.Node("QQ超级会员1天卡", "", "", "android.widget.TextView", False, True, task.Bounds(139, 116, 750, 161))
+        card = task.Node("QQ超级会员3天卡", "", "", "android.widget.TextView", False, True, task.Bounds(139, 116, 750, 161))
         tab = task.Node("已使用", "", "", "android.widget.TextView", True, True, task.Bounds(390, 85, 489, 133))
         pending = task.Node("去使用", "", "", "android.widget.Button", True, True, task.Bounds(642, 205, 722, 250))
         observation = task.Observation(b"", "", "", (tab, card, pending), "", "prize_records")
@@ -436,6 +550,12 @@ class 元宝任务测试(unittest.TestCase):
             task.VisionModel._parse_json_tool('```json\n{"tool":"open_welfare","arguments":{}}\n```'),
             ("open_welfare", {}),
         )
+
+    def test_视觉模型设置有限请求超时(self):
+        fake_client = SimpleNamespace()
+        with patch("元宝每日任务.OpenAI", return_value=fake_client) as openai:
+            task.VisionModel(self.配置())
+        self.assertEqual(openai.call_args.kwargs["timeout"], 90)
 
     def test_视觉请求保留同轮历史但只发送最新截图(self):
         class 请求记录器:

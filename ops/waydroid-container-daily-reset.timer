@@ -1,8 +1,8 @@
 [Unit]
-Description=每天北京时间四点五十分清理 Waydroid
+Description=每天北京时间二十三点五十分清理 Waydroid
 
 [Timer]
-OnCalendar=*-*-* 04:50:00 Asia/Shanghai
+OnCalendar=*-*-* 23:50:00 Asia/Shanghai
 Persistent=true
 Unit=waydroid-container-daily-reset.service
 

@@ -33,7 +33,7 @@ DEFAULT_DEVICE = "auto"
 DEFAULT_BASE_URL = "http://localhost:7860/v1"
 DEFAULT_MODEL = "gemini-3.7-flash"
 DEFAULT_TIMEZONE = "Asia/Shanghai"
-DEFAULT_RUN_TIME = "05:00"
+DEFAULT_RUN_TIME = "00:05"
 DEFAULT_TEST_PROMPT = "healthy habits"
 DEFAULT_TEST_IMAGE = str(ROOT / "测试题目.png")
 PACKAGE_NAME = "com.tencent.hunyuan.app.chat"
@@ -41,19 +41,21 @@ DEFAULT_MAX_RETRIES = 3
 DEFAULT_RETRY_COOLDOWN = 10
 DEFAULT_MAX_STEPS = 260
 DEFAULT_GENERATION_TIMEOUT = 180
-DEFAULT_CARD_NAME = "QQ超级会员1天卡"
-DEFAULT_FALLBACK_CARD_NAME = "QQ超级会员3天卡"
+DEFAULT_MODEL_REQUEST_TIMEOUT = 90
+DEFAULT_CARD_NAME = "QQ超级会员3天卡"
 DEFAULT_STATE_PATH = ROOT / ".yuanbao_daily_state.json"
 DEFAULT_STOP_WAYDROID_AFTER_RUN = True
 WAYDROID_START_TIMEOUT = 90
+WAYDROID_READY_TIMEOUT = 45
 WAYDROID_STOP_TIMEOUT = 45
 WAYDROID_POLL_INTERVAL = 1.0
 APP_RESOLVE_TIMEOUT = 45
 APP_RESOLVE_POLL_INTERVAL = 1.0
 OURS_NAV_TIMEOUT = 30
 OURS_NAV_POLL_INTERVAL = 1.0
-WELFARE_LOAD_TIMEOUT = 15
+WELFARE_LOAD_TIMEOUT = 30
 WELFARE_LOAD_POLL_INTERVAL = 1.5
+WELFARE_WEBVIEW_READY_DELAY = 3.0
 MAX_HISTORY_SUMMARY_CHARS = 1200
 MAX_HISTORY_RESULT_CHARS = 1200
 IGNORED_TASKS = ("邀请新用户",)
@@ -130,10 +132,10 @@ class Config:
     retry_cooldown_seconds: int
     max_steps: int
     generation_timeout_seconds: int
+    model_request_timeout_seconds: int
     test_prompt: str
     test_image_path: Path
     card_name: str
-    fallback_card_name: str
     prompt_path: Path
     state_path: Path
 
@@ -175,12 +177,13 @@ class Config:
             generation_timeout_seconds=_env_int(
                 "GENERATION_TIMEOUT_SECONDS", DEFAULT_GENERATION_TIMEOUT, minimum=5
             ),
+            model_request_timeout_seconds=_env_int(
+                "MODEL_REQUEST_TIMEOUT_SECONDS", DEFAULT_MODEL_REQUEST_TIMEOUT, minimum=5
+            ),
             test_prompt=_first_env("TEST_PROMPT", default=DEFAULT_TEST_PROMPT),
             test_image_path=test_image,
-            card_name=_first_env("EXCHANGE_PRODUCT", default=DEFAULT_CARD_NAME),
-            fallback_card_name=_first_env(
-                "EXCHANGE_FALLBACK_PRODUCT", default=DEFAULT_FALLBACK_CARD_NAME
-            ),
+            # 兑换目标固定为三天卡，避免配置或模型误选其它商品。
+            card_name=DEFAULT_CARD_NAME,
             prompt_path=prompt_path,
             state_path=state_path,
         )
@@ -347,6 +350,27 @@ class Device:
             raise AgentError(f"ADB 连接失败：{type(exc).__name__}") from exc
         if state != "device":
             raise AgentError(f"ADB 设备状态不是 device：{state or '空'}")
+
+    def wait_ready(
+        self, timeout: float = WAYDROID_READY_TIMEOUT, poll_interval: float = WAYDROID_POLL_INTERVAL
+    ) -> None:
+        """等待 Android 完成启动，并确认 shell 不再只是表面在线。"""
+        deadline = time.monotonic() + timeout
+        last_error: AgentError | None = None
+        while time.monotonic() < deadline:
+            try:
+                boot_completed = self.adb(
+                    "shell", "getprop", "sys.boot_completed", timeout=5
+                ).decode("utf-8", errors="replace").strip()
+                if boot_completed == "1":
+                    # 冻结的 Waydroid 也可能返回 get-state=device；再做一次短 shell 探针。
+                    self.adb("shell", "echo", "auto-daily-ready", timeout=5)
+                    return
+            except AgentError as exc:
+                last_error = exc
+            time.sleep(poll_interval)
+        detail = f"；{last_error}" if last_error else ""
+        raise AgentError(f"Android 尚未完成启动或 ADB shell 无响应（等待 {timeout:.0f} 秒{detail}）")
 
     def adb(self, *args: str, timeout: float = 20, check: bool = True) -> bytes:
         command = ["adb", "-s", self.serial, *args]
@@ -516,6 +540,10 @@ class WaydroidRuntime:
         return bool(re.search(r"^Session:\s*RUNNING\s*$", status, re.MULTILINE))
 
     @staticmethod
+    def _container_frozen(status: str) -> bool:
+        return bool(re.search(r"^Container:\s*FROZEN\s*$", status, re.MULTILINE))
+
+    @staticmethod
     def _fully_stopped(status: str) -> bool:
         # Waydroid 没有用户会话时只输出 Session: STOPPED，不会输出 Container 行。
         # 只有明确报告容器仍在运行时才需要继续等待；缺少该行代表会话已退出。
@@ -536,6 +564,22 @@ class WaydroidRuntime:
         except OSError as exc:
             raise AgentError(f"无法启动 Waydroid 会话：{type(exc).__name__}") from exc
 
+    @staticmethod
+    def _unfreeze_container() -> None:
+        try:
+            result = subprocess.run(
+                ["waydroid", "container", "unfreeze"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise AgentError(f"无法解冻 Waydroid 容器：{type(exc).__name__}") from exc
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()[:180]
+            raise AgentError(f"Waydroid 容器解冻失败：{detail or '无输出'}")
+
     def discover_device(self, configured: str) -> Device:
         """必要时启动会话，并等待容器 IP 与 ADB 都可用。"""
         value = configured.strip()
@@ -544,6 +588,10 @@ class WaydroidRuntime:
 
         self.managed = True
         status = self._status()
+        if self._container_frozen(status):
+            print("Waydroid 容器当前已冻结，正在解冻")
+            self._unfreeze_container()
+            status = self._status()
         if not self._extract_ip(status) and not self._session_running(status):
             self._start_session()
             self._session_started = True
@@ -551,13 +599,21 @@ class WaydroidRuntime:
         try:
             deadline = time.monotonic() + self.start_timeout
             last_error: AgentError | None = None
+            unfreeze_attempted = False
             while time.monotonic() < deadline:
                 status = self._status()
+                if self._container_frozen(status) and not unfreeze_attempted:
+                    unfreeze_attempted = True
+                    print("Waydroid 容器在启动等待期间被冻结，正在解冻")
+                    self._unfreeze_container()
+                    continue
                 ip = self._extract_ip(status)
                 if ip:
                     device = Device(f"{ip}:5555")
                     try:
                         device.connect()
+                        remaining = max(1.0, deadline - time.monotonic())
+                        device.wait_ready(timeout=min(WAYDROID_READY_TIMEOUT, remaining))
                         return device
                     except AgentError as exc:
                         last_error = exc
@@ -633,6 +689,13 @@ def detect_stage(nodes: Iterable[Node], activity: str) -> str:
     node_list = list(nodes)
     text = " ".join(node.searchable for node in node_list)
     activity_lower = activity.lower()
+    # 更新遮罩里的功能说明也会出现“拍题”等词，必须先标为应用阻塞层。
+    if any(
+        node.resource_id.endswith(":id/upgrade_dialog")
+        or node.resource_id.endswith(":id/skip")
+        for node in node_list
+    ):
+        return "app"
     if (
         "documentsui" in activity_lower
         or "com.google.android.documentsui" in text
@@ -650,9 +713,7 @@ def detect_stage(nodes: Iterable[Node], activity: str) -> str:
         for marker in ("每日问元宝得积分", "去写作", "去p图", "去拍题", "问元宝任意问题累计")
     ):
         return "welfare"
-    if "兑换商城" in text or any(
-        marker in text for marker in ("qq超级会员1天卡", "qq超级会员3天卡")
-    ):
+    if "兑换商城" in text or "qq超级会员3天卡" in text:
         return "exchange"
     # “我们”页的抽屉中有福利中心和任务；聊天页虽然也有底部导航，但没有这组内容。
     if "福利中心" in text and "任务" in text:
@@ -748,6 +809,19 @@ class ToolExecutor:
         time.sleep(0.5)
         return True
 
+    def _dismiss_upgrade_prompt(self, nodes: Iterable[Node]) -> bool:
+        """关闭元宝冷启动时的版本更新遮罩，避免遮住底部导航。"""
+        dialog = find_node(nodes, f"{PACKAGE_NAME}:id/upgrade_dialog")
+        title = find_node(nodes, "元宝新版本", exact=True)
+        if dialog is None and title is None:
+            return False
+        skip = find_node(nodes, f"{PACKAGE_NAME}:id/skip", clickable_only=True)
+        if skip is None:
+            return False
+        self._tap_node(skip)
+        time.sleep(0.8)
+        return True
+
     def observe(self) -> Observation:
         # Waydroid/Android 某些实例首次启动应用时会弹出系统兼容性提示；
         # 该提示不是业务状态，若不关闭会遮住底部导航并阻断固定的首步导航。
@@ -756,6 +830,8 @@ class ToolExecutor:
             ui_xml = self.device.ui_dump()
             nodes = tuple(parse_nodes(ui_xml))
             if self._dismiss_android_warning(nodes):
+                continue
+            if self._dismiss_upgrade_prompt(nodes):
                 continue
             activity = self.device.activity()
             return Observation(image, ui_xml, compact_ui(ui_xml), nodes, activity, detect_stage(nodes, activity))
@@ -912,6 +988,7 @@ class ToolExecutor:
     def _go_to_ours(self) -> Observation:
         """等待首页导航就绪后进入“我们”，避免冷启动时过早返回或误按。"""
         deadline = time.monotonic() + OURS_NAV_TIMEOUT
+        back_sent = False
         while time.monotonic() < deadline:
             observation = self.observe()
             if observation.stage == "ours":
@@ -922,34 +999,131 @@ class ToolExecutor:
                 self._tap_node(ours_node)
                 time.sleep(1.5)
                 continue
-            # 应用冷启动或 WebView 首次恢复时层级可能暂时为空。
-            # 先给首页最多约 8 秒加载时间，避免 BACK 把尚未就绪的应用退出。
+            # 应用冷启动或 WebView 首次恢复时层级可能暂时为空；聊天首页不要因暂时空层级退出。
             elapsed = OURS_NAV_TIMEOUT - max(0.0, deadline - time.monotonic())
-            if elapsed >= 8:
+            activity_lower = observation.activity.lower()
+            # 元宝的模板详情、写作和拍题 Activity 都可能被统一归类为 app；
+            # 只要不是 home.v2 首页，就说明当前仍在应用内部嵌套页，可以安全返回。
+            nested_app = PACKAGE_NAME in activity_lower and "home.v2" not in activity_lower
+            clearly_nested = observation.stage in {
+                "writing",
+                "image",
+                "photo_question",
+                "photo_preview",
+                "picker",
+            } or nested_app or (
+                "home.v2" not in activity_lower and observation.stage not in {"app", "unknown"}
+            )
+            if elapsed >= 12 and clearly_nested and not back_sent:
                 self.device.input("keyevent", "KEYCODE_BACK")
+                back_sent = True
                 time.sleep(1.2)
             else:
                 time.sleep(OURS_NAV_POLL_INTERVAL)
         observation = self.observe()
-        if observation.stage != "ours":
-            raise AgentError("无法回到元宝“我们”页面")
-        return observation
-
-    def _go_to_welfare(self) -> Observation:
-        observation = self._go_to_ours()
-        welfare_node = find_node(observation.nodes, "福利中心", exact=True)
-        if welfare_node is None:
-            self._tap_point(640, 486)
-        else:
-            self._tap_node(welfare_node)
-        # WebView 从详情页返回时偶尔需要数秒恢复层级；在执行层内等待，避免把临时加载状态交给模型。
-        deadline = time.monotonic() + WELFARE_LOAD_TIMEOUT
+        if observation.stage == "ours":
+            return observation
+        # WebView 返回时偶发出现空层级；重启应用可恢复已登录首页，且不会清除任务进度。
+        try:
+            self.device.adb("shell", "am", "force-stop", PACKAGE_NAME, timeout=20)
+            time.sleep(1)
+            self.device.launch_app(PACKAGE_NAME)
+        except AgentError as exc:
+            raise AgentError(f"无法回到元宝“我们”页面，应用重启失败：{exc}") from exc
+        deadline = time.monotonic() + OURS_NAV_TIMEOUT
         while time.monotonic() < deadline:
             observation = self.observe()
-            if observation.stage == "welfare":
+            if observation.stage == "ours":
                 return observation
-            time.sleep(WELFARE_LOAD_POLL_INTERVAL)
-        raise AgentError("福利中心没有加载出任务页面")
+            ours_node = find_node(observation.nodes, "我们", exact=True)
+            if ours_node is not None:
+                self._tap_node(ours_node)
+                time.sleep(1.5)
+            else:
+                time.sleep(OURS_NAV_POLL_INTERVAL)
+        raise AgentError("无法回到元宝“我们”页面")
+
+    def _go_to_welfare(self) -> Observation:
+        last_observation: Observation | None = None
+        for attempt in range(2):
+            observation = self._go_to_ours()
+            last_observation = observation
+            # 入口本身也可能在抽屉恢复期间暂时缺失；最多等待几秒后再使用已知布局坐标。
+            entry_deadline = time.monotonic() + min(8, WELFARE_LOAD_TIMEOUT)
+            fallback_tapped = False
+            last_entry_tap_at: float | None = None
+            while time.monotonic() < entry_deadline:
+                if observation.stage == "welfare":
+                    return observation
+                webview_observation = self._welfare_webview_observation(
+                    observation, last_entry_tap_at
+                )
+                if webview_observation is not None:
+                    print("福利中心 WebView 已打开，无障碍树暂时为空，交由模型确认")
+                    return webview_observation
+                welfare_node = find_node(observation.nodes, "福利中心", exact=True)
+                if welfare_node is not None and last_entry_tap_at is None:
+                    self._tap_node(welfare_node)
+                    last_entry_tap_at = time.monotonic()
+                elif not fallback_tapped and time.monotonic() + 1 >= entry_deadline:
+                    self._tap_point(640, 486)
+                    fallback_tapped = True
+                    last_entry_tap_at = time.monotonic()
+                time.sleep(OURS_NAV_POLL_INTERVAL)
+                observation = self.observe()
+                last_observation = observation
+            # WebView 从详情页返回时偶尔需要数十秒恢复层级；在执行层内等待，避免把临时加载状态交给模型。
+            deadline = time.monotonic() + WELFARE_LOAD_TIMEOUT
+            while time.monotonic() < deadline:
+                observation = self.observe()
+                last_observation = observation
+                if observation.stage == "welfare":
+                    return observation
+                webview_observation = self._welfare_webview_observation(
+                    observation, last_entry_tap_at
+                )
+                if webview_observation is not None:
+                    print("福利中心 WebView 已打开，无障碍树暂时为空，交由模型确认")
+                    return webview_observation
+                # 如果抽屉仍停留在“我们”页，重复点击入口，覆盖第一次点击未被 WebView 接收的竞态。
+                if observation.stage == "ours":
+                    welfare_node = find_node(observation.nodes, "福利中心", exact=True)
+                    now = time.monotonic()
+                    if welfare_node is not None and (
+                        last_entry_tap_at is None or now - last_entry_tap_at >= 5
+                    ):
+                        self._tap_node(welfare_node)
+                        last_entry_tap_at = now
+                time.sleep(WELFARE_LOAD_POLL_INTERVAL)
+            if attempt == 0:
+                print("福利中心页面加载超时，正在重启元宝并重试")
+                self.device.adb("shell", "am", "force-stop", PACKAGE_NAME, timeout=20)
+                time.sleep(1)
+                self.device.launch_app(PACKAGE_NAME)
+        detail = ""
+        if last_observation is not None:
+            detail = f"（阶段={last_observation.stage or '未知'}，Activity={last_observation.activity[:120] or '未知'}）"
+        raise AgentError(f"福利中心没有加载出任务页面{detail}")
+
+    @staticmethod
+    def _welfare_webview_observation(
+        observation: Observation, entry_started_at: float | None
+    ) -> Observation | None:
+        """福利页 WebView 偶发没有无障碍文本时，等待渲染后交给视觉模型确认。"""
+        if entry_started_at is None:
+            return None
+        if "webbrowseractivity" not in observation.activity.lower():
+            return None
+        if time.monotonic() - entry_started_at < WELFARE_WEBVIEW_READY_DELAY:
+            return None
+        return Observation(
+            observation.image,
+            observation.ui_xml,
+            observation.ui,
+            observation.nodes,
+            observation.activity,
+            "welfare",
+        )
 
     def _ensure_picker_image(self) -> ToolResult:
         if not self.image_pushed:
@@ -1117,48 +1291,22 @@ class ToolExecutor:
             candidates.append((abs(ny - product.bounds.bottom), int(match.group(1))))
         return min(candidates, default=(0, None), key=lambda item: item[0])[1]
 
-    def _exchange_to_top(self, observation: Observation) -> Observation:
-        """把兑换商城列表复位到顶部，供备用商品从同一滚动起点重新扫描。"""
-        top_button = find_node(observation.nodes, "回到顶部", clickable_only=True)
-        if top_button is not None:
-            self._tap_node(top_button)
-            time.sleep(1)
-            return self.observe()
-        # 某些版本不暴露“回到顶部”按钮，反向滑动若干次也能回到首屏。
-        for _ in range(8):
-            self.device.input(
-                "swipe",
-                str(self.width // 2),
-                "450",
-                str(self.width // 2),
-                "1150",
-                "500",
-            )
-            time.sleep(0.6)
-            observation = self.observe()
-        return observation
-
     def _recover_exchange_state(self, observation: Observation) -> str | None:
         """从同日状态文件恢复兑换流程，避免服务重启后重复扣积分。"""
-        candidates = [self.config.card_name]
-        if self.config.fallback_card_name and self.config.fallback_card_name not in candidates:
-            candidates.append(self.config.fallback_card_name)
-        for card_name in candidates:
-            status = self._today_exchange_status(card_name)
-            if status is None:
-                continue
-            self.reward_card_name = card_name
-            self.exchange_confirmed = True
-            if status == "used":
-                self.prize_records_opened = True
-                self.reward_use_clicked = True
-                self.reward_use_confirmed = True
-                return status
-            if status == "unavailable":
-                self.reward_unavailable = True
-                return status
-            return "pending"
-        return None
+        status = self._today_exchange_status(self.config.card_name)
+        if status is None:
+            return None
+        self.reward_card_name = self.config.card_name
+        self.exchange_confirmed = True
+        if status == "used":
+            self.prize_records_opened = True
+            self.reward_use_clicked = True
+            self.reward_use_confirmed = True
+            return status
+        if status == "unavailable":
+            self.reward_unavailable = True
+            return status
+        return "pending"
 
     def _redeem_card(self) -> ToolResult:
         observation = self.observe()
@@ -1187,7 +1335,7 @@ class ToolExecutor:
         if recovered == "unavailable":
             return self._result(
                 True,
-                "已从同日状态恢复：备用兑换商品积分不足，跳过兑换并返回“我们”页",
+                "已从同日状态恢复：QQ超级会员3天卡积分不足，跳过兑换并返回“我们”页",
                 stage=observation.stage,
                 reward_unavailable=True,
             )
@@ -1208,44 +1356,28 @@ class ToolExecutor:
             time.sleep(1)
             observation = self.observe()
             found = self._find_card_and_button(observation, self.reward_card_name)
-        if not found and self.config.fallback_card_name:
-            # 1 天卡下架时继续扫描 3 天卡；只有读到积分和价格后才允许决定是否跳过。
-            fallback = self.config.fallback_card_name
-            observation = self._exchange_to_top(observation)
-            self.reward_card_name = fallback
-            found = self._find_card_and_button(observation, fallback)
-            for _ in range(6):
-                if found:
-                    break
-                self.device.input("swipe", str(self.width // 2), "1150", str(self.width // 2), "450", "500")
-                time.sleep(1)
-                observation = self.observe()
-                found = self._find_card_and_button(observation, fallback)
-            if found:
-                product, _ = found
-                points = self._read_exchange_points(observation)
-                cost = self._read_product_cost(observation, product)
-                if points is None or cost is None:
-                    return self._result(
-                        False,
-                        f"已找到备用商品“{fallback}”，但无法确认积分或价格，拒绝盲目兑换",
-                        stage=observation.stage,
-                    )
-                if points < cost:
-                    self.reward_unavailable = True
-                    self._write_state("unavailable", fallback)
-                    return self._result(
-                        True,
-                        f"未找到“{self.config.card_name}”；备用商品“{fallback}”需要 {cost} 积分，当前仅 {points}，跳过兑换并返回“我们”页",
-                        stage=observation.stage,
-                        reward_unavailable=True,
-                        points=points,
-                        cost=cost,
-                    )
         if not found:
-            self.reward_card_name = self.config.card_name
-            return self._result(False, f"没有找到目标商品：{self.config.card_name}，备用商品也不可用")
+            return self._result(False, f"没有找到目标商品：{self.config.card_name}")
         product, button = found
+        points = self._read_exchange_points(observation)
+        cost = self._read_product_cost(observation, product)
+        if points is None or cost is None:
+            return self._result(
+                False,
+                f"已找到目标商品“{self.config.card_name}”，但无法确认积分或价格，拒绝盲目兑换",
+                stage=observation.stage,
+            )
+        if points < cost:
+            self.reward_unavailable = True
+            self._write_state("unavailable")
+            return self._result(
+                True,
+                f"目标商品“{self.config.card_name}”需要 {cost} 积分，当前仅 {points}，跳过兑换并返回“我们”页",
+                stage=observation.stage,
+                reward_unavailable=True,
+                points=points,
+                cost=cost,
+            )
         self._tap_node(button)
         time.sleep(2)
         self.exchange_target_clicked = True
@@ -1613,7 +1745,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "redeem_qq_card",
-            "description": "优先定位配置指定的 QQ 超级会员 1 天卡；若页面没有该商品则查找配置的 3 天卡，积分不足时安全跳过兑换。",
+            "description": "只定位 QQ 超级会员 3 天卡；读取当前积分和商品价格，积分不足时安全跳过兑换。",
             "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
         },
     },
@@ -1679,7 +1811,12 @@ class VisionModel:
 
     def __init__(self, config: Config):
         self.config = config
-        self.client = OpenAI(api_key=config.api_key, base_url=config.base_url)
+        # 视觉网关无响应时必须回到统一重试边界，不能无限占用 Waydroid 会话。
+        self.client = OpenAI(
+            api_key=config.api_key,
+            base_url=config.base_url,
+            timeout=config.model_request_timeout_seconds,
+        )
         self.tools_supported = True
         # 系统提示必须在同一轮请求中完全一致；动态状态放到最新 user 消息末尾。
         # 端点不支持 tools 时也沿用同一份静态协议，避免降级请求改变前缀。
@@ -2014,12 +2151,20 @@ class Workflow:
         return False
 
     @staticmethod
-    def _tap_hits_label(args: dict[str, Any], observation: Observation, *markers: str) -> bool:
+    def _tap_hits_label(
+        args: dict[str, Any],
+        observation: Observation,
+        *markers: str,
+        allow_empty_welfare: bool = False,
+    ) -> bool:
         """判断模型点击是否落在当前观测中带指定语义的控件附近。"""
         try:
             x, y = int(args["x"]), int(args["y"])
         except (KeyError, TypeError, ValueError):
             return False
+        # 福利 WebView 偶发只返回空无障碍树；此时截图仍可交给视觉模型定位入口。
+        if allow_empty_welfare and observation.stage == "welfare" and not observation.nodes:
+            return True
         wanted = tuple(marker.lower() for marker in markers)
         for node in observation.nodes:
             if not node.enabled or node.bounds.area <= 0:
@@ -2046,7 +2191,7 @@ class Workflow:
             return ToolResult(False, "尚未回到“我们”页面")
         self.finished = True
         if reward_unavailable:
-            return ToolResult(True, "每日任务已完成；备用兑换商品积分不足，已返回“我们”页面")
+            return ToolResult(True, "每日任务已完成；QQ超级会员3天卡积分不足，已返回“我们”页面")
         return ToolResult(True, "每日任务与奖品使用均已完成，本轮进入下一次等待")
 
     def dispatch(self, name: str, args: dict[str, Any], observation: Observation) -> ToolResult:
@@ -2062,13 +2207,17 @@ class Workflow:
         if name == "tap" and observation.stage == "welfare" and self._ignored_welfare_tap(args, observation):
             return ToolResult(False, "已拒绝点击“邀请新用户”任务")
         if name == "tap" and self.target == "same_template":
-            if self.phase == "open_target" and not self._tap_hits_label(args, observation, "做同款"):
+            if self.phase == "open_target" and not self._tap_hits_label(
+                args, observation, "做同款", allow_empty_welfare=True
+            ):
                 return ToolResult(False, "请点击福利中心中“做同款”任务入口")
             if self.phase == "perform":
                 if self.substate.get("template_clicked", False):
                     return ToolResult(False, "推荐模板已经点击，下一步应直接发送并等待生成")
                 if not self.substate.get("entry_clicked", False):
-                    if observation.stage != "welfare" or not self._tap_hits_label(args, observation, "做同款"):
+                    if observation.stage != "welfare" or not self._tap_hits_label(
+                        args, observation, "做同款", allow_empty_welfare=True
+                    ):
                         return ToolResult(False, "请先点击福利中心中“做同款”任务入口")
                 elif not self._tap_hits_label(args, observation, "做同款"):
                     return ToolResult(False, "请在推荐模板页点击任意一个“做同款”按钮")

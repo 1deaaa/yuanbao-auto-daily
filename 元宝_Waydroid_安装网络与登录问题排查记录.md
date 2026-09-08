@@ -12,11 +12,11 @@
 - Android：13。
 - 设备地址：由 `waydroid status` 动态获取（本文用 `<WAYDROID_IP>:5555` 表示）。
 - 设备型号伪装：小米 13 对应标识 `2211133C`，设备代号 `fuxi`。
-- ABI：系统为 x86_64，同时声明 `arm64-v8a`、`armeabi-v7a`、`armeabi`，通过 `libhoudini.so` 提供 ARM 翻译。因此 ARM/ARM64 APK 通常可以尝试安装运行，但实际执行可能经过指令翻译；带有特殊原生库、反模拟器检测或依赖 Google/厂商硬件服务的应用仍需单独验证。
+- ABI：系统为 x86_64，同时声明 `arm64-v8a`、`armeabi-v7a`、`armeabi`，当前通过 `libndk_translation.so` 提供 ARM 翻译。因此 ARM/ARM64 APK 通常可以尝试安装运行，但实际执行可能经过指令翻译；带有特殊原生库、反模拟器检测或依赖 Google/厂商硬件服务的应用仍需单独验证。
 - 显示：`750x1333`，密度 `225`，适合在宿主机上以手机窗口使用，而不是占满 1440 高度的全屏窗口。
 - 系统语言：`zh-CN`（简体中文）。
 - 系统时区：`Asia/Shanghai`（北京时间，UTC+08:00）。
-- 已安装应用：腾讯元宝 `com.tencent.hunyuan.app.chat`（本次运行版本名 `2.79.10`、版本号 `61784970`）、应用宝 `com.tencent.android.qqdownloader`、系统 WebView `com.android.webview` 等。
+- 已安装应用：腾讯元宝 `com.tencent.hunyuan.app.chat`（当前官方版本名 `2.83.10`、版本号 `63888094`）、应用宝 `com.tencent.android.qqdownloader`、系统 WebView `com.android.webview` 等。
 - 桌面入口：
   - `~/.local/share/applications/waydroid.com.tencent.hunyuan.app.chat.desktop`（元宝）
   - `~/.local/share/applications/waydroid.com.tencent.android.qqdownloader.desktop`（应用宝）
@@ -40,7 +40,7 @@
 
 ## 2. 环境与安装背景
 
-宿主机为 Ubuntu 26.04 LTS、KDE 6、纯 Wayland，CPU 为 AMD Ryzen 7 4800H，使用核显。选择 Waydroid 的原因是它直接使用 Linux 容器和宿主图形栈，启动开销较低，并能通过 Houdini 兼容层运行 ARM/ARM64 Android 包。
+宿主机为 Ubuntu 26.04 LTS、KDE 6、纯 Wayland，CPU 为 AMD Ryzen 7 4800H，使用核显。选择 Waydroid 的原因是它直接使用 Linux 容器和宿主图形栈，启动开销较低，并能通过 ARM 二进制翻译层运行 ARM/ARM64 Android 包；本机当前采用 `libndk_translation.so`。
 
 安装和调试期间完成了以下基础工作：
 
@@ -127,6 +127,55 @@ ro.ndk_translation.version=0.2.3
 本次没有通过关闭 Clash TUN、把腾讯域名强制送代理、替换宿主机 DNS 或修改宿主机防火墙来“碰运气”解决。网络部分的有效操作是确认链路事实：Waydroid 能拿到 DHCP、网关和 DNS，腾讯主页/验证码页能返回 HTTP 200，Mihomo 对匹配到的腾讯域名执行 `DIRECT`。在此基础上，登录失败改由 WebView 进程日志继续定位；切换元宝到系统 WebView 后，验证码页、扫码回调和登录跳转恢复正常。
 
 因此，网络问题的可复现解决方案是“保留现有 TUN + 规则直连，排除错误网络归因，再修复 X5 渲染兼容性”，而不是继续扩大网络配置改动范围。
+
+### 3.4 登录成功后历史和消息不可用：`fwmarkd/netd` 兼容修复
+
+用户完成登录后，元宝主页可以显示但历史无法加载、发送消息无响应。此时 Android 网络面板仍显示默认网络已验证，宿主机和容器也能访问腾讯 HTTPS；继续对 Clash/TUN 做改动没有解释力。对元宝 TIM SDK 的连接日志和 Waydroid `netd` 行为进行对照后，定位到 `fwmarkd` 请求格式兼容问题：元宝原生 SDK 的 `ON_CONNECT` 请求带有额外 36 字节目标地址，旧属性未启用时容器内 `netd` 只接受 16 字节，因长度不符返回 `EBADMSG`。这会让元宝把登录后的连接误判为 `ERR_CONNECTION_FAILED`，表现为历史和发送功能一起失效。
+
+本机将以下持久属性设为 `true`，并在重启后确认生成文件和 Android 运行时属性一致：
+
+```text
+ro.vendor.redirect_socket_calls=true
+```
+
+涉及的属性源和生成文件包括：
+
+```text
+/var/lib/waydroid/waydroid.cfg
+/var/lib/waydroid/waydroid_base.prop
+/var/lib/waydroid/waydroid.prop
+/var/lib/waydroid/rootfs/vendor/waydroid.prop
+```
+
+修改前保留了备份：
+
+```text
+/var/lib/waydroid/waydroid.cfg.before-fwmark-20260905-010649
+/var/lib/waydroid/waydroid_base.prop.before-fwmark-20260905-011023
+```
+
+每次修改属性后都必须完整重启容器和 Android 会话，再用当前动态地址检查：
+
+```bash
+waydroid session stop
+sudo waydroid container stop
+sudo waydroid container start
+waydroid session start
+adb connect <WAYDROID_IP>:5555
+adb -s <WAYDROID_IP>:5555 shell getprop ro.vendor.redirect_socket_calls
+```
+
+修复后的实际日志证据为：
+
+```text
+ro.vendor.redirect_socket_calls=true
+Connect to im server successfully
+Login success
+synchronize server complete
+receive heartbeat response
+```
+
+随后已通过元宝发送测试消息并收到回复；修复后未再出现新的 `9508`、`ERR_CONNECTION_FAILED` 或 `EBADMSG`。ICMP ping 丢包不能单独证明 Android 断网，验证应优先使用 TCP/HTTPS、Android `VALIDATED` 状态和元宝 TIM 心跳。该开关属于 Waydroid 与应用/系统版本的兼容性处理，重新初始化镜像或升级 Android 后应重新抓取日志确认。
 
 ## 4. 第二次故障定位：登录无限转圈的真实原因
 
@@ -359,6 +408,27 @@ adb -s <WAYDROID_IP>:5555 get-state
 
 从当前版本起兑换目标固定为 `QQ超级会员3天卡`。执行层只扫描该商品，读取当前积分和商品价格后再决定是否点击；积分不足会记录当天 `unavailable` 状态、返回“我们”页并完成任务，不会改兑 1 天卡或任何其它商品。历史实测中出现的 1 天卡记录属于旧策略，不代表当前行为。
 
+### 10.8 2026-09-02 启动失败复现与修复验证
+
+1. 当天 `00:05:38` 定时器正常触发，但服务连续五次在首步 `open_welfare` 失败，`00:21:23` 出现 `Start request repeated too quickly`。回看同版本冷启动截图和层级后确认，直接诱因是元宝“元宝新版本”更新遮罩：遮罩说明文字包含“拍题”，旧阶段识别器误判为拍题页，同时遮住底部“我们”入口。
+2. 执行层现在在每次首屏观测中优先处理 Android 兼容性提示和元宝更新遮罩，识别 `upgrade_dialog`/`skip` 后自动跳过；阶段识别也把该遮罩固定归类为 `app`，不会再次被其中的功能说明误判为业务任务页。应用启动还会等待 Splash 窗口消失，并从干净的元宝进程开始。
+3. `waydroid status` 偶尔会报告 `Session: RUNNING / Container: FROZEN`，普通用户执行 `waydroid container unfreeze` 会因 root 权限或 `/var/lib/waydroid/waydroid.log` 权限失败。运行时现在自动停止并重新启动用户会话，随后重新发现动态 ADB 地址；真实测试已确认从 `FROZEN` 恢复到 `RUNNING`，ADB `192.168.240.112:5555` 在线。
+4. 已知元宝首次协议页不需要模型猜测：脚本默认只在 `HYLoginMainActivity` 中找到可点击的精确“同意并继续”时自动确认；按钮缺失或 `AUTO_ACCEPT_PROTOCOL=false` 时才保留人工阻塞。手机号、验证码、微信/QQ 扫码登录和 ANR 仍属于人工前置条件。
+5. Android 系统兼容性提示也不需要模型猜测：启动阶段优先识别标题为“Android 系统”、类型为 `SYSTEM_ERROR` 且处于可见状态的系统窗口。无障碍树可用时点击精确的“确定”节点；无障碍树因容器冻结暂时为空时，从窗口边界计算右下按钮中心后点击，避免把该弹窗误交给模型。
+6. 登录或 ANR 等人工阻塞由脚本提升为 `ManualActionRequired`，保留 Waydroid 现场并返回退出码 `75`；服务单元的 `RestartPreventExitStatus=75` 会阻止重复拉起同一阻塞页面。此前协议页人工停止的真实记录对应旧版本逻辑。
+7. 另外修正会话所有权：任务首步失败时只停止本轮新启动的 Waydroid 会话，不会停止用户预先打开的会话；任务成功仍按 `STOP_WAYDROID_AFTER_RUN=true` 回收 Waydroid。
+8. 本轮验证通过 47 项单元测试、Python 编译检查和 `git diff --check`；测试结束后请确认 `waydroid status`，下次定时触发时间为北京时间 `00:05`。
+
+### 10.9 2026-09-03 最新 ARM64 版本与转译后端对照
+
+1. 从腾讯应用宝官方详情页取得 `com.tencent.hunyuan.app.chat` 的 `2.83.10` 单 APK。该官方包只有 `lib/arm64-v8a`，没有 `x86` 或 `x86_64` 原生库；此前的第三方 XAPK 虽然同为 `2.83.10`，却带有 Google Play `PairIP LicenseActivity`，侧载到 VANILLA Waydroid 后会因缺少 `com.android.vending.licensing.ILicensingService` 反复授权失败。
+2. 使用 `adb install -r` 覆盖安装官方包，版本更新为 `2.83.10`，应用数据目录 inode 未变，没有执行 `pm clear`。安装后需用 `pm enable --user 0 com.tencent.hunyuan.app.chat` 恢复用户启用状态；当前画面为手机/扫码登录页，登录仍需人工完成。
+3. 在同一台机器、同一设备属性和同一 APK 下做冷启动对照：`libhoudini.so` 于 `21:16:39` 启动，`am start -W` 超时，随后持续出现 `TuringFD` 的 `Long monitor contention`，Splash 未正常退出。
+4. 先备份 `/var/lib/waydroid/waydroid.cfg`、`waydroid_base.prop`、`waydroid.prop` 和 system 覆盖层，再按 Android 13 配置安装 `libndk_translation`。当前生效属性为 `ro.dalvik.vm.native.bridge=libndk_translation.so`，版本为 `0.2.3`。
+5. 切换后于 `21:24:01` 冷启动同一官方包，日志显示 `Initialized NDK translation (aarch64), version 0.2.3`；`am start -W` 返回 `Status: ok`、`LaunchState: COLD`、`TotalTime: 1937`，并记录 `Displayed ... HYLoginMainActivity: +1s937ms`。手工关闭一次 Android 系统兼容性提示后，截图和无障碍层级均显示完整登录页，未再出现 Houdini 下的启动锁死。
+
+结论：在本机 AMD x86_64 Waydroid 上，元宝最新官方 ARM64 包可以通过 `libndk_translation` 完成稳定冷启动；当前推荐后端改为 `libndk_translation`，而不是 `libhoudini`。这只证明启动和登录页兼容，登录后的 WebView、任务页面和后续原生能力仍需在人工登录后继续验证。转译层和应用版本升级都可能改变结果，升级前应保留配置备份。
+
 ## 11. 4GB 内存限制与每日任务生命周期
 
 ### 11.1 内存限制
@@ -407,3 +477,43 @@ LimitNOFILE=524288
 Waydroid root 服务同时使用 `ops/waydroid-container.service.d/recovery.conf` 的崩溃自动重启。`ops/waydroid-container-watchdog.timer` 每 10 分钟检查空闲容器管理器的文件句柄，默认达到 800 个才重启；`ops/waydroid-container-daily-reset.timer` 每天北京时间 23:50 只在 `Container` 非 RUNNING 时重启管理器，为次日 00:05 任务预先清理上一轮留下的句柄。两项检查都不会主动停止正在运行的 Android 容器。
 
 这套机制可以自动恢复已知的启动竞态、Waydroid 管理器崩溃和句柄泄漏；不能保证上游应用改版、外网不可用、本地模型网关故障、宿主机掉电或整体 OOM 时任务一定成功。此类异常仍需查看 `journalctl --user -u yuanbao-daily.service` 和 `journalctl -u waydroid-container.service`。
+
+### 11.5 2026-09-07 任务中途停止与请求精简
+
+1. `00:05` 的首轮服务正常启动，前置任务可以执行；第一次中断发生在写作任务的 `input_test_prompt`。页面正在加载或 WebView 重绘时，固定文本没有及时出现在输入框，连续三次外层重试触发防循环熔断。systemd 随后按 `Restart=on-failure` 重试，最终因 `StartLimitBurst=5` 停止。日志没有内存不足、网络断开或 Waydroid HIDL 崩溃证据。
+2. 补跑时发现第二个独立问题：拍题入口有时先进入相机预览，原有图片选择器判断只接受相册页面，导致 `select_local_image` 连续失败。现在支持相册、图片、上传等入口语义、相机预览返回和有限备用坐标，并在进入选择器后只选脚本推送的脱敏图片。
+3. 随后“做同款”任务曾因福利 WebView 空无障碍树拒绝模型坐标；增加了空树福利入口的有界放行、文字节点校正和推荐卡片父控件回退。最终补跑从已有计数恢复，`23:50:25` 读到五项任务全部 `3/3`，`23:51:07` 读取到三天卡需要 `30000` 积分而当前仅 `20000`，安全跳过兑换，`23:51:34` `complete_task` 成功，服务退出码为 0，随后 Waydroid 正常停止。
+
+本轮同时把工作流收敛为“视觉定位一次、本地重复执行”的边界：
+
+| 环节 | 执行方 | 仍保留的校验 |
+| --- | --- | --- |
+| 任务进度读取 | 视觉模型 | 福利中心截图和字段范围校验 |
+| 每种任务首次入口定位 | 视觉模型 | 屏幕边界、忽略“邀请新用户”、阶段校验 |
+| 同一任务第 2/3 次入口 | 本地坐标缓存 | 当前页面阶段、文字邻近或已知大卡片区域校验；失败立即清缓存并回退模型 |
+| 推荐模板首次卡片定位 | 视觉模型 | `做同款`文字或可点击大卡片校验 |
+| 推荐模板后续卡片 | 本地坐标缓存 | `app`阶段及文字/卡片区域校验 |
+| 输入、发送、生成等待、选图、确认、领奖、返回、兑换和完成断言 | 本地执行器 | 每个动作都有前置状态和页面结果证据 |
+| 登录、协议、验证码、扫码、未知异常 | 人工或视觉模型判断 | 不通过无意义重试掩盖人工阻塞 |
+
+缓存只在单次进程中存在，不写入状态文件，因此不会把旧分辨率或旧版本布局带到下一天。固定任务子步骤集中在 `TASK_STEPS` 配方表中，输入类、图片类和做同款流程共用同一套阶段编排，减少散落的重复分支。
+
+这项优化不改变必要的智能判断：模型仍负责“当前任务做到几次”“当前入口在哪里”“推荐模板卡片在哪里”和“页面是否出现未知状态”。在布局稳定的情况下，第二、三次重复任务及做同款卡片不再各自请求一次视觉模型；布局变化时会自动恢复原有模型路径。
+
+### 11.6 2026-09-08 中途停止复盘与最终补跑
+
+本次中断的直接原因不是宿主机内存、ADB 网络或 Waydroid 崩溃，而是工作流状态被一次视觉误读覆盖：
+
+1. 福利截图实际显示“问元宝问题 3/3”和顶部“今日已完成”，模型报告却返回 daily_done=false；旧编排器于是重新进入已完成的每日问入口，固定坐标连续点击无效后触发三次失败熔断。
+2. 另一次重试把已经确认的 3/3 报成 2/3。旧状态没有持久化，也没有同日单调合并，服务重启后会重新执行已完成任务。
+3. 现在状态文件保存 date、daily_done、五项 task_progress 和三天卡 exchange_status。同一天的计数只取最大值，问题计数达到 3 时自动推导今日任务已完成；兑换写入会保留任务进度，服务重启从最近确认的任务继续。
+4. 子任务的输入、发送、生成等待、选图、确认、奖励、返回福利中心和兑换均由本地执行器完成。返回福利中心且所有本地后置条件成功后，当前任务计数在本地递增，不再对同一张福利截图重复请求视觉模型；完整无障碍层级可直接解析五项计数时也跳过模型报告。
+5. 元宝奖励遮罩有时在 claim_reward 返回数秒后才注入 WebView，且无障碍树为空。执行器现在等待领取，并在返回福利中心时再次检查；对 900x1600 手机布局使用亮绿色按钮像素探针，确认是奖励遮罩才点击，不会盲点任务行。
+6. “做同款”任务行可能位于屏幕下方。执行器先向上滚动一次并清除旧坐标缓存，入口点击后必须离开福利页才推进阶段；滚动后本机已验证坐标可用，模板卡片和未知页面仍交给视觉模型。
+7. 完整无障碍层级恢复后，普通任务入口按专属文案直接定位；只有层级为空、入口语义不明确或布局发生变化时才请求视觉模型。输入、选图、领奖、返回等本地幂等动作允许按 `MAX_RETRIES` 有界重试，视觉坐标点击仍严格拦截同画面重复，避免 WebView 瞬态重绘再次把任务提前熔断。
+
+2026-09-08 实际补跑记录：从 问元宝问题=3/3、写作=0/3、P图=0/3、拍题=0/3、做同款=0/3 恢复；完成写作、P图、拍题和做同款各 3 次。任务奖励到账后积分为 31500，读取到 QQ 超级会员 3 天卡价格 30000，完成兑换、奖品记录和绑定账号使用确认；complete_task 成功，状态文件记录 exchange_status=used，随后 Waydroid 为 Session: STOPPED。
+
+这次补跑说明需要保留的视觉判断只有：首次或异常时读取进度、定位当前任务入口、定位推荐模板卡片，以及判断未知页面。所有同质重复动作已经收敛到同一套本地阶段配方；页面布局变化时，入口语义校验失败会清除缓存并回退视觉模型。
+
+验证结果：`py_compile` 通过，`test_元宝每日任务.py` 共 78 项通过，`git diff --check` 通过；补跑状态文件记录五项任务均为 `3/3`、三天卡已使用，Waydroid 为 `Session: STOPPED`。随后沿现有 systemd 链路做了终态恢复验证：读取当天终态、跳过兑换、返回“我们”、`complete_task` 成功，服务退出码为 0，Waydroid 再次停止。此前 00:05 首轮的失败记录仍保留在 `journalctl --user -u yuanbao-daily.service`，不能把它改写成首轮成功。

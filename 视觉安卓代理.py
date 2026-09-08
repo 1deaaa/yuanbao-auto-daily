@@ -20,7 +20,9 @@ from openai import OpenAI
 
 DEFAULT_DEVICE = os.environ.get("ANDROID_DEVICE", "")
 DEFAULT_BASE_URL = "http://localhost:7860/v1"
-DEFAULT_MODEL = "gemini-3.7-flash"
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
+DEFAULT_REASONING_EFFORT = "high"
+REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
 PACKAGE_NAME = "com.tencent.hunyuan.app.chat"
 ALLOWED_ACTIONS = {"tap", "swipe", "type", "key", "wait", "done"}
 MAX_STEPS = 20
@@ -254,6 +256,7 @@ def ask_model(
     goal: str,
     size: tuple[int, int],
     history: list[dict[str, Any]] | None = None,
+    reasoning_effort: str | None = None,
 ) -> dict[str, Any]:
     width, height = size
     history = history or []
@@ -266,6 +269,10 @@ def ask_model(
     )
     response = client.chat.completions.create(
         model=model,
+        # 通过 extra_body 让旧版 OpenAI 客户端也把规范字段放在请求顶层。
+        extra_body={
+            "reasoning_effort": _configured_reasoning_effort(reasoning_effort),
+        },
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             *history,
@@ -280,6 +287,14 @@ def ask_model(
     )
     content = response.choices[0].message.content or ""
     return parse_action(content)
+
+
+def _configured_reasoning_effort(value: str | None = None) -> str:
+    effort = (value or os.environ.get("REASONING_EFFORT") or DEFAULT_REASONING_EFFORT).strip().lower()
+    if effort not in REASONING_EFFORTS:
+        allowed = ", ".join(sorted(REASONING_EFFORTS))
+        raise RuntimeError(f"REASONING_EFFORT 必须是以下值之一：{allowed}")
+    return effort
 
 
 def main() -> int:

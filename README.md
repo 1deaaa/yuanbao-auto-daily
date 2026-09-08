@@ -2,7 +2,11 @@
 
 这是一个使用本地视觉大模型，通过 Android 截图、无障碍层级和 ADB 操作腾讯元宝的自动化示例。模型每轮只提出一个白名单动作；Python 编排器负责阶段、前置条件、重试、任务计数、兑换证据和完成断言。
 
+每日任务流程采用“首次判断、确定性执行”的策略：新的一天首次读取任务进度时由完整无障碍层级直接解析，层级不完整或语义不明确时才请求视觉模型；输入、发送、等待生成、选图、领奖、返回、兑换和完成断言等确定性动作由执行器完成。子任务完成并通过生成/奖励后置条件后，返回福利中心时由本地编排器递增计数，不再为每一次重复任务重新请求同一张页面的视觉判断；同一轮内重复任务还会缓存已验证入口坐标，并在页面语义或区域校验失败时自动回退视觉定位。这样减少同质化视觉请求，同时保留首次进度、未知入口、推荐模板选择和异常页面的模型判断。本地动作遇到 WebView 重绘或输入法瞬态失败时允许有限重试，视觉坐标点击仍会拦截同画面重复动作。
+
 同一次 `run_once`（通常是当天的一轮任务）会保留压缩后的观测、动作和结果历史；通用原型也采用同样的回合内历史布局。两条路径都只发送最新截图，不把历史图片或账号信息写入请求上下文，并保持静态提示和工具定义不变，以便支持前缀缓存的模型复用更长上文。
+
+状态文件只保存当天的任务计数、今日问元宝完成标志和三天卡兑换状态；进度按同日单调合并，视觉模型短暂误读为较小数字时不会覆盖已确认进度，服务重启可从中断任务继续。
 
 [![测试](https://github.com/1deaaa/yuanbao-auto-daily/actions/workflows/test.yml/badge.svg)](https://github.com/1deaaa/yuanbao-auto-daily/actions/workflows/test.yml)
 
@@ -43,12 +47,15 @@ chmod 600 .env
 编辑 `.env`：
 
 ```dotenv
-MODEL_ID=gemini-3.7-flash
+MODEL_ID=gemini-3.5-flash-lite
 BASE_URL=http://localhost:7860/v1
 LOCAL_LLM_API_KEY=请填入本地端点密钥
+REASONING_EFFORT=high
 ANDROID_DEVICE=auto
 STOP_WAYDROID_AFTER_RUN=true
-MODEL_REQUEST_TIMEOUT_SECONDS=90
+# 仅精确确认元宝首次协议页；登录、验证码和微信/QQ 扫码仍需人工完成
+AUTO_ACCEPT_PROTOCOL=true
+MODEL_REQUEST_TIMEOUT_SECONDS=180
 TEST_IMAGE_PATH=测试题目.png
 PROMPT_PATH=每日任务提示词.md
 STATE_PATH=.yuanbao_daily_state.json
@@ -60,7 +67,7 @@ Windows PowerShell 或其他 ADB 主机只需把 `ANDROID_DEVICE` 改成在线�
 
 ## 定时运行
 
-`yuanbao-daily.service` 和 `yuanbao-daily.timer` 是 Linux 用户级 systemd 示例，默认按 `Asia/Shanghai` 每天 00:05 运行。服务单元按 `~/auto-daily` 和项目内 `.venv` 编写；如果仓库放在其他目录，请在复制前修改单元中的三处路径。服务失败会自动重试最多 5 次；`ANDROID_DEVICE=auto` 时任务成功后停止 Waydroid；显式 ADB 设备模式不会关闭外部模拟器或真机。
+`yuanbao-daily.service` 和 `yuanbao-daily.timer` 是 Linux 用户级 systemd 示例，默认按 `Asia/Shanghai` 每天 00:05 运行。服务单元按 `~/auto-daily` 和项目内 `.venv` 编写；如果仓库放在其他目录，请在复制前修改单元中的三处路径。普通失败会自动重试最多 5 次；启动时的 Android 系统兼容性提示和元宝协议页会在精确匹配后自动确认，登录、验证码、扫码或 ANR 等人工阻塞以退出码 75 结束，不会重复拉起同一页面。将 `AUTO_ACCEPT_PROTOCOL=false` 可关闭协议自动确认。`ANDROID_DEVICE=auto` 时任务成功后停止 Waydroid；显式 ADB 设备模式不会关闭外部模拟器或真机。
 
 ```bash
 mkdir -p ~/.config/systemd/user

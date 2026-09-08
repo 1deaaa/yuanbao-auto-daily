@@ -14,6 +14,7 @@ waydroid_script/
 coverage.xml
 .mypy_cache/
 .ruff_cache/
+androguard.db
 build/
 dist/
 *.egg-info/

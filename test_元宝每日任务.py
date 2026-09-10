@@ -1002,6 +1002,23 @@ class 元宝任务测试(unittest.TestCase):
             workflow.cached_action(task.Observation(b"", "", "", (unrelated,), "", "welfare"))
         )
 
+    def test_福利入口优先选择右侧行动按钮而不是任务标题(self):
+        executor = 假执行器()
+        executor.width, executor.height = 900, 1600
+        workflow = task.Workflow(self.配置(), executor)
+        workflow.phase = "open_target"
+        workflow.target = "question"
+        title = task.Node(
+            "问元宝问题", "", "", "android.widget.TextView", False, True,
+            task.Bounds(119, 1029, 241, 1068),
+        )
+        action = task.Node(
+            "去提问", "", "", "android.widget.TextView", False, True,
+            task.Bounds(747, 1037, 860, 1091),
+        )
+        observation = task.Observation(b"", "", "", (title, action), "WebBrowserActivity", "welfare")
+        self.assertEqual(workflow.cached_action(observation), ("tap", {"x": 803, "y": 1064}))
+
     def test_做同款模板缓存页面变化时失效(self):
         executor = 假执行器()
         executor.width, executor.height = 750, 1333
@@ -1140,8 +1157,28 @@ class 元宝任务测试(unittest.TestCase):
         )
         self.assertEqual(
             workflow.cached_action(observation),
-            ("tap", {"x": 806, "y": 434}),
+            ("tap", {"x": 806, "y": 1064}),
         )
+
+    def test_失败报告包含时间状态和堆栈且隐藏密钥(self):
+        config = self.配置()
+        config = replace(config, api_key="secret-test-key")
+        error = task.RetryLimitExceeded(
+            "连续 3 次工具/状态失败",
+            phase="open_target",
+            target="question",
+            step=9,
+            failures=3,
+            recent_action={"tool": "tap", "arguments": {"x": 803, "y": 1064}},
+            observation=task.Observation(b"", "", "当前页面", (), "WebBrowserActivity", "welfare"),
+        )
+        report = task.build_failure_report(config, error)
+        self.assertIn("报错时间", report)
+        self.assertIn("错误类型：RetryLimitExceeded", report)
+        self.assertIn("失败阶段：open_target", report)
+        self.assertIn("当前任务：question", report)
+        self.assertIn("完整 Python 堆栈", report)
+        self.assertNotIn("secret-test-key", report)
 
     def test_同款入口先滚动再使用本机固定坐标(self):
         executor = 假执行器()
@@ -1181,6 +1218,21 @@ class 元宝任务测试(unittest.TestCase):
         calls = []
         executor.device = SimpleNamespace(input=lambda *args: calls.append(args))
         observation = task.Observation(b"png", "", "", (), "WebBrowserActivity", "welfare")
+        with patch("元宝每日任务.png_pixel", return_value=(30, 220, 126, 255)):
+            with patch("元宝每日任务.time.sleep"):
+                self.assertTrue(executor._dismiss_reward_popup(observation))
+        self.assertEqual(calls, [("tap", "450", "1035")])
+
+    def test_生成页奖励遮罩无障碍为空时也用绿色像素探针收下(self):
+        executor = task.ToolExecutor.__new__(task.ToolExecutor)
+        executor.width, executor.height = 900, 1600
+        calls = []
+        executor.device = SimpleNamespace(input=lambda *args: calls.append(args))
+        observation = task.Observation(
+            b"png", "", "", (),
+            "com.tencent.hunyuan.app.chat/com.tencent.yuanbao.mp.components.websdk.ext.ui.WebBrowserActivity",
+            "app",
+        )
         with patch("元宝每日任务.png_pixel", return_value=(30, 220, 126, 255)):
             with patch("元宝每日任务.time.sleep"):
                 self.assertTrue(executor._dismiss_reward_popup(observation))

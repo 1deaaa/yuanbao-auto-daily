@@ -11,12 +11,12 @@ WorkingDirectory=%h/auto-daily
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=%h/auto-daily/.env
 ExecStart=%h/auto-daily/.venv/bin/python %h/auto-daily/元宝每日任务.py --once
-TimeoutStartSec=45min
+TimeoutStartSec=infinity
 # Type=oneshot 仅在失败时重试，成功后不会常驻运行。
 Restart=on-failure
 RestartSec=90s
-# 登录或协议确认属于人工前置条件，退出码 75 时不重复拉起同一页面。
-RestartPreventExitStatus=75
+# 登录、协议或失败报告窗口属于人工前置条件，退出码 75/76 时不重复拉起。
+RestartPreventExitStatus=75 76
 
 [Install]
 WantedBy=default.target

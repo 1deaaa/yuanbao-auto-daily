@@ -67,7 +67,7 @@ Windows PowerShell 或其他 ADB 主机只需把 `ANDROID_DEVICE` 改成在线�
 
 ## 定时运行
 
-`yuanbao-daily.service` 和 `yuanbao-daily.timer` 是 Linux 用户级 systemd 示例，默认按 `Asia/Shanghai` 每天 00:05 运行。服务单元按 `~/auto-daily` 和项目内 `.venv` 编写；如果仓库放在其他目录，请在复制前修改单元中的三处路径。普通失败会自动重试最多 5 次；启动时的 Android 系统兼容性提示和元宝协议页会在精确匹配后自动确认，登录、验证码、扫码或 ANR 等人工阻塞以退出码 75 结束，不会重复拉起同一页面。将 `AUTO_ACCEPT_PROTOCOL=false` 可关闭协议自动确认。`ANDROID_DEVICE=auto` 时任务成功后停止 Waydroid；显式 ADB 设备模式不会关闭外部模拟器或真机。
+`yuanbao-daily.service` 和 `yuanbao-daily.timer` 是 Linux 用户级 systemd 示例，默认按 `Asia/Shanghai` 每天 00:05 运行。服务单元按 `~/auto-daily` 和项目内 `.venv` 编写；如果仓库放在其他目录，请在复制前修改单元中的三处路径。普通失败会自动重试最多 5 次；启动时的 Android 系统兼容性提示和元宝协议页会在精确匹配后自动确认，登录、验证码、扫码或 ANR 等人工阻塞以退出码 75 结束，不会重复拉起同一页面。脚本内部达到最大重试次数时以退出码 76 结束，并弹出置顶 Tkinter 失败报告窗口，展示北京时间、阶段、任务、最近动作、状态文件和完整堆栈，必须手动关闭；`RestartPreventExitStatus=75 76` 会阻止窗口关闭后被 systemd 立即重复拉起。报告会隐藏 API 密钥、手机号和令牌。服务启动超时设为无限，保证窗口可以一直等待人工处理。将 `AUTO_ACCEPT_PROTOCOL=false` 可关闭协议自动确认。`ANDROID_DEVICE=auto` 时任务成功后停止 Waydroid；显式 ADB 设备模式不会关闭外部模拟器或真机。
 
 ```bash
 mkdir -p ~/.config/systemd/user

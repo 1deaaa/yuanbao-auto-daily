@@ -18,6 +18,7 @@ import struct
 import subprocess
 import sys
 import time
+import traceback
 import zlib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -122,9 +123,12 @@ OURS_FALLBACK_Y_RATIO = 0.963
 WELFARE_LOAD_TIMEOUT = 30
 WELFARE_LOAD_POLL_INTERVAL = 1.5
 WELFARE_WEBVIEW_READY_DELAY = 3.0
+ENTRY_NAVIGATION_TIMEOUT = 12.0
+ENTRY_NAVIGATION_POLL_INTERVAL = 1.0
 MAX_HISTORY_SUMMARY_CHARS = 1200
 MAX_HISTORY_RESULT_CHARS = 1200
 IGNORED_TASKS = ("邀请新用户",)
+FAILURE_EXIT_STATUS = 76
 
 
 TASK_LABELS = {
@@ -260,18 +264,22 @@ IMAGE_TASKS = frozenset({"image", "photo_question"})
 # 入口缓存只在当前运行期间有效，不写入磁盘。布局变化或语义校验失败时，
 # cached_action 会返回 None，下一步仍由视觉模型重新定位。
 TASK_ENTRY_MARKERS: dict[str, tuple[str, ...]] = {
-    "daily_question": ("每日问元宝", "去提问", "问元宝"),
-    "question": ("问元宝任意问题", "去提问", "提问"),
-    "writing": ("去写作", "写作"),
-    "image": ("去p图", "p图", "智能p图"),
-    "photo_question": ("去拍题", "拍题", "拍照答题"),
+    # 先列右侧行动按钮，再列任务标题。新版 WebView 只把这些文本节点
+    # 暴露出来且 clickable=false；点击行动按钮的中心比点击标题稳定。
+    "daily_question": ("去提问", "每日问元宝", "每日问元宝得积分", "问元宝问题", "问元宝"),
+    "question": ("去提问", "问元宝问题", "问元宝任意问题", "提问"),
+    "writing": ("去写作", "使用写作能力", "写作"),
+    "image": ("去p图", "使用p图能力", "p图", "智能p图"),
+    "photo_question": ("去拍题", "使用拍题能力", "拍题", "拍照答题"),
     "same_template": ("做同款",),
 }
 
 # 本机 900x1600 竖屏福利 WebView 的固定任务行按钮位置。只在无障碍树为空、
 # Activity 明确是福利 WebView 且处于已验证的竖屏比例时启用；其它分辨率仍交给模型定位。
 WELFARE_FIXED_ENTRY_RATIOS: dict[str, tuple[float, float]] = {
-    "daily_question": (0.895, 0.271),
+    # 列表顶部的每日积分卡不是“去提问”入口；任务行在福利页回到顶部后
+    # 从 y=995 开始，第一条可操作的问元宝按钮中心约为 y=1064。
+    "daily_question": (0.895, 0.665),
     "question": (0.895, 0.665),
     "writing": (0.895, 0.751),
     "image": (0.895, 0.836),
@@ -290,6 +298,29 @@ class ManualActionRequired(AgentError):
 
 class AppUnresponsiveError(AgentError):
     """应用启动阶段无响应，可以通过重启应用或 Waydroid 会话恢复。"""
+
+
+class RetryLimitExceeded(AgentError):
+    """本轮已耗尽有界重试次数，交给用户界面报告并等待人工关闭。"""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        phase: str = "",
+        target: str = "",
+        step: int | None = None,
+        failures: int | None = None,
+        recent_action: dict[str, Any] | None = None,
+        observation: Any | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.phase = phase
+        self.target = target
+        self.step = step
+        self.failures = failures
+        self.recent_action = recent_action
+        self.observation = observation
 
 
 def is_adb_transport_failure(error: BaseException) -> bool:
@@ -433,6 +464,134 @@ class Config:
         if not config.test_image_path.is_file():
             raise AgentError(f"测试图片不存在：{config.test_image_path}")
         return config
+
+
+def _redact_failure_text(value: Any, config: Config | None) -> str:
+    """错误报告只保留诊断信息，避免把密钥或环境变量中的敏感值带入窗口。"""
+    text = str(value)
+    secrets = {
+        getattr(config, "api_key", ""),
+        os.environ.get("API_KEY", ""),
+        os.environ.get("LOCAL_LLM_API_KEY", ""),
+    }
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "<已隐藏>")
+    return text
+
+
+def build_failure_report(config: Config | None, error: BaseException) -> str:
+    """生成可直接放入 Tkinter 和 journal 的完整失败报告。"""
+    timezone_name = getattr(config, "timezone_name", DEFAULT_TIMEZONE)
+    try:
+        now = datetime.now(ZoneInfo(timezone_name))
+    except (ZoneInfoNotFoundError, ValueError):
+        now = datetime.now()
+    observation = getattr(error, "observation", None)
+    recent_action = getattr(error, "recent_action", None)
+    state_path = getattr(config, "state_path", DEFAULT_STATE_PATH)
+    state = read_daily_state(state_path)
+    lines = [
+        "元宝每日任务失败报告",
+        "=" * 26,
+        f"报错时间（{timezone_name}）：{now.isoformat(timespec='seconds')}",
+        f"任务日期：{now.date().isoformat()}",
+        f"错误类型：{type(error).__name__}",
+        f"错误原因：{_redact_failure_text(error, config)}",
+        f"模型：{getattr(config, 'model_id', '(未知)')}",
+        f"ADB 设备：{getattr(config, 'device', '(未知)')}",
+        f"最大重试次数：{getattr(config, 'max_retries', '(未知)')}",
+        f"已用失败次数：{getattr(error, 'failures', '(未知)')}",
+        f"失败步骤：{getattr(error, 'step', '(未知)')}",
+        f"失败阶段：{getattr(error, 'phase', '(未知)')}",
+        f"当前任务：{getattr(error, 'target', '(未知)')}",
+    ]
+    if recent_action is not None:
+        lines.append(
+            "最近动作："
+            + _redact_failure_text(
+                json.dumps(recent_action, ensure_ascii=False, sort_keys=True), config
+            )
+        )
+    if observation is not None:
+        lines.extend(
+            [
+                f"当前 Activity：{_redact_failure_text(getattr(observation, 'activity', ''), config) or '(未知)' }",
+                f"当前页面阶段：{_redact_failure_text(getattr(observation, 'stage', ''), config) or '(未知)' }",
+            ]
+        )
+        ui = _redact_failure_text(getattr(observation, "ui", ""), config)
+        if ui:
+            lines.extend(["当前无障碍摘要：", ui[:8000]])
+    lines.extend(
+        [
+            f"状态文件：{state_path}",
+            "状态内容："
+            + json.dumps(state, ensure_ascii=False, sort_keys=True),
+            "",
+            "完整 Python 堆栈：",
+            _redact_failure_text(
+                "".join(traceback.format_exception(type(error), error, error.__traceback__)),
+                config,
+            ),
+        ]
+    )
+    return "\n".join(lines)
+
+
+def show_failure_alert(config: Config | None, error: BaseException) -> None:
+    """弹出置顶且阻塞的失败窗口，必须由用户手动关闭。"""
+    report = build_failure_report(config, error)
+    print(report, file=sys.stderr)
+    try:
+        import tkinter as tk
+    except Exception as exc:
+        print(f"无法加载 Tkinter，详细报告已写入日志：{type(exc).__name__}: {exc}", file=sys.stderr)
+        return
+    try:
+        root = tk.Tk()
+        root.title("元宝每日任务失败")
+        root.geometry("980x720")
+        root.minsize(700, 480)
+        # KDE Wayland/XWayland 对置顶和强制聚焦的支持取决于窗口管理器；
+        # 这些增强失败时仍必须进入 mainloop，让报告窗口保持常驻。
+        with contextlib.suppress(Exception):
+            root.attributes("-topmost", True)
+        with contextlib.suppress(Exception):
+            root.lift()
+            root.focus_force()
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(0, weight=1)
+        frame = tk.Frame(root, padx=12, pady=12)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        scrollbar = tk.Scrollbar(frame)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        text = tk.Text(
+            frame,
+            wrap="none",
+            font=("等线", 11),
+            padx=8,
+            pady=8,
+            yscrollcommand=scrollbar.set,
+        )
+        text.grid(row=0, column=0, sticky="nsew")
+        scrollbar.config(command=text.yview)
+        text.insert("1.0", report)
+        text.config(state="disabled")
+        close_button = tk.Button(
+            frame,
+            text="关闭失败窗口",
+            command=root.destroy,
+            height=2,
+        )
+        close_button.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        root.protocol("WM_DELETE_WINDOW", root.destroy)
+        root.mainloop()
+    except Exception as exc:
+        # 没有图形会话或 Tk 后端异常时，不能覆盖原始任务错误。
+        print(f"失败窗口初始化失败，详细报告已写入日志：{type(exc).__name__}: {exc}", file=sys.stderr)
 
 
 @dataclass(frozen=True)
@@ -1569,6 +1728,21 @@ class ToolExecutor:
             raise AgentError(f"坐标越界：{x},{y}")
         self.device.input("tap", str(x), str(y))
 
+    def _observe_after_entry_tap(self) -> Observation:
+        """等待福利入口真正离开 WebView，覆盖点击后异步导航竞态。"""
+        deadline = time.monotonic() + ENTRY_NAVIGATION_TIMEOUT
+        latest = self.observe()
+        if latest.stage != "welfare":
+            self._welfare_context = False
+            return latest
+        while time.monotonic() < deadline:
+            time.sleep(ENTRY_NAVIGATION_POLL_INTERVAL)
+            latest = self.observe()
+            if latest.stage != "welfare":
+                self._welfare_context = False
+                return latest
+        return latest
+
     def _guard_generation(self, tool_name: str) -> ToolResult | None:
         if self.pending_generation and tool_name != "wait_5s":
             return self._result(False, "消息仍可能在生成，必须先调用 wait_5s 等待右下角终止按钮消失")
@@ -2079,7 +2253,13 @@ class ToolExecutor:
             return True
         # WebView 奖励遮罩常完全不进入无障碍树。当前手机布局中，
         # 绿色“开心收下”按钮中心是可验证的亮绿色像素，普通任务行该位置为深色。
-        if observation.stage == "welfare" and not observation.nodes:
+        if (
+            not observation.nodes
+            and (
+                observation.stage == "welfare"
+                or WEBVIEW_ACTIVITY_MARKER in observation.activity.lower()
+            )
+        ):
             x, y = self.width // 2, round(self.height * 0.647)
             pixel = png_pixel(observation.image, x, y)
             if (
@@ -2344,9 +2524,20 @@ class ToolExecutor:
                     raise AgentError(f"坐标越界：{x},{y}")
                 self._tap_point(x, y)
                 time.sleep(0.8)
-                stage = self.observe().stage
+                after_tap = self.observe()
+                # 福利页任务行动按钮是 WebView 的异步路由入口。短暂仍显示福利页
+                # 不代表点击失败，必须给路由和新 Activity 一个有界加载窗口。
+                if after_tap.stage == "welfare":
+                    after_tap = self._observe_after_entry_tap()
+                stage = after_tap.stage
                 if stage != "welfare":
                     self._welfare_context = False
+                if stage == "welfare":
+                    return self._result(
+                        False,
+                        "任务入口点击后仍停留在福利中心，已等待异步导航仍未切换页面",
+                        stage=stage,
+                    )
                 return self._result(True, "已点击指定位置", stage=stage)
             if name == "swipe":
                 values = [int(args[key]) for key in ("x1", "y1", "x2", "y2")]
@@ -3156,11 +3347,10 @@ class Workflow:
         ):
             return None
         markers = TASK_ENTRY_MARKERS[self.target]
-        specific = tuple(
-            marker
-            for marker in markers
-            if marker not in {"去提问", "提问", "写作", "p图", "拍题"}
-        )
+        # TASK_ENTRY_MARKERS 已按“行动按钮 -> 任务标题”的优先级排列。
+        # 不要把行动按钮过滤掉：新版 WebView 的标题和按钮都是不可点击
+        # 文本节点，只有右侧行动文案能稳定表达真正的入口位置。
+        specific = markers
         candidates: list[tuple[int, int, Node]] = []
         for marker_index, marker in enumerate((*specific, *markers)):
             wanted = marker.lower()
@@ -3293,9 +3483,7 @@ class Workflow:
         markers = TASK_ENTRY_MARKERS.get(key, ())
         if markers:
             # 优先要求任务专属标题；只有当前版本完全不暴露标题时，才退回通用按钮文字。
-            specific = tuple(
-                marker for marker in markers if marker not in {"去提问", "提问", "写作", "p图", "拍题"}
-            )
+            specific = markers
             searchable = " ".join(node.searchable for node in observation.nodes)
             if any(marker.lower() in searchable for marker in specific):
                 return ("tap", args) if self._tap_hits_label(args, observation, *specific) else None
@@ -3733,7 +3921,13 @@ def run_once(config: Config) -> None:
                 raise
             except AgentError as exc:
                 if startup_attempt >= 1 or not runtime.managed:
-                    raise
+                    raise RetryLimitExceeded(
+                        f"启动阶段恢复失败，已达到本轮最大恢复次数：{exc}",
+                        phase=getattr(workflow, "phase", "navigate_welfare"),
+                        target=getattr(workflow, "target", None) or "",
+                        step=0,
+                        failures=startup_attempt + 1,
+                    ) from exc
                 startup_attempt += 1
                 print(f"启动阶段失败，正在执行第 {startup_attempt} 次恢复：{str(exc)[:180]}")
                 if device is not None and previous_stay_awake is not None:
@@ -3754,6 +3948,7 @@ def run_once(config: Config) -> None:
         failures = 0
         previous_state: str | None = None
         previous_action: str | None = None
+        recent_action: dict[str, Any] | None = None
         for step in range(1, config.max_steps + 1):
             observation = executor.observe()
             current_state = state_signature(observation.ui, observation.image, observation.activity)
@@ -3796,9 +3991,18 @@ def run_once(config: Config) -> None:
                 failures += 1
                 print(f"步骤 {step}：模型动作解析失败（{str(exc)[:160]}）")
                 if failures >= config.max_retries:
-                    raise
+                    raise RetryLimitExceeded(
+                        f"视觉模型动作连续失败 {failures} 次，达到最大重试次数",
+                        phase=workflow.phase,
+                        target=workflow.target or "",
+                        step=step,
+                        failures=failures,
+                        recent_action=recent_action,
+                        observation=observation,
+                    ) from exc
                 time.sleep(config.retry_cooldown_seconds)
                 continue
+            recent_action = {"tool": name, "arguments": args}
             signature = action_signature(name, args)
             if repeated_action_is_stuck(
                 name,
@@ -3839,10 +4043,29 @@ def run_once(config: Config) -> None:
                 return
             if not result.ok:
                 if failures >= config.max_retries:
-                    raise AgentError(f"连续 {failures} 次工具/状态失败，停止本轮")
+                    raise RetryLimitExceeded(
+                        f"连续 {failures} 次工具/状态失败，达到最大重试次数",
+                        phase=workflow.phase,
+                        target=workflow.target or "",
+                        step=step,
+                        failures=failures,
+                        recent_action={
+                            **(recent_action or {}),
+                            "result": result.message[:500],
+                        },
+                        observation=observation,
+                    )
                 if config.retry_cooldown_seconds:
                     time.sleep(config.retry_cooldown_seconds)
-        raise AgentError(f"达到单轮最大步骤数 {config.max_steps}，未完成每日任务")
+        raise RetryLimitExceeded(
+            f"达到单轮最大步骤数 {config.max_steps}，未完成每日任务",
+            phase=workflow.phase,
+            target=workflow.target or "",
+            step=config.max_steps,
+            failures=failures,
+            recent_action=recent_action,
+            observation=observation,
+        )
     except ManualActionRequired:
         # 保留协议、登录或 ANR 现场供用户处理；退出码 75 会阻止 systemd 自动重启。
         manual_action_required = True
@@ -3910,6 +4133,9 @@ def run_daemon(config: Config) -> None:
         try:
             run_once(config)
             print("本轮完成，进入下一轮等待")
+        except RetryLimitExceeded as exc:
+            print("本轮达到最大重试次数，打开失败报告窗口；关闭后继续等待下一次计划时间", file=sys.stderr)
+            show_failure_alert(config, exc)
         except Exception as exc:
             print(f"本轮失败：{type(exc).__name__}；下一次计划时间仍按配置计算")
 
@@ -3920,6 +4146,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--daemon", action="store_true", help="按 .env 中的北京时间运行时间持续调度")
     parser.add_argument("--env-file", type=Path, default=ROOT / ".env")
     args = parser.parse_args(argv)
+    config: Config | None = None
     try:
         config = Config.from_env(args.env_file)
         if args.daemon:
@@ -3934,6 +4161,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"需要人工处理：{exc}", file=sys.stderr)
         # 75 由 systemd 的 RestartPreventExitStatus 识别，避免重复拉起同一阻塞页面。
         return 75
+    except RetryLimitExceeded as exc:
+        print(f"失败：{type(exc).__name__}；{str(exc)[:300]}", file=sys.stderr)
+        show_failure_alert(config, exc)
+        # 76 配合 systemd 的 RestartPreventExitStatus，避免窗口关闭后再次自动重试。
+        return FAILURE_EXIT_STATUS
     except Exception as exc:
         print(f"失败：{type(exc).__name__}；{str(exc)[:300]}", file=sys.stderr)
         return 1

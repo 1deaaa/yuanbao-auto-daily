@@ -120,6 +120,9 @@ OURS_FALLBACK_DELAY = 8.0
 # 750x1333 实测首页底部“我们”入口的归一化位置；只用于已确认的首页空层级。
 OURS_FALLBACK_X_RATIO = 0.852
 OURS_FALLBACK_Y_RATIO = 0.963
+# 900x1600 实测“我们”页福利入口的归一化位置；仅用于入口节点缺失时的后备点击。
+WELFARE_ENTRY_FALLBACK_X_RATIO = 0.851
+WELFARE_ENTRY_FALLBACK_Y_RATIO = 0.364
 WELFARE_LOAD_TIMEOUT = 30
 WELFARE_LOAD_POLL_INTERVAL = 1.5
 WELFARE_WEBVIEW_READY_DELAY = 3.0
@@ -128,6 +131,16 @@ ENTRY_NAVIGATION_POLL_INTERVAL = 1.0
 MAX_HISTORY_SUMMARY_CHARS = 1200
 MAX_HISTORY_RESULT_CHARS = 1200
 IGNORED_TASKS = ("邀请新用户",)
+# 福利任务入口可能打开站内活动 WebView；这是已知误触，需要自动关回福利中心。
+# 注意：“活动小窗”是常驻右上角的悬浮图标（3x3 像素级装饰节点），福利中心本身
+# 也带它，不能作为活动页证据。只有真正的活动内容语义才能判定为活动页。
+ACTIVITY_PAGE_MARKERS = (
+    "活动规则",
+    "参与方式",
+    "评奖规则",
+    "元宝ai视觉现场",
+    "ai视觉现场",
+)
 FAILURE_EXIT_STATUS = 76
 
 
@@ -263,28 +276,23 @@ IMAGE_TASKS = frozenset({"image", "photo_question"})
 
 # 入口缓存只在当前运行期间有效，不写入磁盘。布局变化或语义校验失败时，
 # cached_action 会返回 None，下一步仍由视觉模型重新定位。
+# “做同款”模板列表也在 WebView 活动里渲染，包含活动规则/参与方式等活动页
+# 语义；用它定位任务行会误触活动横幅，因此语义入口不使用该标题。
 TASK_ENTRY_MARKERS: dict[str, tuple[str, ...]] = {
     # 先列右侧行动按钮，再列任务标题。新版 WebView 只把这些文本节点
     # 暴露出来且 clickable=false；点击行动按钮的中心比点击标题稳定。
-    "daily_question": ("去提问", "每日问元宝", "每日问元宝得积分", "问元宝问题", "问元宝"),
-    "question": ("去提问", "问元宝问题", "问元宝任意问题", "提问"),
+    "daily_question": ("去提问", "每日问元宝", "每日问元宝得积分", "问元宝任意问题"),
+    "question": ("去提问", "问元宝任意问题", "提问"),
     "writing": ("去写作", "使用写作能力", "写作"),
     "image": ("去p图", "使用p图能力", "p图", "智能p图"),
     "photo_question": ("去拍题", "使用拍题能力", "拍题", "拍照答题"),
     "same_template": ("做同款",),
 }
 
-# 本机 900x1600 竖屏福利 WebView 的固定任务行按钮位置。只在无障碍树为空、
-# Activity 明确是福利 WebView 且处于已验证的竖屏比例时启用；其它分辨率仍交给模型定位。
-WELFARE_FIXED_ENTRY_RATIOS: dict[str, tuple[float, float]] = {
-    # 列表顶部的每日积分卡不是“去提问”入口；任务行在福利页回到顶部后
-    # 从 y=995 开始，第一条可操作的问元宝按钮中心约为 y=1064。
-    "daily_question": (0.895, 0.665),
-    "question": (0.895, 0.665),
-    "writing": (0.895, 0.751),
-    "image": (0.895, 0.836),
-    "photo_question": (0.895, 0.922),
-}
+# 福利页改版后每日任务区顶部插入了签到卡与邀请/创作横幅，旧固定行坐标
+# 已整体下移，继续盲点会误触“已完成”等非入口行。本字典保留为空作为扩展点；
+# 入口一律走语义或视觉定位，不再使用固定行坐标。
+WELFARE_FIXED_ENTRY_RATIOS: dict[str, tuple[float, float]] = {}
 # 本机福利页向上滚动一次后，“做同款”任务按钮稳定出现在第五行。
 # 只在已执行该次滚动、无障碍树为空且手机纵向比例时启用。
 SAME_TEMPLATE_FIXED_ENTRY_RATIOS = (0.895, 0.846)
@@ -845,6 +853,16 @@ class Device:
 
     def input(self, *args: str) -> None:
         self.adb("shell", "input", *args, timeout=15)
+
+    def keyboard_shown(self) -> bool:
+        """检测软键盘是否显示；查询失败时按未显示处理，避免误发返回键。"""
+        try:
+            output = self.adb(
+                "shell", "dumpsys", "input_method", timeout=10
+            ).decode("utf-8", errors="replace")
+        except AgentError:
+            return False
+        return "mInputShown=true" in output
 
     def keep_awake(self) -> str:
         """临时阻止后台 Waydroid 因屏幕超时冻结，并返回原始设置。"""
@@ -1457,15 +1475,34 @@ def detect_stage(nodes: Iterable[Node], activity: str) -> str:
         return "photo_preview"
     if "奖品记录" in text and "兑换商城" not in text:
         return "prize_records"
+    # 福利页“做同款”等任务入口会打开站内活动 WebView；它们有明确的活动语义
+    # （活动规则/参与方式/做同款），不能当成提问/写作输入页，否则本地输入会在
+    # 错误页面上耗尽重试次数。节点为空但 Activity 明确是元宝 WebView 时也视为
+    # 活动页候选，交给 _close_activity_page 按返回键关闭。
+    if "webbrowseractivity" in activity_lower and any(
+        marker in text for marker in ACTIVITY_PAGE_MARKERS
+    ):
+        return "activity"
     if any(
         marker in text
-        for marker in ("每日问元宝得积分", "去写作", "去p图", "去拍题", "问元宝任意问题累计")
+        for marker in (
+            "每日问元宝得积分",
+            "去提问",
+            "去写作",
+            "去p图",
+            "去拍题",
+            "问元宝任意问题累计",
+        )
     ):
         return "welfare"
     if "兑换商城" in text or "qq超级会员3天卡" in text:
         return "exchange"
-    # “我们”页的抽屉中有福利中心和任务；聊天页虽然也有底部导航，但没有这组内容。
-    if "福利中心" in text and "任务" in text:
+    # “我们”页的抽屉中有精确的“福利中心”入口和“任务”菜单；聊天首页的福利横幅
+    # （“元宝福利中心”“做任务、得积分、兑福利”）必须排除，否则会被误判为“我们”页。
+    if (
+        find_node(node_list, "福利中心", exact=True) is not None
+        and find_node(node_list, "任务", exact=True) is not None
+    ):
         return "ours"
     if any(value in text for value in ("选择写作类型", "ai写作", "请输入你要写的主题")):
         return "writing"
@@ -1525,7 +1562,12 @@ class ToolExecutor:
         self._welfare_scroll_normalized = False
 
     def normalize_welfare_scroll(self) -> None:
-        """无障碍树为空时把福利任务列表拉回顶部，保证固定行坐标可复用。"""
+        """仅在福利 WebView 明确需要回到顶部时调用；调用方必须已有成功 dump。
+
+        注意：uiautomator dump 超时本身不代表滚动位置错误。旧代码在 dump
+        超时也做标准化滑动，把任务列表推离顶部，反而造成后续入口定位漂移。
+        dump 失败时只截图返回，不做任何滑动。
+        """
         if getattr(self, "_welfare_scroll_normalized", False):
             return
         self.device.input(
@@ -1650,8 +1692,6 @@ class ToolExecutor:
                 if not webview:
                     raise
                 print("福利 WebView 无障碍树未及时空闲，使用截图观测")
-                if getattr(self, "_welfare_context", False):
-                    self.normalize_welfare_scroll()
                 image = self.device.screenshot()
                 return Observation(image, "", "", (), activity, "welfare")
             nodes = tuple(parse_nodes(ui_xml))
@@ -1661,7 +1701,13 @@ class ToolExecutor:
                 continue
             if self._dismiss_protocol_prompt(nodes, activity):
                 continue
-            if webview and not nodes and getattr(self, "_welfare_context", False):
+            if (
+                webview
+                and getattr(self, "_welfare_context", False)
+                and not any(node.text.strip() for node in nodes)
+            ):
+                # Waydroid 多窗口装饰层或 WebView 重绘可能只暴露窗口标题栏等无文本节点；
+                # 只要福利 WebView 没有可用文本，就按空层级处理，用截图交给上层。
                 self.normalize_welfare_scroll()
                 image = self.device.screenshot()
                 return Observation(image, ui_xml, "", (), activity, "welfare")
@@ -1729,18 +1775,32 @@ class ToolExecutor:
         self.device.input("tap", str(x), str(y))
 
     def _observe_after_entry_tap(self) -> Observation:
-        """等待福利入口真正离开 WebView，覆盖点击后异步导航竞态。"""
+        """等待福利入口真正离开 WebView，覆盖点击后异步导航竞态。
+
+        注意：福利 WebView 持续重绘时 dump 可能连续超时；旧代码在每次超时后
+        都做标准化滑动，把任务列表推离顶部。滑动只应在至少一次成功 dump 之后
+        仍停留福利页时执行，dump 超时只等待重试。
+        """
         deadline = time.monotonic() + ENTRY_NAVIGATION_TIMEOUT
+        dumped_once = False
         latest = self.observe()
         if latest.stage != "welfare":
             self._welfare_context = False
             return latest
+        if latest.nodes:
+            dumped_once = True
         while time.monotonic() < deadline:
             time.sleep(ENTRY_NAVIGATION_POLL_INTERVAL)
             latest = self.observe()
             if latest.stage != "welfare":
                 self._welfare_context = False
                 return latest
+            if latest.nodes:
+                if not dumped_once:
+                    dumped_once = True
+                elif getattr(self, "_welfare_context", False):
+                    # 已确认仍在任务列表且层级可读，位置才需要标准化。
+                    self.normalize_welfare_scroll()
         return latest
 
     def _guard_generation(self, tool_name: str) -> ToolResult | None:
@@ -1814,7 +1874,40 @@ class ToolExecutor:
             default=None,
         )
 
+    def _close_activity_page(self, observation: Observation) -> Observation:
+        """关闭误触打开的福利活动页，回到任务列表；只在 WebView 活动页生效。"""
+        if observation.stage != "activity":
+            return observation
+        close = find_node(observation.nodes, "返回", clickable_only=True) or find_node(
+            observation.nodes, "返回"
+        )
+        if close is None:
+            close = find_node(observation.nodes, "关闭", clickable_only=True)
+        if close is not None:
+            self._tap_node(close)
+        else:
+            self.device.input("keyevent", "KEYCODE_BACK")
+        time.sleep(1.5)
+        after = self.observe()
+        # 活动详情可能有多层路由；最多再退一次，避免陷在活动栈里反复等待。
+        if after.stage == "activity":
+            self.device.input("keyevent", "KEYCODE_BACK")
+            time.sleep(1.5)
+            after = self.observe()
+        self._welfare_context = True
+        return after
+
     def _input_fixed_prompt(self, observation: Observation) -> ToolResult:
+        if observation.stage == "activity":
+            # 福利入口可能误触活动横幅；input 阶段先关回福利中心，让外层重新
+            # 定位真正的任务入口，而不是在活动页上等待输入框直到熔断。
+            after = self._close_activity_page(observation)
+            if after.stage == "welfare":
+                return self._result(False, "当前是福利活动页，已返回任务列表，请重新点击任务入口")
+            return self._result(
+                False,
+                f"当前是福利活动页，返回后仍未回到任务列表（阶段={after.stage or '未知'}），请重新观察后再试",
+            )
         if observation.stage == "ours":
             ours = find_node(observation.nodes, "问元宝", exact=True)
             if ours is not None:
@@ -1913,6 +2006,26 @@ class ToolExecutor:
                 return self._result(False, "等待生成超时，右下角终止按钮仍存在")
             time.sleep(5)
 
+    def _collapse_expanded_input(self, observation: Observation) -> bool:
+        """收起聊天页的全屏输入浮层，避免它吞掉底部导航点击。"""
+        collapse = find_node(observation.nodes, "收起输入框", exact=True)
+        if collapse is None:
+            collapse = find_node(
+                observation.nodes, "session_input_arrow_down", clickable_only=True
+            )
+        if collapse is None:
+            return False
+        self._tap_node(collapse)
+        return True
+
+    def _hide_soft_keyboard(self) -> bool:
+        """软键盘会盖住底部导航并吞掉“我们”的点击；显示时先按返回键收起。"""
+        checker = getattr(self.device, "keyboard_shown", None)
+        if not callable(checker) or not checker():
+            return False
+        self.device.input("keyevent", "KEYCODE_BACK")
+        return True
+
     def _navigate_to_ours_until(self, deadline: float) -> Observation:
         """在一个有界时间窗内完成返回和导航；两次恢复都复用这套逻辑。"""
         back_sent = False
@@ -1935,8 +2048,18 @@ class ToolExecutor:
                 raise ManualActionRequired(f"{blocker}（Activity={observation.activity[:120] or '未知'}）")
             if observation.stage == "ours":
                 return observation
+            # 新版聊天页发送后可能停留在全屏展开输入浮层，该浮层会吞掉底部
+            # “我们”的点击；先收起输入框再继续导航。
+            if self._collapse_expanded_input(observation):
+                time.sleep(1.0)
+                continue
             ours_node = find_node(observation.nodes, "我们", exact=True)
             if ours_node is not None:
+                # 软键盘会盖住底部导航，点击“我们”会落在键盘上被吞掉；
+                # 确认键盘显示时先按返回键收起，再在下一轮点击。
+                if self._hide_soft_keyboard():
+                    time.sleep(1.0)
+                    continue
                 # 不假设固定分辨率；部分设备的底部导航高度和横向边距不同。
                 self._tap_node(ours_node)
                 time.sleep(1.5)
@@ -1962,6 +2085,8 @@ class ToolExecutor:
                 continue
             # 元宝的模板详情、写作和拍题 Activity 都可能被统一归类为 app；
             # 只要不是 home.v2 首页，就说明当前仍在应用内部嵌套页，可以安全返回。
+            # 福利活动 WebView 也是应用内部嵌套页；它不会自己回到任务页，
+            # 保留人工可读的关闭路径，供返回逻辑按返回键处理。
             nested_app = PACKAGE_NAME in activity_lower and "home.v2" not in activity_lower
             clearly_nested = observation.stage in {
                 "writing",
@@ -1969,6 +2094,7 @@ class ToolExecutor:
                 "photo_question",
                 "photo_preview",
                 "picker",
+                "activity",
             } or nested_app or (
                 "home.v2" not in activity_lower and observation.stage not in {"app", "unknown"}
             )
@@ -2028,12 +2154,37 @@ class ToolExecutor:
                         raise AgentError(f"无法回到元宝“我们”页面，应用重启失败：{restart_error}") from restart_error
         raise AgentError(f"无法回到元宝“我们”页面：{last_error or '未知错误'}")
 
+    @staticmethod
+    def _welfare_entry_node(observation: Observation) -> Node | None:
+        """定位福利入口，兼容“福利中心”“元宝福利中心”“[icon] 福利中心”等文案。"""
+        exact = find_node(observation.nodes, "福利中心", exact=True)
+        if exact is not None:
+            return exact
+        # 新版聊天首页把入口改成了带图标前缀的横幅文案；只有首页允许模糊匹配，
+        # 避免在聊天记录或其它嵌套页面误点同名文本。横幅上有两个含“福利中心”
+        # 的节点，取面积最小的行动按钮，而不是整张横幅标题。
+        if "home.v2" not in observation.activity.lower():
+            return None
+        candidates = [
+            node
+            for node in observation.nodes
+            if node.enabled and node.bounds.area > 0 and "福利中心" in node.searchable
+        ]
+        return min(candidates, key=lambda node: node.bounds.area, default=None)
+
     def _go_to_welfare(self) -> Observation:
         self.reset_welfare_scroll()
         self._welfare_context = True
         last_observation: Observation | None = None
         for attempt in range(2):
-            observation = self._go_to_ours()
+            observation = self.observe()
+            # 新版聊天首页把福利入口做成了横幅；当前页已有可用入口时不再强制
+            # 绕行“我们”页，避免抽屉改版后启动流程整体失败。
+            if (
+                observation.stage != "welfare"
+                and self._welfare_entry_node(observation) is None
+            ):
+                observation = self._go_to_ours()
             last_observation = observation
             # 入口本身也可能在抽屉恢复期间暂时缺失；最多等待几秒后再使用已知布局坐标。
             entry_deadline = time.monotonic() + min(8, WELFARE_LOAD_TIMEOUT)
@@ -2048,7 +2199,7 @@ class ToolExecutor:
                 if webview_observation is not None:
                     print("福利中心 WebView 已打开，无障碍树暂时为空，交由模型确认")
                     return webview_observation
-                welfare_node = find_node(observation.nodes, "福利中心", exact=True)
+                welfare_node = self._welfare_entry_node(observation)
                 if welfare_node is not None and last_entry_tap_at is None:
                     self._tap_node(welfare_node)
                     last_entry_tap_at = time.monotonic()
@@ -2058,7 +2209,10 @@ class ToolExecutor:
                     and time.monotonic() + 1 >= entry_deadline
                 ):
                     # 仅在已识别的“我们”页使用历史布局后备，未知页面不得盲点。
-                    self._tap_point(640, 486)
+                    self._tap_point(
+                        round(self.width * WELFARE_ENTRY_FALLBACK_X_RATIO),
+                        round(self.height * WELFARE_ENTRY_FALLBACK_Y_RATIO),
+                    )
                     fallback_tapped = True
                     last_entry_tap_at = time.monotonic()
                 time.sleep(OURS_NAV_POLL_INTERVAL)
@@ -2077,15 +2231,14 @@ class ToolExecutor:
                 if webview_observation is not None:
                     print("福利中心 WebView 已打开，无障碍树暂时为空，交由模型确认")
                     return webview_observation
-                # 如果抽屉仍停留在“我们”页，重复点击入口，覆盖第一次点击未被 WebView 接收的竞态。
-                if observation.stage == "ours":
-                    welfare_node = find_node(observation.nodes, "福利中心", exact=True)
-                    now = time.monotonic()
-                    if welfare_node is not None and (
-                        last_entry_tap_at is None or now - last_entry_tap_at >= 5
-                    ):
-                        self._tap_node(welfare_node)
-                        last_entry_tap_at = now
+                # 入口仍在当前页时重复点击，覆盖第一次点击未被 WebView 接收的竞态。
+                welfare_node = self._welfare_entry_node(observation)
+                now = time.monotonic()
+                if welfare_node is not None and (
+                    last_entry_tap_at is None or now - last_entry_tap_at >= 5
+                ):
+                    self._tap_node(welfare_node)
+                    last_entry_tap_at = now
                 time.sleep(WELFARE_LOAD_POLL_INTERVAL)
             if attempt == 0:
                 print("福利中心页面加载超时，正在重启元宝并重试")
@@ -2223,16 +2376,78 @@ class ToolExecutor:
         # 兑换前先收下残留奖励，避免弹窗拦截兑换商城入口。
         self._dismiss_reward_popup(observation)
         observation = self.observe()
+        # 福利页顶部“兑换商城”是 TextView 文案节点（不可点击），不要用
+        # clickable_only 查找；精确命中失败时回退到模糊匹配，再用固定坐标。
         mall = find_node(observation.nodes, "兑换商城", exact=True)
+        if mall is None:
+            mall = find_node(observation.nodes, "兑换商城")
         if mall is None:
             self._tap_point(110, 233)
         else:
             self._tap_node(mall)
         time.sleep(3)
         after = self.observe()
+        # 点进的可能是奖品记录/积分明细等相邻 WebView：只要积分余额可读，
+        # 直接核对积分与价格，积分不足就安全跳过，不必强求 exchange 阶段。
+        points, cost = self._read_points_and_cost(after)
+        if points is not None and cost is not None and points < cost:
+            self.reward_card_name = self.config.card_name
+            self.reward_unavailable = True
+            self._write_state("unavailable")
+            return self._result(
+                True,
+                f"目标商品“{self.config.card_name}”需要 {cost} 积分，当前仅 {points}，跳过兑换并返回“我们”页",
+                stage=after.stage,
+                reward_unavailable=True,
+                points=points,
+                cost=cost,
+            )
         if after.stage != "exchange":
             return self._result(False, "兑换商城没有加载")
         return self._result(True, "已进入兑换商城", stage=after.stage)
+
+    def _read_points_and_cost(
+        self, observation: Observation
+    ) -> tuple[int | None, int | None]:
+        """在积分明细/奖品记录等相邻页直接读取余额与 3 天卡价格。
+
+        失败报告证明：积分不足时页面可能落在 prize_records 而不是 exchange，
+        但余额（顶部纯数字）与卡价（“兑换QQ超级会员3天卡”附近的 -30000）
+        依然可读。读不到任一值时返回 None，调用方继续走正常兑换流程。
+        """
+        points: int | None = None
+        for node in observation.nodes:
+            if node.bounds.area <= 0 or node.bounds.top > 160:
+                continue
+            value = node.text.strip().replace(",", "")
+            match = re.fullmatch(r"(\d+)(?:\s*积分)?", value)
+            if match is None:
+                continue
+            points = min(points, int(match.group(1))) if points is not None else int(match.group(1))
+        if points is None:
+            return None, None
+        cost: int | None = None
+        card_index: int | None = None
+        ordered = list(observation.nodes)
+        for index, node in enumerate(ordered):
+            label = f"{node.text} {node.content_desc}".replace("\n", "")
+            if "超级会员" in label and "天卡" in label:
+                card_index = index
+                break
+        if card_index is None:
+            return points, None
+        for node in ordered[card_index : card_index + 12]:
+            for token in re.findall(r"-?\d[\d,]*", f"{node.text} {node.content_desc}"):
+                try:
+                    number = int(token.replace(",", ""))
+                except ValueError:
+                    continue
+                magnitude = abs(number)
+                if 1000 <= magnitude <= 1000000:
+                    cost = magnitude if cost is None else min(cost, magnitude)
+        if cost is None:
+            return points, None
+        return points, cost
 
     def _dismiss_reward_popup(self, observation: Observation | None = None) -> bool:
         observation = observation or self.observe()
@@ -3170,6 +3385,13 @@ class Workflow:
     fixed_entry_disabled: set[str] = field(default_factory=set)
     same_template_revealed: bool = False
     terminal_restore: bool = False
+    # 卡住恢复（VLM 自由决策）状态：同一卡点只恢复一次，避免无限循环。
+    # recover_phase/recover_target 记录恢复开始时的阶段与目标；恢复成功或
+    # 阶段/目标变化后清零，允许新的卡点再次恢复。
+    recovering: bool = False
+    recover_phase: str | None = None
+    recover_target: str | None = None
+    recover_attempts: int = 0
 
     def restore_state(self) -> None:
         """恢复当天已确认的进度；旧日期只保留兑换状态的清理语义。"""
@@ -3230,6 +3452,16 @@ class Workflow:
             self.progress[key] = max(value, previous if previous is not None else 0)
         self._persist_task_state()
 
+    def recovery_hint(self) -> str:
+        """卡住恢复时给 VLM 的自由决策提示：说明卡点，不限定具体工具。"""
+        label = TASK_LABELS.get(self.target or "", self.target or "无")
+        return (
+            "注意：常规流程已在此卡住（同一阶段连续失败），现进入一次智能恢复："
+            f"阶段={self.phase}，当前目标={label}。"
+            "请只看最新截图自由决策：若有意外弹窗请先关闭；若页面未加载到位可等待或滑动；"
+            "若入口位置不对请重新点；若已在正确页面请继续正常步骤。只允许一个工具调用。"
+        )
+
     def context(self, observation: Observation) -> str:
         progress = ", ".join(
             f"{TASK_LABELS[key]}={self.progress.get(key) if self.progress.get(key) is not None else '?'} / 3"
@@ -3239,7 +3471,7 @@ class Workflow:
             name for name, completed in self.substate.items() if completed
         ) or "无"
         coordinate_hint = ""
-        if self.phase == "open_target" and self.target in WELFARE_FIXED_ENTRY_RATIOS:
+        if self.phase == "open_target" and self.target in TASK_ENTRY_MARKERS:
             width = getattr(self.executor, "width", 0)
             height = getattr(self.executor, "height", 0)
             coordinate_hint = (
@@ -3284,6 +3516,7 @@ class Workflow:
         return ToolResult(True, "已更新福利中心任务进度")
 
     def _select_next(self) -> None:
+        self._clear_recovery("任务推进")
         if not self.daily_done:
             self.target = "daily_question"
             self.phase = "open_target"
@@ -3302,6 +3535,47 @@ class Workflow:
         self.expected_count = None
         self.phase = "open_exchange"
         self.substate = {}
+
+    def _clear_recovery(self, reason: str = "") -> None:
+        """恢复结束（成功推进或切到新卡点）后清零，允许后续新卡点再次恢复。"""
+        if self.recovering or self.recover_attempts:
+            detail = f"（{reason}）" if reason else ""
+            print(f"卡住恢复结束{detail}，清理恢复状态")
+        self.recovering = False
+        self.recover_phase = None
+        self.recover_target = None
+        self.recover_attempts = 0
+
+    def should_enter_recovery(self) -> bool:
+        """同一阶段+目标只恢复一次；切到新阶段/目标后允许再次恢复。"""
+        if self.recover_phase != self.phase or self.recover_target != self.target:
+            if self.recovering or self.recover_attempts:
+                self._clear_recovery("阶段或目标已变化")
+        if self.recovering:
+            return False
+        if self.recover_attempts > 0:
+            return False
+        return True
+
+    def note_recovery_attempt(self) -> None:
+        """记录一次 VLM 自由决策恢复尝试，并作废当前入口缓存。
+
+        同一入口坐标已连续失败，恢复时必须让 VLM 按最新截图重新定位；
+        否则恢复动作会复用同一个坏坐标，再次失败。
+        """
+        self.recovering = True
+        self.recover_phase = self.phase
+        self.recover_target = self.target
+        self.recover_attempts += 1
+        key = self._entry_cache_key()
+        if key is not None and key in self.entry_points:
+            self.entry_points.pop(key, None)
+            print(f"卡住恢复：已作废入口缓存 {key}，VLM 将按最新截图重新定位")
+
+    def finish_recovery(self, reason: str) -> None:
+        """恢复动作执行后即退出恢复态；成败由后续步骤的 failures 计数判定。"""
+        self.recovering = False
+        print(f"卡住恢复动作已执行（{reason}），回到正常流程观察效果")
 
     def _advance_after_task(self) -> None:
         """任务生成和奖励处理均成功后本地推进一次，避免重复请求视觉报告。"""
@@ -3343,13 +3617,19 @@ class Workflow:
             or self.target == "same_template"
             or observation.stage != "welfare"
             or not observation.nodes
-            or self.target in self.entry_points
         ):
+            return None
+        # 语义入口失败后不再无条件复用：同一坐标已失败时必须换入口，
+        # 否则语义定位会反复给出同一个点不中的坐标，耗尽重试次数。
+        cached = self._entry_cache_key()
+        if cached is not None and cached in self.entry_points:
             return None
         markers = TASK_ENTRY_MARKERS[self.target]
         # TASK_ENTRY_MARKERS 已按“行动按钮 -> 任务标题”的优先级排列。
         # 不要把行动按钮过滤掉：新版 WebView 的标题和按钮都是不可点击
         # 文本节点，只有右侧行动文案能稳定表达真正的入口位置。
+        # “做同款”模板列表的活动 WebView 也包含活动规则/任务语义；
+        # 含活动语义的节点不得作为任务入口，避免误触活动横幅。
         specific = markers
         candidates: list[tuple[int, int, Node]] = []
         for marker_index, marker in enumerate((*specific, *markers)):
@@ -3359,6 +3639,10 @@ class Workflow:
                     not node.enabled
                     or node.bounds.area <= 0
                     or "邀请新用户" in node.searchable
+                    or any(
+                        activity_marker in node.searchable.lower()
+                        for activity_marker in ACTIVITY_PAGE_MARKERS
+                    )
                 ):
                     continue
                 fields = (node.text, node.content_desc, node.resource_id)
@@ -3434,20 +3718,6 @@ class Workflow:
                 ratio_x, ratio_y = SAME_TEMPLATE_FIXED_ENTRY_RATIOS
                 print("使用本机福利布局固定“做同款”入口坐标")
                 return "tap", {"x": round(width * ratio_x), "y": round(height * ratio_y)}
-        if (
-            self.phase == "open_target"
-            and self.target in WELFARE_FIXED_ENTRY_RATIOS
-            and self.target not in self.fixed_entry_disabled
-            and self.target not in self.entry_points
-            and observation.stage == "welfare"
-            and not observation.nodes
-            and "webbrowseractivity" in observation.activity.lower()
-        ):
-            width, height = int(self.executor.width), int(self.executor.height)
-            if width > 0 and height > 0 and 1.55 <= height / width <= 2.05:
-                ratio_x, ratio_y = WELFARE_FIXED_ENTRY_RATIOS[self.target]
-                print(f"使用本机福利布局固定入口坐标：{self.target}")
-                return "tap", {"x": round(width * ratio_x), "y": round(height * ratio_y)}
         semantic_action = self._semantic_entry_action(observation)
         if semantic_action is not None:
             return semantic_action
@@ -3479,7 +3749,9 @@ class Workflow:
         if self._ignored_welfare_tap(args, observation):
             return None
         if not observation.nodes:
-            return "tap", args
+            # 空树福利页没有可校验的入口语义：fixed 盲点已停用，缓存坐标也不得
+            # 复用，统一交给视觉模型按最新截图定位，避免误触已下移的任务行。
+            return None
         markers = TASK_ENTRY_MARKERS.get(key, ())
         if markers:
             # 优先要求任务专属标题；只有当前版本完全不暴露标题时，才退回通用按钮文字。
@@ -3494,13 +3766,17 @@ class Workflow:
     def invalidate_cached_action(self) -> None:
         """丢弃当前入口缓存，让下一轮重新请求视觉定位。"""
         key = self._entry_cache_key()
-        if key in WELFARE_FIXED_ENTRY_RATIOS or key == "same_template":
+        if key == "same_template":
             self.fixed_entry_disabled.add(key)
         if key is not None:
             self.entry_points.pop(key, None)
 
     def expected_tool(self, observation: Observation) -> str | None:
         """返回本地状态已经确定的下一步工具，入口坐标仍交给模型定位。"""
+        # 卡住恢复期间不强制任何工具，让 VLM 根据恢复提示自由决策
+        # （tap/swipe/press_back/input/... 均可），这正是智能恢复的意义。
+        if self.recovering:
+            return None
         fixed_phases = {
             "report": "report_tasks",
             # 报告后目标已经由本地状态确定；只允许模型在最新截图中找入口坐标。
@@ -3697,9 +3973,39 @@ class Workflow:
         return ToolResult(True, "每日任务与奖品使用均已完成，本轮进入下一次等待")
 
     def dispatch(self, name: str, args: dict[str, Any], observation: Observation) -> ToolResult:
+        # 卡住恢复期间 VLM 自由决策：跳过阶段白名单（恢复动作本就是打破常规的
+        # 关弹窗/返回/重定位），只保留真正危险动作的人工确认逻辑。成败由外层
+        # failures 计数判定，成功则退出恢复态回到正常流程。
+        if self.recovering:
+            if name == "report_tasks":
+                result = self._parse_report(args)
+            elif name == "complete_task":
+                result = self._complete_task_assertions()
+            else:
+                result = self.executor.execute(name, args)
+            if result.ok:
+                self.finish_recovery(f"{name} 执行成功")
+            return result
         phase_error = self._valid_phase(name)
         if phase_error:
             return ToolResult(False, phase_error)
+        # 入口点击已确认打开福利活动页（站内活动 WebView）：这是已知误触，
+        # 直接关回任务列表并作废当前入口，让视觉模型重新定位真正的入口。
+        # 同一 phase/progress 下的重复短路仍会触发全局 stuck 保护并计入有界失败，
+        # 不会无限循环；关不回时返回阶段信息，便于外层重试或上报。
+        if observation.stage == "activity" and name in {"tap", "swipe", "press_back", "input_test_prompt"}:
+            after = self.executor._close_activity_page(observation)
+            self.fixed_entry_disabled.add(self.target or "")
+            self.entry_points.pop(self.target or "", None)
+            if after.stage == "welfare":
+                return ToolResult(
+                    False,
+                    "任务入口打开了福利活动页，已返回任务列表，请重新定位入口",
+                )
+            return ToolResult(
+                False,
+                f"任务入口打开了福利活动页，返回后仍未回到任务列表（阶段={after.stage or '未知'}）",
+            )
         if (
             name in {"tap", "swipe", "press_back"}
             and self.target in {"image", "photo_question"}
@@ -3954,9 +4260,16 @@ def run_once(config: Config) -> None:
             current_state = state_signature(observation.ui, observation.image, observation.activity)
             try:
                 # 本地状态已明确的阶段/子步骤强制唯一工具；入口点击等仍由模型定位。
+                # 卡住恢复期间不强制工具，让 VLM 看最新截图自由决策。
                 forced_tool = workflow.expected_tool(observation)
                 context = workflow.context(observation)
-                cached_action = workflow.cached_action(observation)
+                if workflow.recovering:
+                    context = f"{context}\n{workflow.recovery_hint()}"
+                    print(
+                        f"步骤 {step}：进入卡住恢复，VLM 自由决策 "
+                        f"（阶段={workflow.phase}，目标={workflow.target or '无'}）"
+                    )
+                cached_action = None if workflow.recovering else workflow.cached_action(observation)
                 if cached_action is not None:
                     # 同一任务的第 2、3 次通常复用同一入口；页面语义变化时
                     # cached_action 会失效，下面仍会回到视觉模型定位。
@@ -3990,6 +4303,17 @@ def run_once(config: Config) -> None:
             except AgentError as exc:
                 failures += 1
                 print(f"步骤 {step}：模型动作解析失败（{str(exc)[:160]}）")
+                # 模型调用失败同样先给一次 VLM 恢复机会：很可能是页面未到位或
+                # 瞬态问题，恢复提示会让模型重新观察最新截图再决策。
+                if failures >= config.max_retries and workflow.should_enter_recovery():
+                    workflow.note_recovery_attempt()
+                    print(
+                        f"步骤 {step}：模型调用连续 {failures} 次失败，熔断前转 VLM 自由决策恢复一次 "
+                        f"（阶段={workflow.phase}，目标={workflow.target or '无'}）"
+                    )
+                    if config.retry_cooldown_seconds:
+                        time.sleep(config.retry_cooldown_seconds)
+                    continue
                 if failures >= config.max_retries:
                     raise RetryLimitExceeded(
                         f"视觉模型动作连续失败 {failures} 次，达到最大重试次数",
@@ -4004,7 +4328,14 @@ def run_once(config: Config) -> None:
                 continue
             recent_action = {"tool": name, "arguments": args}
             signature = action_signature(name, args)
-            if repeated_action_is_stuck(
+            # 卡住恢复动作不受“同画面重复”拦截：恢复本就是在同一卡住画面上
+            # 换手段再试一次（换坐标重 tap / swipe / press_back），拦截它就等于
+            # 堵死恢复。恢复只允许一次，后续仍受正常计数与熔断保护。
+            if workflow.recovering:
+                result = workflow.dispatch(name, args, observation)
+                failures = failures + 1 if not result.ok else 0
+                previous_state, previous_action = current_state, signature
+            elif repeated_action_is_stuck(
                 name,
                 signature,
                 current_state,
@@ -4042,6 +4373,19 @@ def run_once(config: Config) -> None:
                 completed = True
                 return
             if not result.ok:
+                # 熔断前先给 VLM 一次自由决策恢复机会：意外弹窗、页面未到位等
+                # 未被程序覆盖的情况，让模型看最新截图自己决定（关弹窗/滑动/
+                # 重 tap/返回等），而不是连续失败几次就直接死。同一卡点只恢复
+                # 一次；恢复动作本身的成败仍计入 failures，失败则正常熔断。
+                if failures >= config.max_retries and workflow.should_enter_recovery():
+                    workflow.note_recovery_attempt()
+                    print(
+                        f"步骤 {step}：连续 {failures} 次失败，熔断前转 VLM 自由决策恢复一次 "
+                        f"（阶段={workflow.phase}，目标={workflow.target or '无'}）"
+                    )
+                    if config.retry_cooldown_seconds:
+                        time.sleep(config.retry_cooldown_seconds)
+                    continue
                 if failures >= config.max_retries:
                     raise RetryLimitExceeded(
                         f"连续 {failures} 次工具/状态失败，达到最大重试次数",

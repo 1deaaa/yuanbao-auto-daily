@@ -289,13 +289,36 @@ TASK_ENTRY_MARKERS: dict[str, tuple[str, ...]] = {
     "same_template": ("做同款",),
 }
 
+# 福利 WebView 有时只暴露任务标题，不暴露右侧行动按钮；有时又把整行
+# 暴露成一个覆盖整行的 TextView。两种情况下都应以任务行的纵坐标为锚点，
+# 点击右侧行动列，而不是点击标题节点中心。
+TASK_ENTRY_ACTION_MARKERS: dict[str, tuple[str, ...]] = {
+    "daily_question": ("去提问",),
+    "question": ("去提问",),
+    "writing": ("去写作",),
+    "image": ("去p图",),
+    "photo_question": ("去拍题",),
+    "same_template": ("做同款",),
+}
+TASK_ENTRY_ROW_MARKERS: dict[str, tuple[str, ...]] = {
+    "daily_question": ("每日问元宝得积分", "每日问元宝"),
+    "question": ("问元宝任意问题", "问元宝问题"),
+    "writing": ("使用写作能力",),
+    "image": ("使用p图能力",),
+    "photo_question": ("使用拍题能力",),
+    "same_template": ("使用推荐模板做同款",),
+}
+TASK_ENTRY_ACTION_X_RATIO = 0.895
+TASK_ENTRY_SCROLL_MAX_ATTEMPTS = 3
+
 # 福利页改版后每日任务区顶部插入了签到卡与邀请/创作横幅，旧固定行坐标
 # 已整体下移，继续盲点会误触“已完成”等非入口行。本字典保留为空作为扩展点；
 # 入口一律走语义或视觉定位，不再使用固定行坐标。
 WELFARE_FIXED_ENTRY_RATIOS: dict[str, tuple[float, float]] = {}
-# 本机福利页向上滚动一次后，“做同款”任务按钮稳定出现在第五行。
-# 只在已执行该次滚动、无障碍树为空且手机纵向比例时启用。
-SAME_TEMPLATE_FIXED_ENTRY_RATIOS = (0.895, 0.846)
+# 本机福利页向上滚动一次后，“做同款”任务按钮出现在任务列表底部。
+# 只在已执行该次滚动、无障碍树为空且手机纵向比例时启用；真实按钮中心
+# 位于 900x1600 画面的 (806, 1491)，旧坐标 (806, 1354) 会落到拍题行。
+SAME_TEMPLATE_FIXED_ENTRY_RATIOS = (0.895, 0.932)
 class AgentError(RuntimeError):
     """代理可以报告给模型、并由外层重试的错误。"""
 
@@ -329,6 +352,10 @@ class RetryLimitExceeded(AgentError):
         self.failures = failures
         self.recent_action = recent_action
         self.observation = observation
+
+
+class ModelAccessError(AgentError):
+    """视觉模型凭据或地区权限被拒绝，重试不能改变结果。"""
 
 
 def is_adb_transport_failure(error: BaseException) -> bool:
@@ -1413,7 +1440,7 @@ class Observation:
 
 
 def parse_local_welfare_progress(observation: Observation) -> dict[str, Any] | None:
-    """从完整福利层级读取进度；层级不完整时返回 None 交给视觉模型。"""
+    """从福利层级读取可见进度；没有任何可核验计数时返回 None。"""
     if observation.stage != "welfare" or not observation.nodes:
         return None
     markers = {
@@ -1424,19 +1451,20 @@ def parse_local_welfare_progress(observation: Observation) -> dict[str, Any] | N
         "same_template": ("使用推荐模板做同款", "做同款"),
     }
     nodes = tuple(observation.nodes)
+    visible_nodes = tuple(node for node in nodes if node.bounds.area > 0)
     progress: dict[str, int] = {}
     for key, wanted_markers in markers.items():
         label_nodes = [
             node
-            for node in nodes
+            for node in visible_nodes
             if any(marker.lower() in node.searchable for marker in wanted_markers)
         ]
         if not label_nodes:
-            return None
+            continue
         for label in label_nodes:
             nearby = [
                 node
-                for node in nodes
+                for node in visible_nodes
                 if abs(node.bounds.center[0] - label.bounds.center[0]) <= 420
                 and label.bounds.top - 20 <= node.bounds.top <= label.bounds.bottom + 150
             ]
@@ -1445,10 +1473,10 @@ def parse_local_welfare_progress(observation: Observation) -> dict[str, Any] | N
             if match is not None:
                 progress[key] = int(match.group(1))
                 break
-        if key not in progress:
-            return None
+    if not progress:
+        return None
     all_text = " ".join(node.searchable for node in nodes)
-    daily_done = "今日已完成" in all_text or progress["question"] >= 3
+    daily_done = "今日已完成" in all_text or progress.get("question", 0) >= 3
     return {"daily_done": daily_done, **progress}
 
 
@@ -3177,6 +3205,11 @@ class VisionModel:
             try:
                 return operation()
             except Exception as exc:  # 上游兼容端点的异常类型不统一，统一进入重试边界。
+                status_code = getattr(exc, "status_code", None)
+                if status_code in {401, 403}:
+                    raise ModelAccessError(
+                        f"{label}被拒绝（HTTP {status_code}）：{str(exc)[:240]}"
+                    ) from exc
                 last = exc
                 if attempt >= self.config.max_retries:
                     break
@@ -3380,6 +3413,11 @@ class Workflow:
     stale_reports: int = 0
     finished: bool = False
     entry_points: dict[str, tuple[float, float]] = field(default_factory=dict)
+    # report_tasks 使用完整层级选出的入口只消费一次。福利 WebView 下一轮
+    # 可能暂时返回空树，但紧接着的截图仍是同一页面，此时应沿用这次已验证的
+    # 坐标，避免把顶部签到卡或空白区域交给视觉模型猜测。
+    primed_entry_points: set[str] = field(default_factory=set)
+    entry_scroll_attempts: dict[str, int] = field(default_factory=dict)
     entry_failures: int = 0
     state_restored: bool = False
     fixed_entry_disabled: set[str] = field(default_factory=set)
@@ -3487,8 +3525,12 @@ class Workflow:
 
     def _parse_report(self, args: dict[str, Any]) -> ToolResult:
         try:
-            daily_done = bool(args["daily_done"])
-            values = {key: int(args[key]) for key in TASK_ORDER}
+            daily_done = bool(args.get("daily_done", self.daily_done is True))
+            values = {}
+            for key in TASK_ORDER:
+                previous = self.progress.get(key)
+                value = args.get(key, previous if previous is not None else 0)
+                values[key] = int(value)
         except (KeyError, TypeError, ValueError) as exc:
             return ToolResult(False, "report_tasks 缺少固定进度字段")
         if any(value < 0 or value > 3 for value in values.values()):
@@ -3514,6 +3556,27 @@ class Workflow:
         self.stale_reports = 0
         self._select_next()
         return ToolResult(True, "已更新福利中心任务进度")
+
+    def reconcile_visible_progress(self, observation: Observation) -> bool:
+        """当福利页已显示当前目标完成时，先同步进度并跳过重复入口点击。"""
+        if (
+            self.phase != "open_target"
+            or self.target not in TASK_LABELS
+            or self.expected_count is None
+        ):
+            return False
+        report = parse_local_welfare_progress(observation)
+        if report is None:
+            return False
+        visible_count = report.get(self.target)
+        if not isinstance(visible_count, int) or visible_count < self.expected_count:
+            return False
+        target_label = TASK_LABELS[self.target]
+        result = self._parse_report(report)
+        if result.ok:
+            self._prime_entry_point(observation)
+            print(f"福利页面已显示 {target_label} 完成，已同步进度并跳过重复点击")
+        return result.ok
 
     def _select_next(self) -> None:
         self._clear_recovery("任务推进")
@@ -3579,6 +3642,7 @@ class Workflow:
 
     def _advance_after_task(self) -> None:
         """任务生成和奖励处理均成功后本地推进一次，避免重复请求视觉报告。"""
+        completed_target = self.target
         if self.target == "daily_question":
             self.daily_done = True
         elif self.target in TASK_LABELS:
@@ -3590,6 +3654,16 @@ class Workflow:
             self.same_template_revealed = False
         self._persist_task_state()
         self._select_next()
+        # 首次“每日问元宝”和后续“问元宝问题”实际使用福利列表同一行。
+        # 从恢复状态继续运行时可能没有新的 report_tasks，下一轮又恰逢 WebView
+        # 空树；沿用刚完成入口的坐标即可避免再次把顶部签到卡交给模型判断。
+        if (
+            completed_target == "daily_question"
+            and self.target == "question"
+            and "daily_question" in self.entry_points
+        ):
+            self.entry_points["question"] = self.entry_points["daily_question"]
+            self.primed_entry_points.add("question")
 
     def _task_kind(self) -> str:
         return self.target or ""
@@ -3607,6 +3681,116 @@ class Workflow:
             return "same_template:template"
         return None
 
+    @staticmethod
+    def _usable_entry_node(node: Node) -> bool:
+        """过滤邀请任务和活动页语义，避免把相邻卡片当成当前任务行。"""
+        return bool(
+            node.enabled
+            and node.bounds.area > 0
+            and "邀请新用户" not in node.searchable
+            and not any(
+                marker in node.searchable.lower() for marker in ACTIVITY_PAGE_MARKERS
+            )
+        )
+
+    @staticmethod
+    def _matches_entry_marker(node: Node, marker: str) -> bool:
+        wanted = marker.lower()
+        return any(field == marker for field in (node.text, node.content_desc, node.resource_id)) or wanted in node.searchable
+
+    def _task_entry_point(self, observation: Observation) -> tuple[int, int, int] | None:
+        """返回任务入口的右侧点击点和纵向容差。
+
+        福利 WebView 的无障碍实现并不稳定：有时只暴露任务标题，有时暴露
+        “去写作”等行动文案，还有时把整行标题作为一个宽大的 TextView。
+        先用任务标题确定行，再把横坐标放到右侧行动列，能覆盖这三种层级。
+        """
+        if (
+            self.phase != "open_target"
+            or self.target not in TASK_ENTRY_MARKERS
+            or observation.stage != "welfare"
+            or not observation.nodes
+        ):
+            return None
+        width = int(getattr(self.executor, "width", 0))
+        height = int(getattr(self.executor, "height", 0))
+        nodes = [node for node in observation.nodes if self._usable_entry_node(node)]
+        if width <= 0:
+            width = max((node.bounds.right for node in nodes), default=0)
+        if height <= 0:
+            height = max((node.bounds.bottom for node in nodes), default=0)
+        if width <= 0 or height <= 0:
+            return None
+        action_markers = TASK_ENTRY_ACTION_MARKERS.get(self.target, ())
+        row_markers = TASK_ENTRY_ROW_MARKERS.get(self.target, ())
+        actions = [
+            node
+            for node in nodes
+            if any(self._matches_entry_marker(node, marker) for marker in action_markers)
+        ]
+        row_candidates: list[tuple[int, Node]] = []
+        max_row_height = 260
+        for node in nodes:
+            if node.bounds.height > max_row_height:
+                continue
+            for marker_index, marker in enumerate(row_markers):
+                if self._matches_entry_marker(node, marker):
+                    exact = any(
+                        field == marker
+                        for field in (node.text, node.content_desc, node.resource_id)
+                    )
+                    row_candidates.append((marker_index * 2 + (0 if exact else 1), node))
+                    break
+
+        row = min(
+            row_candidates,
+            key=lambda item: (item[0], item[1].bounds.top, item[1].bounds.area),
+            default=(0, None),
+        )[1]
+        action: Node | None = None
+        if actions and row is not None:
+            nearby = [
+                node
+                for node in actions
+                if node is not row
+                and abs(node.bounds.center[1] - row.bounds.center[1])
+                <= max(180, row.bounds.height + 80)
+            ]
+            if nearby:
+                action = min(
+                    nearby,
+                    key=lambda node: (
+                        abs(node.bounds.center[1] - row.bounds.center[1]),
+                        -node.bounds.center[0],
+                    ),
+                )
+        if action is None and actions and row is None:
+            # “去提问”可能同时出现在顶部签到卡和任务列表；没有任务标题时
+            # 选择屏幕中更靠下的行动项，避免点击顶部卡片。
+            action = max(actions, key=lambda node: (node.bounds.center[1], node.bounds.center[0]))
+        if action is None and row is None:
+            return None
+
+        anchor = action or row
+        assert anchor is not None
+        x, y = anchor.bounds.center
+        # 只有右侧的小行动节点才直接使用其中心；整行节点的中心通常落在
+        # x=450 左右，必须改用右侧行动列。没有行动节点时同样只借用行的 y。
+        if (
+            action is not None
+            and action.bounds.width <= round(width * 0.35)
+            and action.bounds.center[0] >= round(width * 0.62)
+        ):
+            x = action.bounds.center[0]
+        else:
+            x = round(width * TASK_ENTRY_ACTION_X_RATIO)
+        anchor_height = max(
+            row.bounds.height if row is not None else 0,
+            action.bounds.height if action is not None else 0,
+        )
+        tolerance = max(70, min(180, anchor_height // 2 + 55))
+        return x, y, tolerance
+
     def _semantic_entry_action(
         self, observation: Observation
     ) -> tuple[str, dict[str, int]] | None:
@@ -3614,59 +3798,90 @@ class Workflow:
         if (
             self.phase != "open_target"
             or self.target not in TASK_ENTRY_MARKERS
-            or self.target == "same_template"
             or observation.stage != "welfare"
             or not observation.nodes
         ):
             return None
+        point = self._task_entry_point(observation)
+        if point is None:
+            return None
+        self.entry_scroll_attempts.pop(self.target, None)
         # 语义入口失败后不再无条件复用：同一坐标已失败时必须换入口，
         # 否则语义定位会反复给出同一个点不中的坐标，耗尽重试次数。
         cached = self._entry_cache_key()
         if cached is not None and cached in self.entry_points:
             return None
-        markers = TASK_ENTRY_MARKERS[self.target]
-        # TASK_ENTRY_MARKERS 已按“行动按钮 -> 任务标题”的优先级排列。
-        # 不要把行动按钮过滤掉：新版 WebView 的标题和按钮都是不可点击
-        # 文本节点，只有右侧行动文案能稳定表达真正的入口位置。
-        # “做同款”模板列表的活动 WebView 也包含活动规则/任务语义；
-        # 含活动语义的节点不得作为任务入口，避免误触活动横幅。
-        specific = markers
-        candidates: list[tuple[int, int, Node]] = []
-        for marker_index, marker in enumerate((*specific, *markers)):
-            wanted = marker.lower()
-            for node in observation.nodes:
-                if (
-                    not node.enabled
-                    or node.bounds.area <= 0
-                    or "邀请新用户" in node.searchable
-                    or any(
-                        activity_marker in node.searchable.lower()
-                        for activity_marker in ACTIVITY_PAGE_MARKERS
-                    )
-                ):
-                    continue
-                fields = (node.text, node.content_desc, node.resource_id)
-                exact = any(field == marker for field in fields)
-                if not (exact or wanted in node.searchable):
-                    continue
-                # 优先专属文案和可点击节点；宽泛文案只在专属文案缺失时使用。
-                specificity = 0 if marker in specific else 1
-                clickable_penalty = 0 if node.clickable else 1
-                candidates.append(
-                    (
-                        specificity * 10 + clickable_penalty,
-                        -node.bounds.top,
-                        node,
-                    )
-                )
-            if candidates and marker in specific:
-                break
-        if not candidates:
-            return None
-        _, _, node = min(candidates, key=lambda item: (item[0], item[1]))
-        x, y = node.bounds.center
+        x, y, _ = point
         print(f"使用无障碍语义定位任务入口：{self.target}")
         return "tap", {"x": x, "y": y}
+
+    def _offscreen_entry_scroll_action(
+        self, observation: Observation
+    ) -> tuple[str, dict[str, int]] | None:
+        """目标行明确存在但尚无屏幕边界时，有界滚动福利列表使其进入视口。"""
+        if (
+            self.phase != "open_target"
+            or self.target not in TASK_ENTRY_ROW_MARKERS
+            or observation.stage != "welfare"
+            or not observation.nodes
+        ):
+            return None
+        markers = TASK_ENTRY_ROW_MARKERS[self.target]
+        if not any(
+            node.bounds.area == 0
+            and any(self._matches_entry_marker(node, marker) for marker in markers)
+            for node in observation.nodes
+        ):
+            return None
+        attempts = self.entry_scroll_attempts.get(self.target, 0)
+        if attempts >= TASK_ENTRY_SCROLL_MAX_ATTEMPTS:
+            return None
+        width = int(getattr(self.executor, "width", 0))
+        height = int(getattr(self.executor, "height", 0))
+        if width <= 0 or height <= 0:
+            return None
+        self.entry_scroll_attempts[self.target] = attempts + 1
+        print(f"福利任务行在视口外，向下滚动以显示入口：{self.target}（{attempts + 1}/{TASK_ENTRY_SCROLL_MAX_ATTEMPTS}）")
+        return "swipe", {
+            "x1": width // 2,
+            "y1": round(height * 0.84),
+            "x2": width // 2,
+            "y2": round(height * 0.38),
+            "duration_ms": 500,
+        }
+
+    def _tap_matches_task_entry(self, args: dict[str, Any], observation: Observation) -> bool:
+        point = self._task_entry_point(observation)
+        if point is None:
+            return False
+        try:
+            x, y = int(args["x"]), int(args["y"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        target_x, target_y, tolerance = point
+        width = int(getattr(self.executor, "width", 0))
+        return (
+            abs(x - target_x) <= max(55, round(width * 0.10))
+            and abs(y - target_y) <= tolerance
+        )
+
+    def _correct_task_entry_tap(self, args: dict[str, Any], observation: Observation) -> None:
+        """把模型点在任务标题/整行中部的坐标校正到右侧行动列。"""
+        point = self._task_entry_point(observation)
+        if point is None:
+            return
+        try:
+            x, y = int(args["x"]), int(args["y"])
+        except (KeyError, TypeError, ValueError):
+            return
+        target_x, target_y, tolerance = point
+        width = int(getattr(self.executor, "width", 0))
+        if abs(y - target_y) > tolerance:
+            return
+        if abs(x - target_x) <= max(55, round(width * 0.10)):
+            return
+        args.update({"x": target_x, "y": target_y})
+        print(f"模型点击落在任务行中部，已校正到右侧行动列：{self.target}")
 
     def _remember_entry_point(self, name: str, args: dict[str, Any]) -> None:
         """保存一次已成功点击的入口，使用归一化坐标适配同一运行中的尺寸。"""
@@ -3683,6 +3898,16 @@ class Workflow:
         if width <= 0 or height <= 0 or not (0 <= x < width and 0 <= y < height):
             return
         self.entry_points[key] = (x / width, y / height)
+
+    def _prime_entry_point(self, observation: Observation) -> None:
+        """用刚完成的稳定福利层级预存当前任务入口，覆盖下一轮空树竞态。"""
+        action = self._semantic_entry_action(observation)
+        if action is None:
+            return
+        self._remember_entry_point(*action)
+        key = self._entry_cache_key()
+        if key is not None and key in self.entry_points:
+            self.primed_entry_points.add(key)
 
     def cached_action(self, observation: Observation) -> tuple[str, dict[str, int]] | None:
         """在页面仍匹配时复用已验证入口，否则让视觉模型重新定位。"""
@@ -3718,9 +3943,44 @@ class Workflow:
                 ratio_x, ratio_y = SAME_TEMPLATE_FIXED_ENTRY_RATIOS
                 print("使用本机福利布局固定“做同款”入口坐标")
                 return "tap", {"x": round(width * ratio_x), "y": round(height * ratio_y)}
+        if (
+            self.phase == "perform"
+            and self.target == "same_template"
+            and self.substate.get("entry_clicked")
+            and not self.substate.get("template_clicked")
+        ):
+            key = self._entry_cache_key()
+            if key is not None and key in self.entry_points:
+                width, height = int(self.executor.width), int(self.executor.height)
+                if width > 0 and height > 0:
+                    ratio_x, ratio_y = self.entry_points[key]
+                    cached_args = {
+                        "x": round(width * ratio_x),
+                        "y": round(height * ratio_y),
+                    }
+                    if observation.stage == "app" and (
+                        self._tap_hits_label(cached_args, observation, "做同款")
+                        or self._tap_hits_template_card(cached_args, observation)
+                    ):
+                        return "tap", cached_args
+                if observation.stage == "app":
+                    self.entry_points.pop(key, None)
+            button = find_node(observation.nodes, "做同款", exact=True)
+            if button is None:
+                button = find_node(observation.nodes, "做同款")
+            if button is not None and button.bounds.area > 0:
+                print("使用无障碍语义定位推荐模板按钮")
+                return "tap", {"x": button.bounds.center[0], "y": button.bounds.center[1]}
+            fallback = self._template_card_fallback(observation)
+            if fallback is not None:
+                print("使用首张可点击推荐模板卡片继续做同款任务")
+                return "tap", {"x": fallback[0], "y": fallback[1]}
         semantic_action = self._semantic_entry_action(observation)
         if semantic_action is not None:
             return semantic_action
+        scroll_action = self._offscreen_entry_scroll_action(observation)
+        if scroll_action is not None:
+            return scroll_action
         key = self._entry_cache_key()
         if key is None or key not in self.entry_points:
             return None
@@ -3749,8 +4009,12 @@ class Workflow:
         if self._ignored_welfare_tap(args, observation):
             return None
         if not observation.nodes:
-            # 空树福利页没有可校验的入口语义：fixed 盲点已停用，缓存坐标也不得
-            # 复用，统一交给视觉模型按最新截图定位，避免误触已下移的任务行。
+            # 只有 report_tasks 刚用完整层级确认过的坐标才允许跨过一次空树；
+            # 普通历史缓存仍然禁止复用，避免福利页滚动后误点旧任务行。
+            if key in self.primed_entry_points:
+                self.primed_entry_points.discard(key)
+                print(f"福利 WebView 层级暂空，沿用已确认的任务入口坐标：{key}")
+                return "tap", args
             return None
         markers = TASK_ENTRY_MARKERS.get(key, ())
         if markers:
@@ -3758,8 +4022,14 @@ class Workflow:
             specific = markers
             searchable = " ".join(node.searchable for node in observation.nodes)
             if any(marker.lower() in searchable for marker in specific):
-                return ("tap", args) if self._tap_hits_label(args, observation, *specific) else None
-            if self._tap_hits_label(args, observation, *markers):
+                if self._tap_hits_label(args, observation, *specific) or self._tap_matches_task_entry(
+                    args, observation
+                ):
+                    return "tap", args
+                return None
+            if self._tap_hits_label(args, observation, *markers) or self._tap_matches_task_entry(
+                args, observation
+            ):
                 return "tap", args
         return None
 
@@ -4012,6 +4282,8 @@ class Workflow:
             and observation.stage == "picker"
         ):
             return ToolResult(False, "当前已在系统图片选择器，必须调用 select_local_image 选择测试图片")
+        if name == "tap" and self.phase == "open_target":
+            self._correct_task_entry_tap(args, observation)
         if name == "tap" and observation.stage == "welfare" and self._ignored_welfare_tap(args, observation):
             return ToolResult(False, "已拒绝点击“邀请新用户”任务")
         if name == "tap" and self.target == "same_template":
@@ -4092,6 +4364,8 @@ class Workflow:
                     return ToolResult(False, "当前任务尚未发送，必须先调用 send_message")
         if name == "report_tasks":
             result = self._parse_report(args)
+            if result.ok:
+                self._prime_entry_point(observation)
             return result
         if name == "complete_task":
             return self._complete_task_assertions()
@@ -4258,6 +4532,11 @@ def run_once(config: Config) -> None:
         for step in range(1, config.max_steps + 1):
             observation = executor.observe()
             current_state = state_signature(observation.ui, observation.image, observation.activity)
+            if workflow.reconcile_visible_progress(observation):
+                failures = 0
+                previous_state, previous_action = current_state, None
+                print(f"步骤 {step}：已根据福利页面的可见进度恢复当前任务")
+                continue
             try:
                 # 本地状态已明确的阶段/子步骤强制唯一工具；入口点击等仍由模型定位。
                 # 卡住恢复期间不强制工具，让 VLM 看最新截图自由决策。
@@ -4300,6 +4579,17 @@ def run_once(config: Config) -> None:
                         forced_tool=forced_tool,
                     )
                     used_cached_action = False
+            except ModelAccessError as exc:
+                failures += 1
+                raise RetryLimitExceeded(
+                    f"视觉模型服务不可用：{str(exc)[:300]}",
+                    phase=workflow.phase,
+                    target=workflow.target or "",
+                    step=step,
+                    failures=failures,
+                    recent_action=recent_action,
+                    observation=observation,
+                ) from exc
             except AgentError as exc:
                 failures += 1
                 print(f"步骤 {step}：模型动作解析失败（{str(exc)[:160]}）")

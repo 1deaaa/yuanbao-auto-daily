@@ -1599,8 +1599,8 @@ def parse_local_welfare_progress(observation: Observation) -> dict[str, Any] | N
     if not progress:
         return None
     # “今日已完成”也会出现在签到卡，不代表“每日问元宝”已经完成。
-    # 只有每日问元宝任务行自身的状态，或三次普通问答已经完成，才能确认 daily_done。
-    daily_done = progress.get("question", 0) >= 3
+    # 普通“问元宝问题”与每日问元宝是两个独立任务，不能用前者的计数推导后者。
+    daily_done = False
     daily_markers = ("每日问元宝得积分", "每日问元宝")
     daily_labels = [
         node
@@ -2534,6 +2534,17 @@ class ToolExecutor:
         label = min(labels, key=lambda node: node.bounds.area)
         if label.clickable:
             return label
+        if label.parent_clickable and label.parent_bounds is not None:
+            direct_parents = [
+                node
+                for node in observation.nodes
+                if node.enabled
+                and node.clickable
+                and node.bounds == label.parent_bounds
+            ]
+            if direct_parents:
+                return min(direct_parents, key=lambda node: node.bounds.area)
+            return label
         lx, ly = label.bounds.center
         parents = [
             node
@@ -2545,6 +2556,60 @@ class ToolExecutor:
             and node.bounds.top <= ly <= node.bounds.bottom
         ]
         return min(parents, key=lambda node: node.bounds.area, default=label)
+
+    @staticmethod
+    def _welfare_return_tap_point(
+        observation: Observation, node: Node, width: int, height: int
+    ) -> tuple[int, int]:
+        """在返回按钮与其它顶部控件重叠时选择未被覆盖的区域。"""
+        bounds = node_interaction_bounds(node)
+        center = bounds.center
+
+        def contains(outer: Bounds, inner: Bounds) -> bool:
+            return (
+                outer != inner
+                and outer.left <= inner.left
+                and outer.top <= inner.top
+                and outer.right >= inner.right
+                and outer.bottom >= inner.bottom
+            )
+
+        competing = [
+            candidate
+            for candidate in observation.nodes
+            if candidate.enabled
+            and candidate.clickable
+            and candidate.bounds.area > 0
+            and candidate.bounds != bounds
+            and candidate.bounds.area <= round(max(1, width * height) * 0.55)
+            # 聊天消息容器、RecyclerView 等可点击祖先会覆盖整个顶部区域，
+            # 但它们不是前景浮层；只把与返回按钮相交的兄弟控件视为遮挡。
+            and not contains(candidate.bounds, bounds)
+            and candidate.bounds.left < bounds.right
+            and candidate.bounds.right > bounds.left
+            and candidate.bounds.top < bounds.bottom
+            and candidate.bounds.bottom > bounds.top
+        ]
+        if not competing:
+            return center
+        candidates = (
+            (bounds.right - 15, center[1]),
+            (bounds.left + 15, center[1]),
+            center,
+        )
+        for point in candidates:
+            x, y = point
+            if (
+                bounds.left <= x < bounds.right
+                and bounds.top <= y < bounds.bottom
+                and not any(
+                    candidate.bounds.left <= x < candidate.bounds.right
+                    and candidate.bounds.top <= y < candidate.bounds.bottom
+                    for candidate in competing
+                )
+            ):
+                return point
+        return center
 
     @staticmethod
     def _welfare_entry_click_node(observation: Observation) -> Node | None:
@@ -2599,7 +2664,14 @@ class ToolExecutor:
                     return webview_observation
                 welfare_node = self._welfare_entry_click_node(observation) or self._welfare_return_node(observation)
                 if welfare_node is not None and last_entry_tap_at is None:
-                    self._tap_node(welfare_node)
+                    return_node = self._welfare_return_node(observation)
+                    if return_node is not None and welfare_node == return_node:
+                        x, y = self._welfare_return_tap_point(
+                            observation, return_node, self.width, self.height
+                        )
+                        self._tap_point(x, y)
+                    else:
+                        self._tap_node(welfare_node)
                     last_entry_tap_at = time.monotonic()
                 elif (
                     not fallback_tapped
@@ -2635,7 +2707,14 @@ class ToolExecutor:
                 if welfare_node is not None and (
                     last_entry_tap_at is None or now - last_entry_tap_at >= 5
                 ):
-                    self._tap_node(welfare_node)
+                    return_node = self._welfare_return_node(observation)
+                    if return_node is not None and welfare_node == return_node:
+                        x, y = self._welfare_return_tap_point(
+                            observation, return_node, self.width, self.height
+                        )
+                        self._tap_point(x, y)
+                    else:
+                        self._tap_node(welfare_node)
                     last_entry_tap_at = now
                 time.sleep(WELFARE_LOAD_POLL_INTERVAL)
             if attempt == 0:
@@ -3253,7 +3332,14 @@ class ToolExecutor:
                 if after_tap.stage != "welfare":
                     return_node = self._welfare_return_node(after_tap) or self._welfare_entry_click_node(after_tap)
                     if return_node is not None:
-                        self._tap_node(return_node)
+                        welfare_return = self._welfare_return_node(after_tap)
+                        if welfare_return is not None and return_node == welfare_return:
+                            resolved_x, resolved_y = self._welfare_return_tap_point(
+                                after_tap, welfare_return, self.width, self.height
+                            )
+                            self._tap_point(resolved_x, resolved_y)
+                        else:
+                            self._tap_node(return_node)
                         time.sleep(0.8)
                         after_tap = self.observe()
                 # 福利页任务行动按钮是 WebView 的异步路由入口。短暂仍显示福利页
@@ -4085,10 +4171,19 @@ class Workflow:
             finder = getattr(self.executor, "_welfare_return_node", None)
             node = finder(observation) if callable(finder) else None
             if node is not None:
-                bounds = node_interaction_bounds(node)
-                if bounds.area > 0:
+                point_finder = getattr(self.executor, "_welfare_return_tap_point", None)
+                if callable(point_finder):
+                    point = point_finder(
+                        observation,
+                        node,
+                        getattr(self.executor, "width", 0),
+                        getattr(self.executor, "height", 0),
+                    )
+                else:
+                    point = node_interaction_bounds(node).center
+                if point != (0, 0) or node_interaction_bounds(node).area > 0:
                     print("视觉重规划失败，使用当前观测中的“返回福利中心”语义控件")
-                    return "tap", {"x": bounds.center[0], "y": bounds.center[1]}
+                    return "tap", {"x": point[0], "y": point[1]}
         if self.phase == "navigate_welfare":
             activity_lower = observation.activity.lower()
             if PACKAGE_NAME not in activity_lower and observation.activity:
@@ -4150,6 +4245,23 @@ class Workflow:
             f"奖励使用证据={self.executor.reward_use_confirmed}; {coordinate_hint}"
         )
 
+    def _sanitize_daily_done_report(
+        self, args: dict[str, Any], observation: Observation
+    ) -> tuple[dict[str, Any], bool]:
+        """过滤福利页顶部签到状态对每日任务完成状态的误报。"""
+        if (
+            self.daily_done is True
+            or args.get("daily_done") is not True
+            or observation.stage != "welfare"
+        ):
+            return args, False
+        local_report = parse_local_welfare_progress(observation)
+        if local_report is None or local_report.get("daily_done") is True:
+            return args, False
+        sanitized = dict(args)
+        sanitized["daily_done"] = False
+        return sanitized, True
+
     def _parse_report(self, args: dict[str, Any]) -> ToolResult:
         try:
             daily_done = bool(args.get("daily_done", self.daily_done is True))
@@ -4169,9 +4281,9 @@ class Workflow:
             ):
                 return ToolResult(False, "available_tasks 必须是任务目录中的字符串数组")
             self.skipped_tasks = set(TASK_ORDER) - set(available)
-        merged_daily_done = bool(
-            self.daily_done is True or daily_done or values["question"] >= 3
-        )
+        # 普通问答和每日问元宝是福利页上的两个独立奖励任务；只有模型报告
+        # 每日任务行已完成，或本地已经确认过该任务，才能合并 daily_done。
+        merged_daily_done = bool(self.daily_done is True or daily_done)
         merged_values = {
             key: max(value, self.progress[key] if self.progress[key] is not None else 0)
             for key, value in values.items()
@@ -4295,6 +4407,14 @@ class Workflow:
             self._prime_entry_point(observation)
             print(f"福利页面已显示 {target_label} 完成，已同步进度并跳过重复点击")
         return result.ok
+
+    def reconcile_return_to_welfare(self, observation: Observation) -> bool:
+        """返回阶段观测到福利页时立即推进，抵抗 WebView 返回后的结果竞态。"""
+        if self.phase != "return" or observation.stage != "welfare":
+            return False
+        self._advance_after_task()
+        print("已观测到福利中心页面，完成返回阶段并推进下一任务")
+        return True
 
     def _select_next(self) -> None:
         self._clear_recovery("任务推进")
@@ -5217,7 +5337,10 @@ class Workflow:
         # failures 计数判定，成功则退出恢复态回到正常流程。
         if self.recovering:
             if name == "report_tasks":
-                result = self._parse_report(args)
+                report_args, corrected = self._sanitize_daily_done_report(args, observation)
+                result = self._parse_report(report_args)
+                if corrected and result.ok:
+                    result.message += "；已忽略非每日任务行的‘今日已完成’状态"
             elif name == "report_exchange":
                 result = self._parse_exchange_report(args, observation)
             elif name == "complete_task":
@@ -5427,7 +5550,10 @@ class Workflow:
                 else:
                     return ToolResult(False, "当前任务尚未发送，必须先调用 send_message")
         if name == "report_tasks":
-            result = self._parse_report(args)
+            report_args, corrected = self._sanitize_daily_done_report(args, observation)
+            result = self._parse_report(report_args)
+            if corrected and result.ok:
+                result.message += "；已忽略非每日任务行的‘今日已完成’状态"
             if result.ok:
                 self._prime_entry_point(observation)
             return result
@@ -5438,6 +5564,30 @@ class Workflow:
             if callable(set_variant):
                 set_variant(self._prompt_variant())
         result = self.executor.execute(name, args)
+        if (
+            self.phase == "return"
+            and name in {"tap", "press_back"}
+            and result.data.get("stage") != "welfare"
+        ):
+            # 返回入口可能被前景控件遮挡，甚至在执行器报告失败时也要尝试
+            # 当前页面的语义导航；成功回到福利页后由本地状态统一推进。
+            semantic_navigation = getattr(self.executor, "_go_to_welfare", None)
+            if callable(semantic_navigation):
+                try:
+                    fallback_observation = semantic_navigation()
+                except ManualActionRequired:
+                    raise
+                except AgentError:
+                    fallback_observation = None
+                if (
+                    fallback_observation is not None
+                    and fallback_observation.stage == "welfare"
+                ):
+                    result = ToolResult(
+                        True,
+                        "返回入口未响应，已按当前页面语义导航回福利中心",
+                        {"stage": "welfare"},
+                    )
         if not result.ok:
             return result
         if self.phase == "open_exchange" and name == "tap" and result.data.get("stage") == "welfare":
@@ -5624,6 +5774,15 @@ def run_once(config: Config) -> None:
                 stable_missing_scrolls = 0
                 last_scroll_catalog_signature = None
                 last_visual_action = None
+                continue
+            if workflow.reconcile_return_to_welfare(observation):
+                failures = 0
+                visual_replan_attempts = 0
+                visual_replan_reason = ""
+                stable_missing_scrolls = 0
+                last_scroll_catalog_signature = None
+                last_visual_action = None
+                previous_state, previous_action = current_state, None
                 continue
             if workflow.reconcile_visible_progress(observation):
                 failures = 0

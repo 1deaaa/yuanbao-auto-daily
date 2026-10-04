@@ -1307,7 +1307,7 @@ class 元宝任务测试(unittest.TestCase):
         self.assertEqual(workflow.phase, "open_target")
         self.assertEqual(workflow.target, "question")
 
-    def test_报告进度单调合并且问题三次自动确认每日任务(self):
+    def test_报告进度单调合并且普通问题三次不确认每日任务(self):
         with tempfile.TemporaryDirectory() as directory:
             config = replace(self.配置(), state_path=Path(directory) / "state.json")
             workflow = task.Workflow(config, 假执行器())
@@ -1322,7 +1322,7 @@ class 元宝任务测试(unittest.TestCase):
                 }
             )
             self.assertTrue(result.ok)
-            self.assertTrue(workflow.daily_done)
+            self.assertFalse(workflow.daily_done)
             self.assertEqual(workflow.progress["question"], 3)
             result = workflow._parse_report(
                 {
@@ -1334,12 +1334,74 @@ class 元宝任务测试(unittest.TestCase):
                     "same_template": 0,
                 }
             )
-            self.assertFalse(result.ok)
-            self.assertTrue(workflow.daily_done)
+            self.assertTrue(result.ok)
+            self.assertFalse(workflow.daily_done)
             self.assertEqual(workflow.progress["question"], 3)
             saved = task.read_daily_state(config.state_path)
-            self.assertTrue(saved["daily_done"])
+            self.assertFalse(saved["daily_done"])
             self.assertEqual(saved["task_progress"]["question"], 3)
+
+    def test_每日任务行明确完成时才确认每日任务(self):
+        workflow = task.Workflow(self.配置(), 假执行器())
+        result = workflow._parse_report(
+            {
+                "daily_done": True,
+                "question": 3,
+                "writing": 0,
+                "image": 0,
+                "photo_question": 0,
+                "same_template": 0,
+            }
+        )
+        self.assertTrue(result.ok)
+        self.assertTrue(workflow.daily_done)
+
+    def test_福利页普通进度存在时过滤签到卡完成误报(self):
+        workflow = task.Workflow(self.配置(), 假执行器())
+        workflow.phase = "report"
+        observation = task.Observation(
+            b"",
+            "",
+            "",
+            (
+                task.Node(
+                    "问元宝问题已完成3/3",
+                    "",
+                    "",
+                    "android.widget.TextView",
+                    False,
+                    True,
+                    task.Bounds(40, 600, 800, 650),
+                ),
+                task.Node(
+                    "今日已完成",
+                    "",
+                    "",
+                    "android.widget.TextView",
+                    False,
+                    True,
+                    task.Bounds(700, 400, 860, 450),
+                ),
+            ),
+            "WebBrowserActivity",
+            "welfare",
+        )
+        result = workflow.dispatch(
+            "report_tasks",
+            {
+                "daily_done": True,
+                "question": 3,
+                "writing": 3,
+                "image": 3,
+                "photo_question": 3,
+                "same_template": 0,
+            },
+            observation,
+        )
+        self.assertTrue(result.ok)
+        self.assertFalse(workflow.daily_done)
+        self.assertEqual(workflow.target, "daily_question")
+        self.assertIn("忽略", result.message)
 
     def test_页面任务目录移除旧任务时不再盲点入口(self):
         workflow = task.Workflow(self.配置(), 假执行器())
@@ -1827,13 +1889,55 @@ class 元宝任务测试(unittest.TestCase):
         self.assertEqual(
             task.parse_local_welfare_progress(observation),
             {
-                "daily_done": True,
+                "daily_done": False,
                 "question": 3,
                 "writing": 1,
                 "image": 0,
                 "photo_question": 2,
                 "same_template": 1,
             },
+        )
+
+    def test_福利层级每日任务行完成时才报告每日任务完成(self):
+        observation = task.Observation(
+            b"",
+            "",
+            "",
+            (
+                task.Node(
+                    "每日问元宝得积分",
+                    "",
+                    "",
+                    "android.widget.TextView",
+                    False,
+                    True,
+                    task.Bounds(40, 400, 400, 450),
+                ),
+                task.Node(
+                    "今日已完成",
+                    "",
+                    "",
+                    "android.widget.TextView",
+                    False,
+                    True,
+                    task.Bounds(40, 460, 400, 500),
+                ),
+                task.Node(
+                    "问元宝问题已完成3/3",
+                    "",
+                    "",
+                    "android.widget.TextView",
+                    False,
+                    True,
+                    task.Bounds(40, 600, 800, 650),
+                ),
+            ),
+            "WebBrowserActivity",
+            "welfare",
+        )
+        self.assertEqual(
+            task.parse_local_welfare_progress(observation),
+            {"daily_done": True, "question": 3},
         )
 
     def test_福利层级仅暴露部分进度时只返回可见计数(self):
@@ -1866,7 +1970,7 @@ class 元宝任务测试(unittest.TestCase):
         )
         self.assertEqual(
             task.parse_local_welfare_progress(observation),
-            {"daily_done": True, "question": 3},
+            {"daily_done": False, "question": 3},
         )
 
     def test_离屏零边界计数不会串到其它任务(self):
@@ -1940,7 +2044,7 @@ class 元宝任务测试(unittest.TestCase):
         )
         self.assertEqual(
             task.parse_local_welfare_progress(observation),
-            {"daily_done": True, "question": 3, "writing": 3},
+            {"daily_done": False, "question": 3, "writing": 3},
         )
 
     def test_福利页可见进度超过已保存进度时同步并跳过已完成任务(self):
@@ -2938,6 +3042,37 @@ class 元宝任务测试(unittest.TestCase):
         self.assertEqual(workflow.phase, "open_target")
         executor._go_to_welfare.assert_called_once_with()
 
+    def test_返回阶段顶部入口未响应时按语义导航并推进状态(self):
+        executor = 假执行器()
+        executor._go_to_welfare = Mock(
+            return_value=task.Observation(b"", "", "", (), "WebBrowserActivity", "welfare")
+        )
+        workflow = task.Workflow(self.配置(), executor)
+        workflow.daily_done = True
+        workflow.phase = "return"
+        workflow.target = "question"
+        workflow.expected_count = 1
+        result = workflow.dispatch(
+            "tap",
+            {"x": 285, "y": 113},
+            task.Observation(b"", "", "", (), "HomeActivity", "chat"),
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(workflow.progress["question"], 1)
+        self.assertEqual(workflow.phase, "open_target")
+        executor._go_to_welfare.assert_called_once_with()
+
+    def test_返回阶段已观测福利页时直接推进状态(self):
+        workflow = task.Workflow(self.配置(), 假执行器())
+        workflow.daily_done = True
+        workflow.phase = "return"
+        workflow.target = "question"
+        workflow.expected_count = 1
+        observation = task.Observation(b"", "", "", (), "WebBrowserActivity", "welfare")
+        self.assertTrue(workflow.reconcile_return_to_welfare(observation))
+        self.assertEqual(workflow.progress["question"], 1)
+        self.assertEqual(workflow.phase, "open_target")
+
     def test_视觉重规划失败后使用当前返回福利语义控件(self):
         executor = 假执行器()
         executor._welfare_return_node = Mock(
@@ -2952,6 +3087,35 @@ class 元宝任务测试(unittest.TestCase):
             task.Observation(b"", "", "", (), "HomeActivity", "chat")
         )
         self.assertEqual(action, ("tap", {"x": 174, "y": 118}))
+
+    def test_返回福利语义控件与顶部控件重叠时选择安全区域(self):
+        executor = task.ToolExecutor.__new__(task.ToolExecutor)
+        executor.width, executor.height = 900, 1600
+        workflow = task.Workflow(self.配置(), executor)
+        workflow.phase = "return"
+        observation = task.Observation(
+            b"",
+            "",
+            "",
+            tuple(
+                task.parse_nodes(
+                    '<hierarchy>'
+                    '<node text="" clickable="true" enabled="true" bounds="[0,0][900,169]">'
+                    '<node text="" clickable="true" enabled="true" bounds="[27,78][300,148]">'
+                    '<node text="返回福利中心" clickable="false" enabled="true" bounds="[99,100][249,136]" />'
+                    '</node>'
+                    '</node>'
+                    '<node text="" clickable="true" enabled="true" bounds="[0,65][101,146]" />'
+                    '<node text="" clickable="true" enabled="true" bounds="[121,64][256,145]" />'
+                    '<node text="快速思考" clickable="false" enabled="true" bounds="[121,108][201,137]" />'
+                    '</hierarchy>'
+                )
+            ),
+            "HomeActivity",
+            "chat",
+        )
+        action = workflow.semantic_visual_recovery_action(observation)
+        self.assertEqual(action, ("tap", {"x": 285, "y": 113}))
 
     def test_启动视觉导航误入外部窗口时先返回(self):
         workflow = task.Workflow(self.配置(), 假执行器())

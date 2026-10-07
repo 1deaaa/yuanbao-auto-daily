@@ -340,6 +340,56 @@ class 元宝任务测试(unittest.TestCase):
         self.assertEqual(calls, [("tap", "459", "1018")])
         executor._go_to_ours.assert_not_called()
 
+    def test_返回福利链接无响应时经我们页重新打开(self):
+        executor = task.ToolExecutor.__new__(task.ToolExecutor)
+        executor.width = 900
+        executor.height = 1600
+        executor._welfare_context = False
+        executor._welfare_scroll_normalized = False
+        calls = []
+        executor.device = SimpleNamespace(input=lambda *args: calls.append(args))
+        return_nodes = task.parse_nodes(
+            '<hierarchy>'
+            '<node class="android.view.View" clickable="true" enabled="true" '
+            'bounds="[27,106][300,176]" />'
+            '<node text="返回福利中心" clickable="false" enabled="true" '
+            'bounds="[99,128][249,164]" />'
+            '</hierarchy>'
+        )
+        welfare_entry_nodes = task.parse_nodes(
+            '<hierarchy>'
+            '<node class="android.view.View" clickable="true" enabled="true" '
+            'bounds="[812,571][900,652]" />'
+            '<node text="福利中心" clickable="false" enabled="true" '
+            'bounds="[836,597][900,626]" />'
+            '</hierarchy>'
+        )
+        chat = task.Observation(
+            b"", "", "", tuple(return_nodes),
+            "com.tencent.hunyuan.app.chat/.home.v2.YBHomeActivityV2", "chat",
+        )
+        ours = task.Observation(
+            b"", "", "", tuple(welfare_entry_nodes),
+            "com.tencent.hunyuan.app.chat/.home.v2.YBHomeActivityV2", "ours",
+        )
+        welfare = task.Observation(
+            b"", "", "",
+            (),
+            "com.tencent.hunyuan.app.chat/com.tencent.yuanbao.mp.components.websdk.ext.ui.WebBrowserActivity",
+            "welfare",
+        )
+        executor.observe = Mock(side_effect=[chat, chat, ours, welfare])
+        executor._go_to_ours = Mock(return_value=ours)
+        with (
+            patch("元宝每日任务.WELFARE_RETURN_LINK_FALLBACK_DELAY", 0),
+            patch("元宝每日任务.time.sleep"),
+        ):
+            result = executor._go_to_welfare()
+        self.assertEqual(result.stage, "welfare")
+        executor._go_to_ours.assert_called_once()
+        self.assertIn(("tap", "163", "141"), calls)
+        self.assertIn(("tap", "856", "611"), calls)
+
     def test_非首页缺少入口节点时回退我们页(self):
         executor = task.ToolExecutor.__new__(task.ToolExecutor)
         executor.width = 900
@@ -1239,6 +1289,85 @@ class 元宝任务测试(unittest.TestCase):
                 ("tap", "767", "1540"),
             ],
         )
+
+    def test_底部导航图标未响应时点击当前可点击区域(self):
+        executor = task.ToolExecutor.__new__(task.ToolExecutor)
+        executor.width = 900
+        executor.height = 1600
+        calls = []
+        executor.device = SimpleNamespace(input=lambda *args: calls.append(args))
+        ours = task.Node(
+            "",
+            "我们",
+            "",
+            "android.widget.ImageView",
+            False,
+            True,
+            task.Bounds(744, 1517, 791, 1564),
+        )
+        bottom_target = task.Node(
+            "",
+            "",
+            "",
+            "android.view.View",
+            True,
+            True,
+            task.Bounds(0, 1560, 900, 1600),
+        )
+        chat = task.Observation(
+            b"", "", "", (ours, bottom_target),
+            "com.tencent.hunyuan.app.chat/.home.v2.YBHomeActivityV2",
+            "chat",
+        )
+        ours_page = task.Observation(
+            b"", "", "", (ours,),
+            "com.tencent.hunyuan.app.chat/.home.v2.YBHomeActivityV2",
+            "ours",
+        )
+        executor.observe = Mock(side_effect=[chat, chat, ours_page])
+        with patch("元宝每日任务.time.sleep"):
+            result = executor._navigate_to_ours_until(task.time.monotonic() + 10)
+        self.assertEqual(result.stage, "ours")
+        self.assertEqual(
+            calls,
+            [("tap", "767", "1540"), ("tap", "767", "1580")],
+        )
+
+    def test_桌面窗口模式按当前我们文字区域补点(self):
+        ours = task.Node(
+            "",
+            "我们",
+            "",
+            "android.widget.ImageView",
+            False,
+            True,
+            task.Bounds(851, 1425, 888, 1462),
+        )
+        label = task.Node(
+            "我们",
+            "",
+            "",
+            "android.widget.TextView",
+            False,
+            True,
+            task.Bounds(857, 1463, 883, 1482),
+        )
+        bottom_bar = task.Node(
+            "",
+            "",
+            "navigation_bar",
+            "android.view.View",
+            False,
+            True,
+            task.Bounds(0, 1458, 900, 1490),
+        )
+        point = task.ToolExecutor._bottom_navigation_tap_point(
+            task.Observation(b"", "", "", (ours, label, bottom_bar), "HomeActivity", "chat"),
+            ours,
+            900,
+            1600,
+        )
+        self.assertEqual(point, (869, 1472))
 
     def test_显式设备发现不读取Waydroid状态(self):
         runtime = task.WaydroidRuntime()
@@ -3073,6 +3202,36 @@ class 元宝任务测试(unittest.TestCase):
         self.assertEqual(workflow.progress["question"], 1)
         self.assertEqual(workflow.phase, "open_target")
 
+    def test_返回阶段默认使用本地语义导航(self):
+        workflow = task.Workflow(self.配置(), 假执行器())
+        workflow.phase = "return"
+        workflow.target = "question"
+        self.assertFalse(workflow.requires_visual_navigation())
+
+    def test_返回阶段存在底部我们入口时使用本地导航(self):
+        workflow = task.Workflow(self.配置(), 假执行器())
+        workflow.phase = "return"
+        observation = task.Observation(
+            b"",
+            "",
+            "",
+            tuple(
+                task.parse_nodes(
+                    '<hierarchy>'
+                    '<node content-desc="我们" class="android.widget.ImageView" '
+                    'enabled="true" bounds="[744,1517][791,1564]" />'
+                    '<node text="返回福利中心" enabled="true" bounds="[99,100][249,136]" />'
+                    '</hierarchy>'
+                )
+            ),
+            "HomeActivity",
+            "chat",
+        )
+        self.assertEqual(
+            workflow.semantic_visual_recovery_action(observation),
+            ("return_to_welfare", {}),
+        )
+
     def test_视觉重规划失败后使用当前返回福利语义控件(self):
         executor = 假执行器()
         executor._welfare_return_node = Mock(
@@ -3084,7 +3243,11 @@ class 元宝任务测试(unittest.TestCase):
         workflow = task.Workflow(self.配置(), executor)
         workflow.phase = "return"
         action = workflow.semantic_visual_recovery_action(
-            task.Observation(b"", "", "", (), "HomeActivity", "chat")
+            task.Observation(
+                b"", "", "", (),
+                "com.tencent.hunyuan.app.chat/.home.v2.YBHomeActivityV2",
+                "chat",
+            )
         )
         self.assertEqual(action, ("tap", {"x": 174, "y": 118}))
 
@@ -3124,6 +3287,26 @@ class 元宝任务测试(unittest.TestCase):
             task.Observation(b"", "", "", (), "org.lineageos.jelly/.MainActivity", "app")
         )
         self.assertEqual(action, ("press_back", {}))
+
+    def test_启动阶段发现返回福利入口时使用本地语义导航(self):
+        executor = task.ToolExecutor.__new__(task.ToolExecutor)
+        executor._welfare_return_node = Mock(
+            return_value=task.Node(
+                "返回福利中心", "", "", "android.widget.TextView", False, True,
+                task.Bounds(99, 100, 249, 136),
+            )
+        )
+        workflow = task.Workflow(self.配置(), executor)
+        workflow.phase = "navigate_welfare"
+        action = workflow.semantic_visual_recovery_action(
+            task.Observation(
+                b"", "", "", (),
+                "com.tencent.hunyuan.app.chat/.home.v2.YBHomeActivityV2",
+                "chat",
+            )
+        )
+        self.assertEqual(action, ("return_to_welfare", {}))
+        self.assertIsNone(workflow._valid_phase("return_to_welfare"))
 
     def test_卡住恢复动作只执行不推进业务状态(self):
         executor = 假执行器()
@@ -3212,6 +3395,22 @@ class 元宝任务测试(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(executor.calls, [])
 
+    def test_相册优先点击可点击图片卡片容器(self):
+        nodes = task.parse_nodes(
+            '<hierarchy>'
+            '<node class="android.view.View" clickable="true" enabled="true" '
+            'bounds="[431,93][581,137]" />'
+            '<node class="android.widget.RelativeLayout" clickable="true" enabled="true" '
+            'bounds="[0,158][251,410]">'
+            '<node class="android.widget.ImageView" clickable="false" enabled="true" '
+            'bounds="[8,166][243,402]" />'
+            '</node>'
+            '</hierarchy>'
+        )
+        selected = task.ToolExecutor._picker_image_node(nodes)
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.bounds, task.Bounds(0, 158, 251, 410))
+
     def test_未选图时禁止提交图片任务(self):
         executor = 假执行器()
         workflow = task.Workflow(self.配置(), executor)
@@ -3239,6 +3438,32 @@ class 元宝任务测试(unittest.TestCase):
         result = workflow.dispatch("wait_5s", {}, observation)
         self.assertTrue(result.ok)
         self.assertEqual(executor.calls, [("wait_5s", {})])
+
+    def test_拍题选图仍停留相机页时重新选图再确认(self):
+        executor = task.ToolExecutor.__new__(task.ToolExecutor)
+        executor.width = 900
+        executor.height = 1600
+        executor.pending_generation = False
+        executor.device = SimpleNamespace(input=lambda *args: None)
+        camera = task.Observation(
+            b"", "", "", (),
+            "com.tencent.hunyuan.app.chat/com.tencent.hunyuan.deps.camera.ui.activity.CameraCaptureActivity",
+            "photo_question",
+        )
+        result_page = task.Observation(
+            b"", "", "",
+            (task.Node("确认", "", "", "android.widget.TextView", True, True, task.Bounds(863, 1258, 900, 1318)),),
+            "com.tencent.hunyuan.app.chat/com.tencent.hunyuan.deps.camera.ui.activity.CameraResultActivity",
+            "photo_preview",
+        )
+        executor.observe = Mock(side_effect=[camera, camera, result_page, result_page])
+        executor._ensure_picker_image = Mock(
+            return_value=task.ToolResult(True, "已重新选择图片", {"stage": "photo_preview"})
+        )
+        with patch("元宝每日任务.time.sleep"):
+            result = executor.execute("confirm_image", {})
+        self.assertTrue(result.ok)
+        executor._ensure_picker_image.assert_called_once()
 
     def test_奖品记录顶部筛选标签不是使用成功证据(self):
         config = self.配置()

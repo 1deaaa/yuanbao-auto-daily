@@ -136,6 +136,9 @@ WELFARE_ENTRY_FALLBACK_Y_RATIO = 0.364
 WELFARE_LOAD_TIMEOUT = 30
 WELFARE_LOAD_POLL_INTERVAL = 1.5
 WELFARE_WEBVIEW_READY_DELAY = 3.0
+# 聊天页顶部“返回福利中心”可能被模型选择器等 Compose 控件覆盖；短暂
+# 等待路由响应后，优先复用当前页面的底部“我们”入口重新打开福利中心。
+WELFARE_RETURN_LINK_FALLBACK_DELAY = 2.0
 ENTRY_NAVIGATION_TIMEOUT = 12.0
 ENTRY_NAVIGATION_POLL_INTERVAL = 1.0
 MAX_HISTORY_SUMMARY_CHARS = 1200
@@ -2373,11 +2376,42 @@ class ToolExecutor:
         self.device.input("keyevent", "KEYCODE_BACK")
         return True
 
+    @staticmethod
+    def _bottom_navigation_tap_point(
+        observation: Observation, node: Node, width: int, height: int
+    ) -> tuple[int, int]:
+        """从当前层级计算底部导航的第二触点，避开不可点击的图标子节点。"""
+        bounds = node_interaction_bounds(node)
+        x, y = bounds.center
+        candidates = [
+            candidate
+            for candidate in observation.nodes
+            if candidate.enabled
+            and candidate.bounds.area > 0
+            # 桌面窗口模式下应用内容可能只占屏幕的一部分；“我们”文字或
+            # 底部导航容器通常位于图标下方，不能只按整屏高度筛选。
+            and candidate.bounds.top >= bounds.top + round(bounds.height * 0.55)
+            and candidate.bounds.bottom > bounds.bottom
+            and candidate.bounds.left <= x <= candidate.bounds.right
+            and candidate.bounds.right > x
+        ]
+        if candidates:
+            target = min(candidates, key=lambda candidate: candidate.bounds.area)
+            point = (x, target.bounds.center[1])
+            if point != (x, y) and 0 <= point[0] < width and 0 <= point[1] < height:
+                return point
+        # 无障碍树没有暴露底部容器时，仍优先点图标下方的窗口内区域；此前
+        # 使用 max(..., height-20) 会在桌面窗口模式把触点推到应用窗口之外。
+        fallback_y = min(height - 1, bounds.bottom + max(1, round(bounds.height * 0.4)))
+        return x, fallback_y
+
     def _navigate_to_ours_until(self, deadline: float) -> Observation:
         """在一个有界时间窗内完成返回和导航；两次恢复都复用这套逻辑。"""
         back_sent = False
         last_back_elapsed: float | None = None
         fallback_tapped = False
+        ours_tap_attempts = 0
+        last_ours_node: Node | None = None
         last_observation: Observation | None = None
         last_error: AgentError | None = None
         while time.monotonic() < deadline:
@@ -2402,15 +2436,35 @@ class ToolExecutor:
                 continue
             ours_node = find_node(observation.nodes, "我们", exact=True)
             if ours_node is not None:
+                last_ours_node = ours_node
+            navigation_node = ours_node or (
+                last_ours_node
+                if observation.stage == "chat"
+                and PACKAGE_NAME in observation.activity.lower()
+                else None
+            )
+            if navigation_node is not None:
                 # 软键盘会盖住底部导航，点击“我们”会落在键盘上被吞掉；
                 # 确认键盘显示时先按返回键收起，再在下一轮点击。
                 if self._hide_soft_keyboard():
+                    ours_tap_attempts = 0
                     time.sleep(1.0)
                     continue
-                # 不假设固定分辨率；部分设备的底部导航高度和横向边距不同。
-                self._tap_node(ours_node)
+                # Compose 版本的图标节点可能不标记 clickable，第一次中心点击
+                # 没有切换页面时，第二次点击当前层级暴露的底部可点击区域。
+                if ours_tap_attempts == 0:
+                    self._tap_node(navigation_node)
+                else:
+                    x, y = self._bottom_navigation_tap_point(
+                        observation, navigation_node, self.width, self.height
+                    )
+                    self._tap_point(x, y)
+                ours_tap_attempts += 1
                 time.sleep(1.5)
                 continue
+            if observation.stage != "chat":
+                ours_tap_attempts = 0
+                last_ours_node = None
             # 应用冷启动或 WebView 首次恢复时层级可能暂时为空；聊天首页不要因暂时空层级退出。
             elapsed = OURS_NAV_TIMEOUT - max(0.0, deadline - time.monotonic())
             activity_lower = observation.activity.lower()
@@ -2652,6 +2706,7 @@ class ToolExecutor:
             # 入口本身也可能在抽屉恢复期间暂时缺失；最多等待几秒后再使用已知布局坐标。
             entry_deadline = time.monotonic() + min(8, WELFARE_LOAD_TIMEOUT)
             fallback_tapped = False
+            return_link_fallback_attempted = False
             last_entry_tap_at: float | None = None
             while time.monotonic() < entry_deadline:
                 if observation.stage == "welfare":
@@ -2662,6 +2717,26 @@ class ToolExecutor:
                 if webview_observation is not None:
                     print("福利中心 WebView 已打开，无障碍树暂时为空，交由模型确认")
                     return webview_observation
+                # 聊天页顶部的“返回福利中心”有时只是上一条任务消息留下的
+                # Compose 手势区域，点击不会改变页面；当前截图仍能确认在元宝
+                # 首页时，改走底部“我们”页的福利入口，避免重复点击同一坏路由。
+                if (
+                    not return_link_fallback_attempted
+                    and last_entry_tap_at is not None
+                    and time.monotonic() - last_entry_tap_at
+                    >= WELFARE_RETURN_LINK_FALLBACK_DELAY
+                    and observation.stage == "chat"
+                    and PACKAGE_NAME in observation.activity.lower()
+                    and self._welfare_return_node(observation) is not None
+                ):
+                    return_link_fallback_attempted = True
+                    try:
+                        observation = self._go_to_ours()
+                        last_observation = observation
+                        last_entry_tap_at = None
+                        continue
+                    except AgentError as exc:
+                        print(f"返回福利中心链接无响应，底部“我们”导航失败：{str(exc)[:160]}")
                 welfare_node = self._welfare_entry_click_node(observation) or self._welfare_return_node(observation)
                 if welfare_node is not None and last_entry_tap_at is None:
                     return_node = self._welfare_return_node(observation)
@@ -2745,6 +2820,31 @@ class ToolExecutor:
             "welfare",
         )
 
+    @staticmethod
+    def _picker_image_node(nodes: Iterable[Node]) -> Node | None:
+        """从系统相册层级选出首个图片卡片容器，而不是图片子节点。"""
+        visible = [node for node in nodes if node.enabled and node.bounds.area > 1500]
+        # PictureSelector 的网格卡片是可点击的 RelativeLayout；顶部相册栏也
+        # 可能可点击，但高度明显小于图片卡片，按尺寸和位置排除它。
+        cards = [
+            node
+            for node in visible
+            if node.clickable
+            and node.bounds.top > 120
+            and node.bounds.width >= 100
+            and node.bounds.height >= 100
+        ]
+        if cards:
+            return min(cards, key=lambda node: (node.bounds.top, node.bounds.left))
+        image_nodes = [
+            node
+            for node in visible
+            if node.bounds.top > 80 and node.class_name.lower().endswith("imageview")
+        ]
+        if image_nodes:
+            return min(image_nodes, key=lambda node: (node.bounds.top, node.bounds.left))
+        return None
+
     def _ensure_picker_image(self) -> ToolResult:
         if not self.image_pushed:
             self.device.push_image(self.config.test_image_path)
@@ -2826,24 +2926,11 @@ class ToolExecutor:
                 self._tap_node(matching[0])
                 time.sleep(2)
                 return self._result(True, "已选择本地脱敏测试图片", stage=self.observe().stage)
-        image_nodes = [
-            node
-            for node in observation.nodes
-            if node.enabled
-            and node.bounds.area > 1500
-            and node.bounds.top > 80
-            and node.class_name.lower().endswith("imageview")
-        ]
-        if not image_nodes:
-            image_nodes = [
-                node
-                for node in observation.nodes
-                if node.enabled and node.clickable and node.bounds.area > 1500 and node.bounds.top > 80
-            ]
-        if not image_nodes:
+        image_node = self._picker_image_node(observation.nodes)
+        if image_node is None:
             self._tap_point(110, 220)
         else:
-            self._tap_node(sorted(image_nodes, key=lambda node: (node.bounds.top, node.bounds.left))[0])
+            self._tap_node(image_node)
         time.sleep(2)
         return self._result(True, "已选择本地脱敏测试图片", stage=self.observe().stage)
 
@@ -3419,9 +3506,26 @@ class ToolExecutor:
             if name == "select_local_image":
                 return self._ensure_picker_image()
             if name == "confirm_image":
-                if not self._tap_text_button("确认", "使用", "完成"):
-                    return self._result(False, "没有找到图片确认按钮")
-                return self._result(True, "已确认图片", stage=self.observe().stage)
+                reselected_from_camera = False
+                for attempt in range(3):
+                    if self._tap_text_button("确认", "使用", "完成"):
+                        return self._result(True, "已确认图片", stage=self.observe().stage)
+                    observation = self.observe()
+                    if (
+                        not reselected_from_camera
+                        and observation.stage == "photo_question"
+                        and "cameracaptureactivity" in observation.activity.lower()
+                    ):
+                        # 部分新版拍题页第一次从相册选图只更新左下角缩略图，
+                        # 仍停留在相机页；再次从当前页的相册入口选图后才会
+                        # 进入 CameraResultActivity 并暴露“确认”按钮。
+                        reselected_from_camera = True
+                        reselection = self._ensure_picker_image()
+                        if not reselection.ok:
+                            return reselection
+                    elif attempt < 2:
+                        time.sleep(1)
+                return self._result(False, "没有找到图片确认按钮")
             if name == "claim_reward":
                 for attempt in range(3):
                     observation = self.observe()
@@ -4151,7 +4255,7 @@ class Workflow:
 
     def requires_visual_navigation(self) -> bool:
         """所有易变页面入口都由 VLMM 按当前截图导航，避免复用旧坐标。"""
-        return self.phase in {"navigate_welfare", "open_target", "return", "open_exchange"} or (
+        return self.phase in {"navigate_welfare", "open_target", "open_exchange"} or (
             self.phase == "perform"
             and self.target == "same_template"
             and self.substate.get("entry_clicked")
@@ -4168,6 +4272,13 @@ class Workflow:
         VLMM 根据截图判断。
         """
         if self.phase == "return":
+            if observation.stage != "welfare":
+                # 返回福利中心不需要视觉模型选择易被顶部控件遮挡的坐标；
+                # 执行器会按当前 Activity 和无障碍语义，经“我们”页重新打开福利中心。
+                ours = find_node(observation.nodes, "我们", exact=True)
+                if ours is not None:
+                    print("返回阶段使用当前页面语义导航回福利中心")
+                    return "return_to_welfare", {}
             finder = getattr(self.executor, "_welfare_return_node", None)
             node = finder(observation) if callable(finder) else None
             if node is not None:
@@ -4191,13 +4302,24 @@ class Workflow:
                 # 通用恢复动作；回到元宝后再继续视觉识别福利入口。
                 print("当前前台不是元宝页面，使用返回键关闭外部窗口")
                 return "press_back", {}
+            return_finder = getattr(self.executor, "_welfare_return_node", None)
+            return_node = return_finder(observation) if callable(return_finder) else None
+            if return_node is not None:
+                # 启动页可能残留上一次任务的“返回福利中心”入口；这是当前层级
+                # 明确的语义信号，直接复用执行器的本地导航，避免视觉模型反复
+                # 点击顶部控件或旧坐标。
+                print("启动导航发现“返回福利中心”，使用当前页面语义导航")
+                return "return_to_welfare", {}
             finder = getattr(self.executor, "_welfare_entry_click_node", None)
             node = finder(observation) if callable(finder) else None
             if node is not None:
                 bounds = node_interaction_bounds(node)
                 if bounds.area > 0:
                     print("使用当前观测中的“福利中心”语义控件进入福利页")
-                    return "tap", {"x": bounds.center[0], "y": bounds.center[1]}
+                    # 入口节点可能同时被标题、按钮和顶部悬浮层暴露；直接
+                    # 交给 open_welfare 让执行器按当前层级点击，绕过视觉点击的
+                    # 前景遮挡判定，仍然不复用历史坐标。
+                    return "open_welfare", {}
         if self.phase == "open_exchange" and observation.stage == "welfare":
             node = find_semantic_node(observation.nodes, "兑换商城", exact=True)
             if node is None:
@@ -5030,6 +5152,7 @@ class Workflow:
             "navigate_welfare": {
                 "open_welfare",
                 "report_tasks",
+                "return_to_welfare",
                 "tap",
                 "swipe",
                 "press_back",
@@ -5669,11 +5792,22 @@ def run_once(config: Config) -> None:
                                 "请只依据这次最新截图重新规划，禁止重复相同动作或相同位置；"
                                 "若有前景浮层先关闭，目标不可见时先滑动，只有确认进入福利中心后才算成功。"
                             )
-                        name, args, call_id = model.next_tool(
-                            navigation_observation,
-                            navigation_context,
-                            allowed_tools=VISUAL_NAVIGATION_TOOLS,
+                        semantic_action = workflow.semantic_visual_recovery_action(
+                            navigation_observation
                         )
+                        if semantic_action is not None:
+                            # 当前无障碍树已经给出明确入口时，启动阶段也走本地
+                            # 语义导航；只有没有可靠语义证据时才请求视觉模型。
+                            name, args = semantic_action
+                            call_id = None
+                            action_source = "本地语义"
+                        else:
+                            name, args, call_id = model.next_tool(
+                                navigation_observation,
+                                navigation_context,
+                                allowed_tools=VISUAL_NAVIGATION_TOOLS,
+                            )
+                            action_source = "视觉模型"
                         result = workflow.dispatch(name, args, navigation_observation)
                         if call_id is None:
                             model.record_local_tool_result(
@@ -5682,7 +5816,7 @@ def run_once(config: Config) -> None:
                         else:
                             model.record_tool_result(call_id, result)
                         print(
-                            f"步骤 0.{navigation_step}：工具={name} 来源=视觉模型 "
+                            f"步骤 0.{navigation_step}：工具={name} 来源={action_source} "
                             f"结果={'成功' if result.ok else '失败'}；{result.message[:180]}"
                         )
                         if workflow.phase != "navigate_welfare":

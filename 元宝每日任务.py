@@ -20,7 +20,8 @@ import sys
 import time
 import traceback
 import zlib
-from dataclasses import dataclass, field
+import shutil
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -41,6 +42,7 @@ DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_RUN_TIME = "00:05"
 DEFAULT_TEST_PROMPT = "###!!!### Connectivity test only. No writing needed. Reply only ok."
 DEFAULT_TEST_IMAGE = str(ROOT / "测试题目.png")
+DEFAULT_TEST_AUDIO = str(ROOT / "语音测试.wav")
 PACKAGE_NAME = "com.tencent.hunyuan.app.chat"
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_RETRY_COOLDOWN = 10
@@ -51,6 +53,9 @@ DEFAULT_CARD_NAME = "QQ超级会员3天卡"
 DEFAULT_STATE_PATH = ROOT / ".yuanbao_daily_state.json"
 DEFAULT_STOP_WAYDROID_AFTER_RUN = True
 DEFAULT_AUTO_ACCEPT_PROTOCOL = True
+TASK_STATE_SCHEMA = 2
+DAILY_TASK_MODE_LEGACY = "legacy_question"
+DAILY_TASK_MODE_ABILITY_STATION = "ability_station"
 # 这些工具的动作和成功条件完全由本地执行器掌握，不需要为每一步再请求视觉模型。
 LOCAL_DETERMINISTIC_TOOLS = frozenset(
     {
@@ -67,7 +72,7 @@ LOCAL_DETERMINISTIC_TOOLS = frozenset(
         "open_prize_records",
         "use_bound_reward",
         "confirm_reward_use",
-        "return_to_ours",
+        "return_to_home",
         "complete_task",
     }
 )
@@ -78,6 +83,48 @@ RETRYABLE_SAME_STATE_TOOLS = LOCAL_DETERMINISTIC_TOOLS | {"wait_5s"}
 # 视觉导航阶段由模型选择点击、滑动或返回；启动、报告和业务动作由编排器掌握。
 VISUAL_NAVIGATION_TOOLS = frozenset({"tap", "swipe", "press_back"})
 VISUAL_EXCHANGE_TOOLS = VISUAL_NAVIGATION_TOOLS | frozenset({"report_exchange"})
+DAILY_ABILITY_TOOLS = frozenset(
+    {"open_daily_ability", "continue_daily_ability"}
+)
+DAILY_ABILITY_EXPERIENCE_TOOLS = frozenset(
+    {
+        "tap",
+        "long_press",
+        "swipe",
+        "press_back",
+        "return_to_welfare",
+        "input_test_prompt",
+        "send_message",
+        "wait_5s",
+        "select_local_image",
+        "confirm_image",
+    }
+)
+DAILY_ABILITY_EXPERIENCE_ACTION_MARKERS = (
+    "去对话",
+    "去精讲",
+    "去批改",
+    "去识图",
+    "开始体验",
+    "立即体验",
+    "马上体验",
+    "开始使用",
+    "继续体验",
+)
+# 能力体验有时仍停留在福利 WebView 内，页面阶段会继续被识别为 welfare。
+# 该浮层的关闭控件是比页面阶段更可靠的“仍在体验”证据。
+DAILY_ABILITY_EXPERIENCE_OVERLAY_MARKERS = ("vip_learning_close_button",)
+DAILY_ABILITY_EXPERIENCE_NAVIGATION_MARKERS = (
+    "去对话",
+    "去识图",
+    "开始体验",
+    "立即体验",
+    "马上体验",
+    "开始使用",
+    "继续体验",
+)
+DAILY_ABILITY_EXPERIENCE_NAVIGATION_TIMEOUT = 8.0
+DAILY_ABILITY_EXPERIENCE_NAVIGATION_POLL_INTERVAL = 0.8
 VISUAL_NAVIGATION_MAX_STEPS = 12
 # 视觉动作失败通常只是目标离屏、浮层拦截或 WebView 尚未完成路由；这类失败
 # 应回传给 VLMM 重新规划，而不是和 ADB/业务错误共用很小的重试额度。
@@ -106,7 +153,8 @@ UI_DUMP_READ_DELAY = 0.25
 UI_DUMP_OPTIONS = ("--compressed",)
 WEBVIEW_ACTIVITY_MARKER = "webbrowseractivity"
 WEBVIEW_UI_DUMP_ATTEMPTS = 1
-WEBVIEW_UI_DUMP_TIMEOUT = 3
+WEBVIEW_UI_DUMP_TIMEOUT = 6
+WEBVIEW_UI_DUMP_RETRY_DELAY = 1.5
 ANDROID_WARNING_CHECK_INTERVAL = 3.0
 ANDROID_WARNING_WINDOW_TITLE = "Android 系统"
 ANDROID_WARNING_WINDOW_TYPE = "ty=SYSTEM_ERROR"
@@ -133,14 +181,30 @@ OURS_FALLBACK_Y_RATIO = 0.963
 # 900x1600 实测“我们”页福利入口的归一化位置；仅用于入口节点缺失时的后备点击。
 WELFARE_ENTRY_FALLBACK_X_RATIO = 0.851
 WELFARE_ENTRY_FALLBACK_Y_RATIO = 0.364
+# 福利页主卡轮播内容和颜色会变化，只按固定主卡槽位的“去体验”按钮定位。
+DAILY_ABILITY_RULE_VERSION = 4
+DAILY_ABILITY_RULE_NAME = "main_carousel_experience_completed"
+DAILY_ABILITY_BUTTON_X_RATIO = 0.62
+DAILY_ABILITY_BUTTON_Y_RATIO = 0.516
+DAILY_ABILITY_CARD_MIN_Y_RATIO = 0.40
+DAILY_ABILITY_CARD_MAX_Y_RATIO = 0.62
+DAILY_ABILITY_BUTTON_CHECK_LIMIT = 12
+DAILY_ABILITY_VERIFY_CHECK_LIMIT = 8
+DAILY_ABILITY_CLICK_LIMIT = 1
+WELFARE_TASK_LIST_SCROLL_START_RATIO = 0.83
+WELFARE_TASK_LIST_SCROLL_END_RATIO = 0.31
+WELFARE_TASK_CATALOG_SCROLL_MAX_ATTEMPTS = 3
+WELFARE_REWARD_BUTTON_Y_RATIO = 0.61
 WELFARE_LOAD_TIMEOUT = 30
 WELFARE_LOAD_POLL_INTERVAL = 1.5
 WELFARE_WEBVIEW_READY_DELAY = 3.0
-# 聊天页顶部“返回福利中心”可能被模型选择器等 Compose 控件覆盖；短暂
-# 等待路由响应后，优先复用当前页面的底部“我们”入口重新打开福利中心。
+# 新版聊天页应通过抽屉中的“福利中心”导航；旧版返回链接仍保留为无抽屉时的后备。
 WELFARE_RETURN_LINK_FALLBACK_DELAY = 2.0
 ENTRY_NAVIGATION_TIMEOUT = 12.0
 ENTRY_NAVIGATION_POLL_INTERVAL = 1.0
+TOOL_ARGUMENT_REPAIR_ATTEMPTS = 1
+WRITING_SUBMIT_VERIFY_ATTEMPTS = 8
+WRITING_SUBMIT_VERIFY_INTERVAL = 0.5
 MAX_HISTORY_SUMMARY_CHARS = 1200
 MAX_HISTORY_RESULT_CHARS = 1200
 IGNORED_TASKS = ("邀请新用户",)
@@ -165,6 +229,12 @@ TASK_LABELS = {
     "same_template": "使用推荐模板做同款",
 }
 TASK_ORDER = tuple(TASK_LABELS)
+# 新版福利每日任务固定包含写作、拍题、P图；有明确累计进度的做同款任务也纳入。
+NEW_WELFARE_DAILY_TASKS = ("writing", "photo_question", "image")
+# 用户可通过 FORCE_ALL_DAILY_TASKS=true 要求本轮始终执行全部五类业务：
+# 趣问元宝、写作、P图、拍题和做同款。页面是否存在入口仍交给 VLM 判断，
+# 但不能因为当前目录缺少文案、一次点击失败或页面暂时空树而写入跳过集合。
+FORCED_DAILY_TASKS = TASK_ORDER
 
 
 def read_daily_state(path: Path) -> dict[str, Any]:
@@ -274,17 +344,17 @@ def png_pixel(image: bytes, x: int, y: int) -> tuple[int, int, int, int] | None:
     except (IndexError, struct.error, ValueError, zlib.error):
         return None
 
+
 # 任务的固定子步骤集中维护。入口坐标和任务进度仍交给视觉模型，
 # 进入具体能力页后的动作由本地执行器按这里的配方稳定完成。
 TASK_STEPS: dict[str, tuple[str, ...]] = {
-    "daily_question": ("input", "sent", "waited"),
     "question": ("input", "sent", "waited"),
     "writing": ("input", "sent", "waited"),
     "image": ("image", "sent", "waited"),
     "photo_question": ("image", "confirmed", "waited"),
     "same_template": ("entry_clicked", "template_clicked", "sent", "waited"),
 }
-TEXT_TASKS = frozenset({"daily_question", "question", "writing"})
+TEXT_TASKS = frozenset({"question", "writing"})
 IMAGE_TASKS = frozenset({"image", "photo_question"})
 
 # 入口缓存只在当前运行期间有效，不写入磁盘。布局变化或语义校验失败时，
@@ -294,19 +364,17 @@ IMAGE_TASKS = frozenset({"image", "photo_question"})
 TASK_ENTRY_MARKERS: dict[str, tuple[str, ...]] = {
     # 先列右侧行动按钮，再列任务标题。新版 WebView 只把这些文本节点
     # 暴露出来且 clickable=false；点击行动按钮的中心比点击标题稳定。
-    "daily_question": ("去提问", "每日问元宝", "每日问元宝得积分", "问元宝任意问题"),
     "question": ("去提问", "问元宝任意问题", "提问"),
     "writing": ("去写作", "使用写作能力", "写作"),
     "image": ("去p图", "使用p图能力", "p图", "智能p图"),
     "photo_question": ("去拍题", "使用拍题能力", "拍题", "拍照答题"),
-    "same_template": ("做同款",),
+    "same_template": ("做同款模板", "试试大家都在玩的模版", "做同款"),
 }
 
 # 福利 WebView 有时只暴露任务标题，不暴露右侧行动按钮；有时又把整行
 # 暴露成一个覆盖整行的 TextView。两种情况下都应以任务行的纵坐标为锚点，
 # 点击右侧行动列，而不是点击标题节点中心。
 TASK_ENTRY_ACTION_MARKERS: dict[str, tuple[str, ...]] = {
-    "daily_question": ("去提问",),
     "question": ("去提问",),
     "writing": ("去写作",),
     "image": ("去p图",),
@@ -314,14 +382,19 @@ TASK_ENTRY_ACTION_MARKERS: dict[str, tuple[str, ...]] = {
     "same_template": ("做同款",),
 }
 TASK_ENTRY_ROW_MARKERS: dict[str, tuple[str, ...]] = {
-    "daily_question": ("每日问元宝得积分", "每日问元宝"),
     "question": ("问元宝任意问题", "问元宝问题"),
     "writing": ("使用写作能力",),
     "image": ("使用p图能力",),
     "photo_question": ("使用拍题能力",),
-    "same_template": ("使用推荐模板做同款",),
+    "same_template": (
+        "使用推荐模板做同款",
+        "做同款模板得积分",
+        "试试大家都在玩的模版",
+        "试试大家都在玩的模板",
+    ),
 }
-TASK_ENTRY_ACTION_X_RATIO = 0.895
+LEGACY_DAILY_QUESTION_MARKERS = ("每日问元宝得积分", "每日问元宝")
+TASK_ENTRY_ACTION_X_RATIO = 0.965
 TASK_ENTRY_SCROLL_MAX_ATTEMPTS = 3
 
 # 福利页改版后每日任务区顶部插入了签到卡与邀请/创作横幅，旧固定行坐标
@@ -443,9 +516,11 @@ class Config:
     model_request_timeout_seconds: int
     test_prompt: str
     test_image_path: Path
+    test_audio_path: Path
     card_name: str
     prompt_path: Path
     state_path: Path
+    force_all_daily_tasks: bool
 
     @classmethod
     def from_env(cls, env_path: Path = ROOT / ".env") -> "Config":
@@ -468,6 +543,7 @@ class Config:
         except ZoneInfoNotFoundError as exc:
             raise AgentError(f"找不到时区：{timezone_name}") from exc
         test_image = _project_path(_first_env("TEST_IMAGE_PATH", default=DEFAULT_TEST_IMAGE))
+        test_audio = _project_path(_first_env("TEST_AUDIO_PATH", default=DEFAULT_TEST_AUDIO))
         prompt_path = _project_path(_first_env("PROMPT_PATH", default="每日任务提示词.md"))
         state_path = _project_path(_first_env("STATE_PATH", default=".yuanbao_daily_state.json"))
         config = cls(
@@ -498,10 +574,12 @@ class Config:
             ),
             test_prompt=_first_env("TEST_PROMPT", default=DEFAULT_TEST_PROMPT),
             test_image_path=test_image,
+            test_audio_path=test_audio,
             # 兑换目标固定为三天卡，避免配置或模型误选其它商品。
             card_name=DEFAULT_CARD_NAME,
             prompt_path=prompt_path,
             state_path=state_path,
+            force_all_daily_tasks=_env_bool("FORCE_ALL_DAILY_TASKS", False),
         )
         if not config.test_prompt or len(config.test_prompt) > 200:
             raise AgentError("TEST_PROMPT 为空或过长")
@@ -855,7 +933,9 @@ def normalize_tool_arguments(name: str, args: dict[str, Any]) -> dict[str, Any]:
 
     integer_fields = {
         "tap": ("x", "y"),
+        "long_press": ("x", "y", "duration_ms"),
         "swipe": ("x1", "y1", "x2", "y2", "duration_ms"),
+        "open_daily_ability": ("x", "y"),
         "report_tasks": (
             "question",
             "writing",
@@ -1563,65 +1643,230 @@ class Observation:
     nodes: tuple[Node, ...]
     activity: str
     stage: str
+    supplemental_task_progress: tuple[tuple[str, int], ...] = ()
+
+
+def is_daily_ability_experience_visible(observation: Observation) -> bool:
+    """识别能力体验页或仍覆盖在福利页上的体验浮层。"""
+    if observation.stage != "welfare":
+        return True
+    for node in observation.nodes:
+        searchable = node.searchable
+        interaction_bounds = node.interaction_bounds
+        if (
+            interaction_bounds.area > 0
+            and any(marker in searchable for marker in DAILY_ABILITY_EXPERIENCE_OVERLAY_MARKERS)
+        ):
+            return True
+        if (
+            "去对话" in searchable
+            and interaction_bounds.area > 0
+            and interaction_bounds.top >= 300
+        ):
+            return True
+    return False
+
+
+def daily_ability_card_status(observation: Observation) -> str | None:
+    """从主轮播卡固定按钮区域读取已完成/去体验状态。"""
+    visible = [node for node in observation.nodes if node.enabled and node.bounds.area > 0]
+    width = max(900, max((node.bounds.right for node in visible), default=0))
+    height = max(1600, max((node.bounds.bottom for node in visible), default=0))
+    candidates = [
+        node
+        for node in visible
+        if node.text.strip() in {"已完成", "去体验"}
+        and width * 0.48 <= node.bounds.center[0] <= width * 0.78
+        and height * 0.45 <= node.bounds.center[1] <= height * 0.65
+    ]
+    if not candidates:
+        return None
+    return min(
+        (node.text.strip() for node in candidates),
+        key=lambda value: 0 if value == "已完成" else 1,
+    )
+
+
+def has_visible_exchange_product(
+    observation: Observation, card_name: str = DEFAULT_CARD_NAME
+) -> bool:
+    """只用当前可见节点确认兑换页是否展示了目标商品。"""
+    markers = tuple(
+        dict.fromkeys(
+            marker.lower()
+            for marker in (card_name, DEFAULT_CARD_NAME, "超级会员3天卡")
+            if marker
+        )
+    )
+    return any(
+        node.bounds.area > 0
+        and any(marker in node.searchable for marker in markers)
+        for node in observation.nodes
+    )
+
+
+def is_new_welfare_webview(nodes: Iterable[Node], activity: str) -> bool:
+    """识别 2.88.0 福利 WebView 的页面外壳，而不是把积分栏当商城。"""
+    activity_lower = activity.lower()
+    if WEBVIEW_ACTIVITY_MARKER not in activity_lower:
+        return False
+    visible = [node for node in nodes if node.bounds.area > 0]
+    root_ids = {node.resource_id for node in visible}
+    if not {"hunyuan-bot", "__next"}.intersection(root_ids):
+        return False
+    text = " ".join(node.searchable for node in visible)
+    return any(
+        marker in text
+        for marker in (
+            "去体验",
+            "已连续打卡",
+            "第1天",
+            "每日任务",
+            "当日凌晨0点更新任务",
+            "使用写作能力",
+            "使用拍题能力",
+            "使用p图能力",
+            "做同款模板",
+        )
+    )
 
 
 def parse_local_welfare_progress(observation: Observation) -> dict[str, Any] | None:
-    """从福利层级读取可见进度；没有任何可核验计数时返回 None。"""
+    """从新版福利层级读取任务目录与计数，兼容裁切到零面积的 WebView 节点。"""
     if observation.stage != "welfare" or not observation.nodes:
         return None
-    markers = {
-        "question": ("问元宝问题", "问元宝任意问题"),
-        "writing": ("使用写作能力", "去写作"),
-        "image": ("使用p图能力", "去p图"),
-        "photo_question": ("使用拍题能力", "去拍题"),
-        "same_template": ("使用推荐模板做同款", "做同款"),
-    }
     nodes = tuple(observation.nodes)
-    visible_nodes = tuple(node for node in nodes if node.bounds.area > 0)
+    searchable_nodes = tuple(
+        node for node in nodes if node.text.strip() or node.content_desc.strip()
+    )
     progress: dict[str, int] = {}
-    for key, wanted_markers in markers.items():
+    available: list[str] = []
+    count_pattern = re.compile(r"(?:已完成|完成)?\s*([0-3])\s*/\s*3")
+    for key, markers in TASK_ENTRY_ROW_MARKERS.items():
         label_nodes = [
             node
-            for node in visible_nodes
-            if any(marker.lower() in node.searchable for marker in wanted_markers)
+            for node in searchable_nodes
+            if any(marker.lower() in node.searchable for marker in markers)
         ]
         if not label_nodes:
             continue
+        # WebView 常将任务标题和“已完成 x/3”分别暴露为兄弟节点；先查整行
+        # 文本本身，避免零边界标题借用整页父容器后串到前一项的计数。
         for label in label_nodes:
-            nearby = [
-                node
-                for node in visible_nodes
-                if abs(node.bounds.center[0] - label.bounds.center[0]) <= 420
-                and label.bounds.top - 20 <= node.bounds.top <= label.bounds.bottom + 150
-            ]
-            text = " ".join(node.searchable for node in (label, *nearby))
-            match = re.search(r"(?:已完成|完成)?\s*([0-3])\s*/\s*3", text)
+            match = count_pattern.search(label.searchable)
             if match is not None:
                 progress[key] = int(match.group(1))
                 break
-    if not progress:
+        if key in progress:
+            available.append(key)
+            continue
+        for label in label_nodes:
+            label_bounds = label.bounds
+            nearby_counts = []
+            if label_bounds.area <= 0:
+                continue
+            for candidate in searchable_nodes:
+                candidate_match = count_pattern.search(candidate.searchable)
+                if candidate_match is None:
+                    continue
+                candidate_bounds = candidate.bounds
+                if candidate_bounds.area <= 0 or label_bounds.area <= 0:
+                    continue
+                if (
+                    abs(candidate_bounds.center[0] - label_bounds.center[0]) <= 420
+                    and label_bounds.top - 20
+                    <= candidate_bounds.top
+                    <= label_bounds.bottom + 150
+                ):
+                    nearby_counts.append(
+                        (
+                            abs(candidate_bounds.center[1] - label_bounds.center[1]),
+                            candidate_match,
+                        )
+                    )
+            if nearby_counts:
+                _, match = min(nearby_counts, key=lambda item: item[0])
+                progress[key] = int(match.group(1))
+                break
+        # “做同款”入口只有在当前福利页明确显示累计进度时才是每日任务；
+        # 单独出现的推荐模板按钮不加入任务目录。
+        if key != "same_template" or key in progress:
+            available.append(key)
+    if not progress and not available:
         return None
-    # “今日已完成”也会出现在签到卡，不代表“每日问元宝”已经完成。
-    # 普通“问元宝问题”与每日问元宝是两个独立任务，不能用前者的计数推导后者。
-    daily_done = False
-    daily_markers = ("每日问元宝得积分", "每日问元宝")
-    daily_labels = [
-        node
-        for node in visible_nodes
-        if any(marker.lower() in node.searchable for marker in daily_markers)
-    ]
-    for label in daily_labels:
-        nearby = [
-            node
-            for node in visible_nodes
-            if abs(node.bounds.center[0] - label.bounds.center[0]) <= 420
-            and label.bounds.top - 20 <= node.bounds.top <= label.bounds.bottom + 150
-        ]
-        row_text = " ".join(node.searchable for node in (label, *nearby))
-        if re.search(r"(?:今日)?已完成", row_text):
-            daily_done = True
-            break
-    return {"daily_done": daily_done, **progress}
+    return {"available_tasks": available, **progress}
+
+
+def merge_supplemental_task_progress(
+    observation: Observation, report: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """合并滚动福利页前已从当前画面读取的做同款进度。"""
+    supplemental = dict(observation.supplemental_task_progress)
+    count = supplemental.get("same_template")
+    if not isinstance(count, int) or not 0 <= count <= 3:
+        return report
+    merged = dict(report or {"available_tasks": []})
+    available = merged.get("available_tasks")
+    if not isinstance(available, list):
+        available = []
+    merged["available_tasks"] = list(
+        dict.fromkeys((*available, "same_template"))
+    )
+    merged["same_template"] = count
+    return merged
+
+
+def is_new_welfare_page(observation: Observation) -> bool:
+    """识别新版福利 WebView，避免把旧版问题列表套用新版目录约束。"""
+    if (
+        observation.stage != "welfare"
+        or WEBVIEW_ACTIVITY_MARKER not in observation.activity.lower()
+    ):
+        return False
+    if not observation.nodes or is_new_welfare_webview(
+        observation.nodes, observation.activity
+    ):
+        return True
+    text = " ".join(node.searchable for node in observation.nodes)
+    return "当日凌晨0点更新任务" in text or any(
+        marker in text
+        for marker in ("使用拍题能力", "使用p图能力", "邀2名新用户得奖励")
+    )
+
+
+def has_complete_new_welfare_task_catalog(
+    observation: Observation,
+    local_report: dict[str, Any] | None = None,
+) -> bool:
+    """只有标题、三项任务及各自计数都在当前福利层级中时才认定目录完整。"""
+    if not is_new_welfare_page(observation):
+        return False
+    if local_report is None:
+        local_report = parse_local_welfare_progress(observation)
+    if local_report is None:
+        return False
+    available = local_report.get("available_tasks")
+    if not isinstance(available, list):
+        return False
+    if not all(
+        key in available and isinstance(local_report.get(key), int)
+        for key in NEW_WELFARE_DAILY_TASKS
+    ):
+        return False
+    return any("当日凌晨0点更新任务" in node.searchable for node in observation.nodes)
+
+
+def has_authoritative_local_task_catalog(
+    observation: Observation, local_report: dict[str, Any]
+) -> bool:
+    """确认本地任务行属于新版福利页的完整每日任务区。"""
+    available = local_report.get("available_tasks")
+    if not isinstance(available, list) or len(set(available)) < 2:
+        return False
+    return any(
+        "当日凌晨0点更新任务" in node.searchable
+        for node in observation.nodes
+    )
 
 
 def detect_stage(nodes: Iterable[Node], activity: str) -> str:
@@ -1642,7 +1887,7 @@ def detect_stage(nodes: Iterable[Node], activity: str) -> str:
     )
     has_welfare_catalog = task_row_count >= 2 or (
         task_row_count >= 1 and "当日凌晨0点更新任务" in text
-    )
+    ) or any(marker.lower() in text for marker in LEGACY_DAILY_QUESTION_MARKERS)
     # 更新遮罩里的功能说明也会出现“拍题”等词，必须先标为应用阻塞层。
     if any(
         node.resource_id.endswith(":id/upgrade_dialog")
@@ -1678,13 +1923,17 @@ def detect_stage(nodes: Iterable[Node], activity: str) -> str:
         for node in visible_nodes
         if node.text.strip()
     }
+    if is_new_welfare_webview(visible_nodes, activity):
+        # 新版页面的积分栏也带“兑换商城”，但能力站/任务目录才是福利页的
+        # 正向证据。真实商城没有这些能力站或每日任务语义时再进入 exchange。
+        return "welfare"
     if (
         "webbrowseractivity" in activity_lower
         and {"规则", "记录"}.issubset(exact_visible)
         and "兑换商城" not in text
         and not any(
             marker.lower() in text
-            for marker in TASK_ENTRY_ROW_MARKERS["daily_question"]
+            for marker in LEGACY_DAILY_QUESTION_MARKERS
         )
         and not has_welfare_catalog
         and "话题提问" in text
@@ -1722,12 +1971,21 @@ def detect_stage(nodes: Iterable[Node], activity: str) -> str:
         return "ours"
     if any(value in text for value in ("选择写作类型", "ai写作", "请输入你要写的主题")):
         return "writing"
-    if any(value in text for value in ("智能p图", "上传图片", "p图能力")):
+    if any(value in text for value in ("上传图片", "选择图片进行编辑", "图片编辑")):
         return "image"
-    if any(value in text for value in ("拍题", "拍照答题", "相册答题")):
+    if any(value in text for value in ("拍照答题", "相册答题", "请上传题目", "框选题目")):
         return "photo_question"
-    if any(node.resource_id.endswith("edConversationInput") for node in node_list):
+    if (
+        "home.v2." in activity_lower
+        and any(node.resource_id.endswith("conversation_list_layout") for node in node_list)
+    ) or any(node.resource_id.endswith("edConversationInput") for node in node_list):
         return "chat"
+    # “智能P图”“拍题答疑”也会作为聊天页快捷入口常驻；只有没有聊天容器时，
+    # 这些宽泛能力词才用于兜底识别具体能力页。
+    if any(value in text for value in ("智能p图", "p图能力")):
+        return "image"
+    if "拍题" in text:
+        return "photo_question"
     if PACKAGE_NAME in activity:
         return "app"
     return "unknown"
@@ -1772,7 +2030,96 @@ class ToolExecutor:
         # 一个短的本地变体标记，避免把相同测试文本重复提交成无效动作。
         self.prompt_variant: str | None = None
         self._welfare_scroll_normalized = False
+        self._welfare_task_catalog_scrolled = False
         self._welfare_context = False
+        self._welfare_supplemental_task_progress: dict[str, int] = {}
+        self._daily_ability_experience_navigation = False
+
+    def _start_test_audio(self) -> tuple[str, str, str, subprocess.Popen[bytes]] | None:
+        """把短测试音频临时路由到默认麦克风的监视源。"""
+        audio_path = getattr(self.config, "test_audio_path", None)
+        pactl = shutil.which("pactl")
+        paplay = shutil.which("paplay")
+        if not isinstance(audio_path, Path) or not audio_path.is_file():
+            print(f"语音测试文件不存在，跳过音频注入：{audio_path}")
+            return None
+        if pactl is None or paplay is None:
+            print("当前系统缺少 pactl/paplay，跳过音频注入")
+            return None
+        try:
+            default_source = subprocess.run(
+                [pactl, "get-default-source"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            ).stdout.strip()
+            sink_name = f"auto_daily_voice_{os.getpid()}"
+            loaded = subprocess.run(
+                [
+                    pactl,
+                    "load-module",
+                    "module-null-sink",
+                    f"sink_name={sink_name}",
+                    "sink_properties=device.description=AutoDailyVoice",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            module_id = loaded.stdout.strip()
+            if loaded.returncode != 0 or not module_id:
+                print("无法创建临时音频回环，继续使用当前麦克风")
+                return None
+            changed = subprocess.run(
+                [pactl, "set-default-source", f"{sink_name}.monitor"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            if changed.returncode != 0:
+                subprocess.run([pactl, "unload-module", module_id], check=False)
+                print("无法切换临时麦克风源，继续使用当前麦克风")
+                return None
+            process = subprocess.Popen(
+                [paplay, "--device", sink_name, str(audio_path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return default_source, module_id, sink_name, process
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"语音测试音频注入失败，继续使用当前麦克风：{type(exc).__name__}")
+            return None
+
+    @staticmethod
+    def _finish_test_audio(
+        session: tuple[str, str, str, subprocess.Popen[bytes]] | None,
+    ) -> None:
+        """恢复默认音频源并卸载本轮临时回环。"""
+        if session is None:
+            return
+        default_source, module_id, _sink_name, process = session
+        pactl = shutil.which("pactl")
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            process.wait(timeout=5)
+        if pactl is None:
+            return
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            if default_source:
+                subprocess.run(
+                    [pactl, "set-default-source", default_source],
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+            subprocess.run(
+                [pactl, "unload-module", module_id],
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
 
     def set_prompt_variant(self, variant: str | None) -> None:
         """设置当前任务轮次的唯一文本后缀，不把它交给视觉模型决定。"""
@@ -1789,12 +2136,21 @@ class ToolExecutor:
     def reset_welfare_scroll(self) -> None:
         """福利页每次重新打开后都重新校准滚动位置。"""
         self._welfare_scroll_normalized = False
+        self._welfare_task_catalog_scrolled = False
+        supplemental = getattr(self, "_welfare_supplemental_task_progress", None)
+        if isinstance(supplemental, dict):
+            supplemental.clear()
 
     def prepare_visual_exchange_navigation(self) -> None:
         """让视觉点击后的下一次观测不再把空 WebView 强行判成福利页。"""
         # 福利页空层级需要保留上下文，避免普通任务入口误点；兑换入口已经
         # 由截图明确选中，点击后必须允许 Activity/截图重新决定真实页面阶段。
         self._welfare_context = False
+
+    def prepare_daily_ability_experience_navigation(self) -> None:
+        """将体验浮层的点击按当前真实页面重新判定，避免福利页路由等待误拦截。"""
+        self._welfare_context = False
+        self._daily_ability_experience_navigation = True
 
     def normalize_welfare_scroll(self) -> None:
         """仅在福利 WebView 明确需要回到顶部时调用；调用方必须已有成功 dump。
@@ -1816,6 +2172,176 @@ class ToolExecutor:
         time.sleep(1.2)
         self._welfare_scroll_normalized = True
         print("福利 WebView 空层级，已将任务列表滚动位置标准化")
+
+    def prepare_welfare_task_report(self, observation: Observation) -> Observation:
+        """报告前确认新版每日任务目录，并保留滚出视口的做同款进度。"""
+        if observation.stage != "welfare":
+            return observation
+        if not isinstance(
+            getattr(self, "_welfare_supplemental_task_progress", None), dict
+        ):
+            self._welfare_supplemental_task_progress = {}
+        local_report = parse_local_welfare_progress(observation)
+        if local_report is not None and isinstance(local_report.get("same_template"), int):
+            self._welfare_supplemental_task_progress["same_template"] = local_report[
+                "same_template"
+            ]
+
+        def attach_supplemental_progress(current: Observation) -> Observation:
+            if current.stage != "welfare":
+                return current
+            current_report = parse_local_welfare_progress(current)
+            if current_report is not None and isinstance(
+                current_report.get("same_template"), int
+            ):
+                self._welfare_supplemental_task_progress["same_template"] = (
+                    current_report["same_template"]
+                )
+            if not self._welfare_supplemental_task_progress:
+                return current
+            supplemental = tuple(
+                sorted(self._welfare_supplemental_task_progress.items())
+            )
+            if current.supplemental_task_progress == supplemental:
+                return current
+            return replace(
+                current,
+                supplemental_task_progress=supplemental,
+            )
+
+        observation = attach_supplemental_progress(observation)
+        new_welfare_page = is_new_welfare_page(observation)
+        if new_welfare_page:
+            if has_complete_new_welfare_task_catalog(observation, local_report):
+                self._welfare_task_catalog_scrolled = True
+                return observation
+            if (
+                not observation.nodes
+                and getattr(self, "_welfare_task_catalog_scrolled", False)
+            ):
+                return observation
+        elif (
+            local_report is not None
+            or getattr(self, "_welfare_task_catalog_scrolled", False)
+        ):
+            return observation
+
+        if not getattr(self, "_welfare_scroll_normalized", False):
+            self.normalize_welfare_scroll()
+        for attempt in range(WELFARE_TASK_CATALOG_SCROLL_MAX_ATTEMPTS):
+            self.device.input(
+                "swipe",
+                str(self.width // 2),
+                str(round(self.height * WELFARE_TASK_LIST_SCROLL_START_RATIO)),
+                str(self.width // 2),
+                str(round(self.height * WELFARE_TASK_LIST_SCROLL_END_RATIO)),
+                "500",
+            )
+            time.sleep(1)
+            observation = attach_supplemental_progress(self.observe())
+            local_report = parse_local_welfare_progress(observation)
+            if new_welfare_page:
+                if has_complete_new_welfare_task_catalog(observation, local_report):
+                    self._welfare_task_catalog_scrolled = True
+                    return observation
+                if not observation.nodes:
+                    # 层级为空时，只有完成目录滚动后才允许模型读取当前截图。
+                    self._welfare_task_catalog_scrolled = True
+                    return observation
+            else:
+                self._welfare_task_catalog_scrolled = True
+                return observation
+            if observation.stage != "welfare":
+                raise AgentError("滚动福利任务目录时离开了福利中心")
+            print(
+                "新版福利每日任务目录尚不完整，继续滚动定位"
+                f"（{attempt + 1}/{WELFARE_TASK_CATALOG_SCROLL_MAX_ATTEMPTS}）"
+            )
+        raise AgentError("滚动后仍无法从福利页面读取写作、拍题和P图三项每日任务")
+
+    def _daily_ability_click_point(
+        self, args: dict[str, Any], observation: Observation
+    ) -> tuple[int, int] | None:
+        """定位固定主卡槽位中的“去体验”，忽略轮播内容和卡片颜色。"""
+        if observation.stage != "welfare" or self.width <= 0 or self.height <= 0:
+            return None
+        if args.get("button_visible") is not True:
+            return None
+
+        target_x = round(self.width * DAILY_ABILITY_BUTTON_X_RATIO)
+        target_y = round(self.height * DAILY_ABILITY_BUTTON_Y_RATIO)
+        button_nodes = [
+            node
+            for node in observation.nodes
+            if node.enabled
+            and node.text.strip() == "去体验"
+            and node.bounds.area > 0
+        ]
+        main_card_buttons = [
+            node
+            for node in button_nodes
+            if self.width * 0.48 <= node.bounds.center[0] <= self.width * 0.78
+            and self.height * DAILY_ABILITY_CARD_MIN_Y_RATIO
+            <= node.bounds.center[1]
+            <= self.height * DAILY_ABILITY_CARD_MAX_Y_RATIO
+        ]
+        if main_card_buttons:
+            button = min(
+                main_card_buttons,
+                key=lambda node: (
+                    (node.bounds.center[0] - target_x) ** 2
+                    + (node.bounds.center[1] - target_y) ** 2
+                ),
+            )
+            return button.bounds.center
+        if button_nodes:
+            # 当前树已给出“去体验”边界但只在顶部轮播等其它区域时，禁止回退
+            # 到主卡固定点，以免误点同名入口。
+            return None
+
+        # WebView 偶发不提供按钮无障碍节点；此时按钮位置固定，模型必须先从
+        # 当前截图确认主卡槽位显示“去体验”，执行器不采纳模型提供的坐标。
+        return target_x, target_y
+
+    def _open_daily_ability(
+        self, args: dict[str, Any], observation: Observation
+    ) -> ToolResult:
+        """点击主轮播卡固定槽位的“去体验”，随后把体验页面交给视觉模型。"""
+        self._welfare_context = True
+        if observation.stage != "welfare":
+            return self._result(
+                False,
+                f"主卡体验按钮要求福利页，当前阶段={observation.stage or '未知'}",
+                stage=observation.stage,
+                visual_replan=True,
+            )
+        if args.get("button_visible") is not True:
+            return self._result(
+                True,
+                "主轮播卡固定位置当前未确认显示‘去体验’，未点击",
+                stage=observation.stage,
+                ability_card_visible=False,
+            )
+        point = self._daily_ability_click_point(args, observation)
+        if point is None:
+            return self._result(
+                False,
+                "当前可见的‘去体验’不在主轮播卡固定位置，未点击",
+                stage=observation.stage,
+                visual_replan=True,
+            )
+        print(f"点击主轮播卡固定位置的‘去体验’（x={point[0]}, y={point[1]}）")
+        self._tap_point(*point)
+        time.sleep(1.2)
+        after = self.observe()
+        return self._result(
+            True,
+            "已点击主轮播卡‘去体验’，将当前体验页面交给视觉模型处理",
+            stage=after.stage,
+            ability_station_clicked=True,
+            ability_station_evidence="main_carousel_experience_clicked",
+            experience_opened=after.stage != "welfare",
+        )
 
     def _read_state(self) -> dict[str, Any]:
         return read_daily_state(self.config.state_path)
@@ -1914,39 +2440,54 @@ class ToolExecutor:
         # 该提示不是业务状态，若不关闭会遮住底部导航并阻断固定的首步导航。
         for _ in range(2):
             # WebView 页面持续重绘时，uiautomator 可能一直等不到 idle state。
-            # 先读取 Activity，已确认是福利 WebView 时只做一次短探针；失败后
-            # 仍可用截图交给视觉模型，不能把页面渲染竞态误判成 ADB 故障。
+            # 福利页探针给足完成一次压缩树 dump 的时间；仍失败时保留截图回退，
+            # 不能把页面渲染竞态误判成 ADB 故障。
             activity = self.device.activity()
             webview = WEBVIEW_ACTIVITY_MARKER in activity.lower()
-            try:
-                ui_xml = self.device.ui_dump(
-                    attempts=WEBVIEW_UI_DUMP_ATTEMPTS if webview else UI_DUMP_ATTEMPTS,
-                    timeout=WEBVIEW_UI_DUMP_TIMEOUT if webview else UI_DUMP_TIMEOUT,
-                )
-            except AgentError:
-                if not webview:
-                    raise
-                print("福利 WebView 无障碍树未及时空闲，使用截图观测")
+            ui_xml = ""
+            nodes: tuple[Node, ...] = ()
+            probe_count = (
+                2
+                if webview and getattr(self, "_welfare_context", False)
+                else 1
+            )
+            for probe in range(probe_count):
+                try:
+                    ui_xml = self.device.ui_dump(
+                        attempts=WEBVIEW_UI_DUMP_ATTEMPTS if webview else UI_DUMP_ATTEMPTS,
+                        timeout=WEBVIEW_UI_DUMP_TIMEOUT if webview else UI_DUMP_TIMEOUT,
+                    )
+                except AgentError:
+                    if not webview:
+                        raise
+                    if probe + 1 < probe_count:
+                        print("福利 WebView 无障碍树暂不可用，等待后重试")
+                        time.sleep(WEBVIEW_UI_DUMP_RETRY_DELAY)
+                        continue
+                    print("福利 WebView 无障碍树未及时空闲，使用截图观测")
+                    image = self.device.screenshot()
+                    return Observation(image, "", "", (), activity, "welfare")
+                nodes = tuple(parse_nodes(ui_xml))
+                if not (
+                    webview
+                    and getattr(self, "_welfare_context", False)
+                    and not any(node.text.strip() for node in nodes)
+                ):
+                    break
+                self.normalize_welfare_scroll()
+                if probe + 1 < probe_count:
+                    print("福利 WebView 空层级，等待任务目录渲染后重试")
+                    time.sleep(WEBVIEW_UI_DUMP_RETRY_DELAY)
+                    continue
                 image = self.device.screenshot()
-                return Observation(image, "", "", (), activity, "welfare")
-            nodes = tuple(parse_nodes(ui_xml))
+                self._welfare_context = True
+                return Observation(image, ui_xml, "", (), activity, "welfare")
             if self._dismiss_android_warning(nodes):
                 continue
             if self._dismiss_upgrade_prompt(nodes):
                 continue
             if self._dismiss_protocol_prompt(nodes, activity):
                 continue
-            if (
-                webview
-                and getattr(self, "_welfare_context", False)
-                and not any(node.text.strip() for node in nodes)
-            ):
-                # Waydroid 多窗口装饰层或 WebView 重绘可能只暴露窗口标题栏等无文本节点；
-                # 只要福利 WebView 没有可用文本，就按空层级处理，用截图交给上层。
-                self.normalize_welfare_scroll()
-                image = self.device.screenshot()
-                self._welfare_context = True
-                return Observation(image, ui_xml, "", (), activity, "welfare")
             # dump 可能等待数秒；截图放在 dump 之后，避免把旧页面图片和新层级
             # 拼进同一次视觉请求，尤其是福利页返回后的 WebView 重绘阶段。
             image = self.device.screenshot()
@@ -2153,6 +2694,31 @@ class ToolExecutor:
                     self.normalize_welfare_scroll()
         return latest
 
+    @staticmethod
+    def _daily_ability_navigation_button_visible(observation: Observation) -> bool:
+        """判断当前体验浮层是否有可能触发异步 Activity 导航。"""
+        return any(
+            any(marker in node.searchable for marker in DAILY_ABILITY_EXPERIENCE_NAVIGATION_MARKERS)
+            for node in observation.nodes
+        )
+
+    def _observe_after_daily_ability_action(
+        self, before: Observation, navigation_expected: bool
+    ) -> Observation:
+        """等待能力浮层的导航按钮真正切出 WebView，避免点击旧页面。"""
+        latest = self.observe()
+        if not navigation_expected:
+            return latest
+        if latest.activity != before.activity or latest.stage != "welfare":
+            return latest
+        deadline = time.monotonic() + DAILY_ABILITY_EXPERIENCE_NAVIGATION_TIMEOUT
+        while time.monotonic() < deadline:
+            time.sleep(DAILY_ABILITY_EXPERIENCE_NAVIGATION_POLL_INTERVAL)
+            latest = self.observe()
+            if latest.activity != before.activity or latest.stage != "welfare":
+                return latest
+        return latest
+
     def _guard_generation(self, tool_name: str) -> ToolResult | None:
         if self.pending_generation and tool_name != "wait_5s":
             return self._result(False, "消息仍可能在生成，必须先调用 wait_5s 等待右下角终止按钮消失")
@@ -2175,6 +2741,11 @@ class ToolExecutor:
             )
         ]
         return max(candidates, key=lambda node: node.bounds.area, default=None)
+
+    def _fixed_prompt(self) -> str:
+        value = self.config.test_prompt
+        variant = getattr(self, "prompt_variant", None)
+        return f"{value} {variant}" if variant else value
 
     def _find_send(self, observation: Observation) -> Node | None:
         nodes = [node for node in observation.nodes if node.enabled and node.bounds.area > 0]
@@ -2200,8 +2771,36 @@ class ToolExecutor:
         ]
         if preferred:
             return max(preferred, key=lambda node: node.bounds.area)
+        input_node = self._find_input(observation)
+        if input_node is not None:
+            input_bounds = node_interaction_bounds(input_node)
+            anchored = [
+                node
+                for node in nodes
+                if node.clickable
+                and node is not input_node
+                and node.bounds.area <= 40_000
+                and node.bounds.left >= input_bounds.right - 48
+                and node.bounds.right >= input_bounds.right - 4
+                and min(node.bounds.bottom, input_bounds.bottom)
+                - max(node.bounds.top, input_bounds.top)
+                >= min(20, input_bounds.height // 2)
+                and not any(
+                    marker in f"{node.text} {node.content_desc}".lower()
+                    for marker in ("上传", "相册", "键盘", "收起", "关闭")
+                )
+            ]
+            if anchored:
+                return min(
+                    anchored,
+                    key=lambda node: (
+                        abs(node.bounds.center[1] - input_bounds.center[1]),
+                        -node.bounds.area,
+                    ),
+                )
+            return None
         # Compose 版本的绿色上箭头有时没有文字和资源 ID，只暴露为右下角可点击图标。
-        # 仅在底部区域寻找较小控件，避免误点页面上的其它大按钮。
+        # 没有可访问输入框的页面才按屏幕右下区域兜底。
         bottom_right = [
             node
             for node in nodes
@@ -2291,35 +2890,40 @@ class ToolExecutor:
         if input_node is None:
             return self._result(False, "等待输入框超时，当前页面尚未进入提问/写作输入状态")
 
-        value = self.config.test_prompt
-        if self.prompt_variant:
-            value = f"{value} {self.prompt_variant}"
+        value = self._fixed_prompt()
         if any(ord(char) > 127 for char in value):
             return self._result(False, "固定测试文本含中文，当前设备未配置可靠中文输入；请在 TEST_PROMPT 中使用英文")
-        # 输入框可能已经保留上一次尝试的内容；先检查完整节点文本，避免重复追加。
-        if input_node is not None and value in input_node.text:
-            return self._result(True, "固定测试文本已在输入框中", stage=observation.stage)
         escaped = encode_adb_input_text(value)
-        # 输入法切换和 WebView 重绘偶尔会吞掉第一次 input text；在同一个工具内
-        # 有界重试，并重新聚焦输入框，避免外层把一次瞬态失败升级为整轮熔断。
+        # 写作/聊天页面会复用草稿框；每轮必须替换旧内容，不能将任务标记追加到上一轮。
         for attempt in range(3):
             if attempt:
                 refreshed = self.observe()
                 refreshed_input = self._find_input(refreshed)
-                if refreshed_input is not None:
-                    input_node = refreshed_input
-                    self._tap_node(input_node)
-                else:
-                    self._tap_point(self.width // 2, self.height - 100)
-                time.sleep(0.5)
+                if refreshed_input is None:
+                    return self._result(False, "重试输入时输入框已消失")
+                observation = refreshed
+                input_node = refreshed_input
+            current_text = input_node.text.strip()
+            if current_text == value:
+                return self._result(True, "固定测试文本已准确填入当前输入框", stage=observation.stage)
+            self._tap_node(input_node)
+            if current_text:
+                self.device.input("keycombination", "113", "29")
+                self.device.input("keyevent", "KEYCODE_DEL")
+                time.sleep(0.2)
+                cleared = self.observe()
+                cleared_input = self._find_input(cleared)
+                if cleared_input is None or cleared_input.text.strip():
+                    return self._result(False, "旧输入内容未能清空，已中止本轮以避免拼接发送")
+                observation = cleared
+                input_node = cleared_input
             self.device.input("text", escaped)
             check_deadline = time.monotonic() + 2.5
             while time.monotonic() < check_deadline:
                 after = self.observe()
-                # compact_ui 为了控制模型上下文会截断，不能用它判断输入是否成功。
-                input_texts = [node.text for node in after.nodes if node.text]
-                if any(value in text for text in input_texts):
-                    return self._result(True, "已通过固定工具输入测试文本", stage=after.stage)
+                after_input = self._find_input(after)
+                if after_input is not None and after_input.text.strip() == value:
+                    return self._result(True, "已在当前输入框中准确填入固定测试文本", stage=after.stage)
                 time.sleep(0.4)
         return self._result(False, "固定测试文本没有出现在输入框")
 
@@ -2351,7 +2955,12 @@ class ToolExecutor:
                     break
             if not busy:
                 self.pending_generation = False
-                return self._result(True, f"已等待生成完成（检查 {checks} 次）", stage=observation.stage)
+                return self._result(
+                    True,
+                    f"已等待生成完成（检查 {checks} 次）",
+                    stage=observation.stage,
+                    daily_ability_experience=is_daily_ability_experience_visible(observation),
+                )
             if time.monotonic() >= deadline:
                 return self._result(False, "等待生成超时，右下角终止按钮仍存在")
             time.sleep(5)
@@ -2360,9 +2969,21 @@ class ToolExecutor:
         """收起聊天页的全屏输入浮层，避免它吞掉底部导航点击。"""
         collapse = find_node(observation.nodes, "收起输入框", exact=True)
         if collapse is None:
-            collapse = find_node(
-                observation.nodes, "session_input_arrow_down", clickable_only=True
-            )
+            # 新版写作页的顶部“快速回答/模型”选择器也会复用
+            # session_input_arrow_down 资源 ID，但它位于左上角，点击会反复打开
+            # 模型菜单，永远无法进入下面的键盘收起和底部导航。资源 ID 只能作为
+            # 位置受限的后备证据；真正的输入浮层收起按钮位于右侧，或直接暴露
+            # “收起输入框”语义。
+            candidates = [
+                node
+                for node in observation.nodes
+                if node.enabled
+                and node.clickable
+                and node.bounds.area > 0
+                and node.resource_id.endswith("session_input_arrow_down")
+                and node.bounds.center[0] >= self.width * 0.65
+            ]
+            collapse = min(candidates, key=lambda node: node.bounds.area, default=None)
         if collapse is None:
             return False
         self._tap_node(collapse)
@@ -2374,6 +2995,23 @@ class ToolExecutor:
         if not callable(checker) or not checker():
             return False
         self.device.input("keyevent", "KEYCODE_BACK")
+        return True
+
+    def _dismiss_chat_attachment_sheet(self, observation: Observation) -> bool:
+        """仅当聊天页附件面板的多个专属入口同时可见时收起该面板。"""
+        if observation.stage not in {"chat", "app"}:
+            return False
+        visible_text = " ".join(
+            node.searchable
+            for node in observation.nodes
+            if node.enabled and node.bounds.area > 0
+        )
+        markers = ("进入相册", "联网搜索", "添加文件")
+        if sum(marker in visible_text for marker in markers) < 2:
+            return False
+        self.device.input("keyevent", "KEYCODE_BACK")
+        time.sleep(0.4)
+        print("已收起聊天页附件面板，继续福利中心导航")
         return True
 
     @staticmethod
@@ -2405,8 +3043,20 @@ class ToolExecutor:
         fallback_y = min(height - 1, bounds.bottom + max(1, round(bounds.height * 0.4)))
         return x, fallback_y
 
+    @staticmethod
+    def _is_new_chat_home(observation: Observation) -> bool:
+        """只把明确暴露新版抽屉、且没有旧版“我们”入口的主 Activity 视为首页。"""
+        activity_lower = observation.activity.lower()
+        return (
+            observation.stage in {"chat", "app"}
+            and PACKAGE_NAME in activity_lower
+            and "home.v2.ybhomeactivityv2" in activity_lower
+            and find_node(observation.nodes, "我们", exact=True) is None
+            and ToolExecutor._welfare_drawer_toggle_node(observation) is not None
+        )
+
     def _navigate_to_ours_until(self, deadline: float) -> Observation:
-        """在一个有界时间窗内完成返回和导航；两次恢复都复用这套逻辑。"""
+        """兼容旧版“我们”页；新版聊天首页是等价的有效落点。"""
         back_sent = False
         last_back_elapsed: float | None = None
         fallback_tapped = False
@@ -2427,6 +3077,8 @@ class ToolExecutor:
             blocker = self._manual_blocker(observation)
             if blocker is not None:
                 raise ManualActionRequired(f"{blocker}（Activity={observation.activity[:120] or '未知'}）")
+            if self._is_new_chat_home(observation):
+                return observation
             if observation.stage == "ours":
                 return observation
             # 新版聊天页发送后可能停留在全屏展开输入浮层，该浮层会吞掉底部
@@ -2462,11 +3114,31 @@ class ToolExecutor:
                 ours_tap_attempts += 1
                 time.sleep(1.5)
                 continue
+            elapsed = OURS_NAV_TIMEOUT - max(0.0, deadline - time.monotonic())
+            back_button_visible = any(
+                node.enabled
+                and node.bounds.area > 0
+                and (
+                    node.resource_id.endswith("android:id/back")
+                    or node.content_desc.strip().lower() in {"back", "返回上一页"}
+                )
+                for node in observation.nodes
+            )
+            if (
+                observation.stage == "chat"
+                and "home.v2." in observation.activity.lower()
+                and back_button_visible
+                and not back_sent
+            ):
+                self.device.input("keyevent", "KEYCODE_BACK")
+                back_sent = True
+                last_back_elapsed = elapsed
+                time.sleep(1.2)
+                continue
             if observation.stage != "chat":
                 ours_tap_attempts = 0
                 last_ours_node = None
             # 应用冷启动或 WebView 首次恢复时层级可能暂时为空；聊天首页不要因暂时空层级退出。
-            elapsed = OURS_NAV_TIMEOUT - max(0.0, deadline - time.monotonic())
             activity_lower = observation.activity.lower()
             # 已确认是元宝首页但无障碍树为空时，最多按一次归一化的“我们”位置。
             # 不对福利页、登录页或未知 Activity 盲点，且由 OURS_FALLBACK_DELAY 限制等待时间。
@@ -2536,7 +3208,7 @@ class ToolExecutor:
         self.device.wait_app_ready(PACKAGE_NAME)
 
     def _go_to_ours(self) -> Observation:
-        """等待首页导航就绪后进入“我们”，最多重启元宝一次。"""
+        """等待元宝首页导航就绪；兼容旧版“我们”页，最多重启一次。"""
         last_error: AgentError | None = None
         for attempt in range(2):
             try:
@@ -2552,8 +3224,8 @@ class ToolExecutor:
                     except ManualActionRequired:
                         raise
                     except AgentError as restart_error:
-                        raise AgentError(f"无法回到元宝“我们”页面，应用重启失败：{restart_error}") from restart_error
-        raise AgentError(f"无法回到元宝“我们”页面：{last_error or '未知错误'}")
+                        raise AgentError(f"无法回到元宝主页，应用重启失败：{restart_error}") from restart_error
+        raise AgentError(f"无法回到元宝主页：{last_error or '未知错误'}")
 
     @staticmethod
     def _welfare_entry_node(observation: Observation) -> Node | None:
@@ -2569,7 +3241,12 @@ class ToolExecutor:
         candidates = [
             node
             for node in observation.nodes
-            if node.enabled and node.bounds.area > 0 and "福利中心" in node.searchable
+            if node.enabled
+            and node.bounds.area > 0
+            and "福利中心" in node.searchable
+            and not any(
+                marker in node.searchable for marker in ("返回福利中心", "回到福利中心")
+            )
         ]
         return min(candidates, key=lambda node: node.bounds.area, default=None)
 
@@ -2683,12 +3360,33 @@ class ToolExecutor:
         ]
         return min(parents, key=lambda node: node.bounds.area, default=label)
 
+    @staticmethod
+    def _welfare_drawer_toggle_node(observation: Observation) -> Node | None:
+        """定位新版聊天首页无障碍树中的抽屉入口。"""
+        candidates = [
+            node
+            for node in observation.nodes
+            if node.enabled
+            and node.clickable
+            and node.bounds.area > 0
+            and (
+                node.resource_id.rsplit("/", 1)[-1] == "ic_navigation_show"
+                or node.content_desc.strip() == "抽屉页入口"
+            )
+        ]
+        return min(candidates, key=lambda node: node.bounds.area, default=None)
+
     def _go_to_welfare(self) -> Observation:
         self.reset_welfare_scroll()
         self._welfare_context = True
         last_observation: Observation | None = None
         for attempt in range(2):
             observation = self.observe()
+            if self._dismiss_chat_attachment_sheet(observation):
+                observation = self.observe()
+            if self._hide_soft_keyboard():
+                time.sleep(0.4)
+                observation = self.observe()
             if observation.stage == "activity":
                 # 福利专题页和任务列表共用 WebView Activity；先按页面语义返回，
                 # 避免把专题页交给“我们”页导航逻辑反复重启应用。
@@ -2700,6 +3398,8 @@ class ToolExecutor:
             if (
                 observation.stage != "welfare"
                 and self._welfare_entry_node(observation) is None
+                and self._welfare_return_node(observation) is None
+                and self._welfare_drawer_toggle_node(observation) is None
             ):
                 observation = self._go_to_ours()
             last_observation = observation
@@ -2708,6 +3408,8 @@ class ToolExecutor:
             fallback_tapped = False
             return_link_fallback_attempted = False
             last_entry_tap_at: float | None = None
+            drawer_tap_attempts = 0
+            last_drawer_tap_at: float | None = None
             while time.monotonic() < entry_deadline:
                 if observation.stage == "welfare":
                     return observation
@@ -2717,9 +3419,8 @@ class ToolExecutor:
                 if webview_observation is not None:
                     print("福利中心 WebView 已打开，无障碍树暂时为空，交由模型确认")
                     return webview_observation
-                # 聊天页顶部的“返回福利中心”有时只是上一条任务消息留下的
-                # Compose 手势区域，点击不会改变页面；当前截图仍能确认在元宝
-                # 首页时，改走底部“我们”页的福利入口，避免重复点击同一坏路由。
+                # 新版优先走左上角抽屉；只有没有抽屉控件的旧版页面才尝试
+                # “返回福利中心”消息入口及“我们”页兼容路径。
                 if (
                     not return_link_fallback_attempted
                     and last_entry_tap_at is not None
@@ -2728,6 +3429,7 @@ class ToolExecutor:
                     and observation.stage == "chat"
                     and PACKAGE_NAME in observation.activity.lower()
                     and self._welfare_return_node(observation) is not None
+                    and self._welfare_drawer_toggle_node(observation) is None
                 ):
                     return_link_fallback_attempted = True
                     try:
@@ -2736,18 +3438,28 @@ class ToolExecutor:
                         last_entry_tap_at = None
                         continue
                     except AgentError as exc:
-                        print(f"返回福利中心链接无响应，底部“我们”导航失败：{str(exc)[:160]}")
-                welfare_node = self._welfare_entry_click_node(observation) or self._welfare_return_node(observation)
-                if welfare_node is not None and last_entry_tap_at is None:
-                    return_node = self._welfare_return_node(observation)
-                    if return_node is not None and welfare_node == return_node:
-                        x, y = self._welfare_return_tap_point(
-                            observation, return_node, self.width, self.height
-                        )
-                        self._tap_point(x, y)
-                    else:
-                        self._tap_node(welfare_node)
+                        print(f"返回福利中心链接无响应，旧版“我们”导航失败：{str(exc)[:160]}")
+                entry_node = self._welfare_entry_click_node(observation)
+                drawer_node = self._welfare_drawer_toggle_node(observation)
+                return_node = self._welfare_return_node(observation)
+                now = time.monotonic()
+                if entry_node is not None and last_entry_tap_at is None:
+                    self._tap_node(entry_node)
                     last_entry_tap_at = time.monotonic()
+                elif drawer_node is not None and drawer_tap_attempts < 2 and (
+                    last_drawer_tap_at is None or now - last_drawer_tap_at >= 5
+                ):
+                    self._tap_node(drawer_node)
+                    drawer_tap_attempts += 1
+                    last_drawer_tap_at = now
+                    last_entry_tap_at = None
+                    print("新版聊天页未直接暴露福利入口，改从抽屉打开福利中心")
+                elif return_node is not None and last_entry_tap_at is None:
+                    x, y = self._welfare_return_tap_point(
+                        observation, return_node, self.width, self.height
+                    )
+                    self._tap_point(x, y)
+                    last_entry_tap_at = now
                 elif (
                     not fallback_tapped
                     and observation.stage == "ours"
@@ -2777,19 +3489,30 @@ class ToolExecutor:
                     print("福利中心 WebView 已打开，无障碍树暂时为空，交由模型确认")
                     return webview_observation
                 # 入口仍在当前页时重复点击，覆盖第一次点击未被 WebView 接收的竞态。
-                welfare_node = self._welfare_entry_click_node(observation) or self._welfare_return_node(observation)
+                entry_node = self._welfare_entry_click_node(observation)
+                drawer_node = self._welfare_drawer_toggle_node(observation)
+                return_node = self._welfare_return_node(observation)
                 now = time.monotonic()
-                if welfare_node is not None and (
+                if entry_node is not None and (
                     last_entry_tap_at is None or now - last_entry_tap_at >= 5
                 ):
-                    return_node = self._welfare_return_node(observation)
-                    if return_node is not None and welfare_node == return_node:
-                        x, y = self._welfare_return_tap_point(
-                            observation, return_node, self.width, self.height
-                        )
-                        self._tap_point(x, y)
-                    else:
-                        self._tap_node(welfare_node)
+                    self._tap_node(entry_node)
+                    last_entry_tap_at = now
+                elif drawer_node is not None and drawer_tap_attempts < 2 and (
+                    last_drawer_tap_at is None or now - last_drawer_tap_at >= 5
+                ):
+                    self._tap_node(drawer_node)
+                    drawer_tap_attempts += 1
+                    last_drawer_tap_at = now
+                    last_entry_tap_at = None
+                    print("福利侧栏尚未打开，重试新版抽屉入口")
+                elif return_node is not None and (
+                    last_entry_tap_at is None or now - last_entry_tap_at >= 5
+                ):
+                    x, y = self._welfare_return_tap_point(
+                        observation, return_node, self.width, self.height
+                    )
+                    self._tap_point(x, y)
                     last_entry_tap_at = now
                 time.sleep(WELFARE_LOAD_POLL_INTERVAL)
             if attempt == 0:
@@ -2845,6 +3568,32 @@ class ToolExecutor:
             return min(image_nodes, key=lambda node: (node.bounds.top, node.bounds.left))
         return None
 
+    def _chat_camera_button(self, observation: Observation) -> Node | None:
+        """定位输入框左侧真实的“拍照”按钮，避开上方快捷能力栏。"""
+        if observation.stage != "chat":
+            return None
+        candidates = [
+            node
+            for node in observation.nodes
+            if node.enabled
+            and any(
+                value.strip() == "拍照"
+                for value in (node.text, node.content_desc)
+            )
+            and node_interaction_bounds(node).area > 0
+        ]
+        candidates = [
+            node
+            for node in candidates
+            if node_interaction_bounds(node).center[0] <= self.width * 0.22
+            and node_interaction_bounds(node).center[1] >= self.height * 0.78
+        ]
+        return min(
+            candidates,
+            key=lambda node: node_interaction_bounds(node).area,
+            default=None,
+        )
+
     def _ensure_picker_image(self) -> ToolResult:
         if not self.image_pushed:
             self.device.push_image(self.config.test_image_path)
@@ -2861,18 +3610,14 @@ class ToolExecutor:
             "上传",
             "选择图片",
             "从相册",
+            "相册入口",
             "gallery",
             "image",
-        )
-        fallback_points = (
-            (58, self.height - 125),
-            (58, self.height - 80),
-            (110, self.height - 125),
-            (self.width // 8, round(self.height * 0.82)),
         )
         for attempt in range(6):
             if observation.stage == "picker":
                 break
+            camera_button = self._chat_camera_button(observation)
             candidates = [
                 node
                 for node in observation.nodes
@@ -2880,7 +3625,9 @@ class ToolExecutor:
                 and node.bounds.area > 0
                 and any(word in node.searchable for word in entry_markers)
             ]
-            if candidates:
+            if camera_button is not None:
+                self._tap_node(camera_button)
+            elif candidates:
                 # 优先点击最靠近输入区左侧的图片入口，避免误触顶部说明文本。
                 self._tap_node(
                     min(
@@ -2896,10 +3643,11 @@ class ToolExecutor:
                 # 相机预览没有相册文字时，先返回拍题页，再由下一轮选择入口。
                 self.device.input("keyevent", "KEYCODE_BACK")
             else:
-                # 元宝拍题页和 P 图页都把本地图片入口放在输入区左侧；不同版本
-                # 的底部栏高度略有差异，依次尝试有限的相邻坐标。
-                x, y = fallback_points[min(attempt, len(fallback_points) - 1)]
-                self._tap_point(x, y)
+                if attempt == 5:
+                    break
+                time.sleep(1)
+                observation = self.observe()
+                continue
             time.sleep(min(5, 2 + attempt))
             observation = self.observe()
         if observation.stage != "picker":
@@ -2950,13 +3698,16 @@ class ToolExecutor:
                 self._write_state("unavailable")
                 return self._result(
                     True,
-                    f"目标商品“{self.config.card_name}”需要 {cost} 积分，当前仅 {points}，跳过兑换并返回“我们”页",
+                    f"目标商品“{self.config.card_name}”需要 {cost} 积分，当前仅 {points}，已安全跳过兑换",
                     stage=observation.stage,
                     reward_unavailable=True,
                     points=points,
                     cost=cost,
                 )
-            if observation.stage == "exchange":
+            if observation.stage == "exchange" and (
+                has_visible_exchange_product(observation, self.config.card_name)
+                or not observation.nodes
+            ):
                 self._last_exchange_observation = observation
                 return self._result(True, "已进入兑换商城", stage=observation.stage)
             # 福利页顶部“兑换商城”是 TextView 文案节点（不可点击），不要用
@@ -2969,7 +3720,10 @@ class ToolExecutor:
                 self._tap_node(mall)
                 time.sleep(3)
                 after = self.observe()
-                if after.stage == "exchange":
+                if after.stage == "exchange" and (
+                    has_visible_exchange_product(after, self.config.card_name)
+                    or not after.nodes
+                ):
                     self._last_exchange_observation = after
                     return self._result(True, "已进入兑换商城", stage=after.stage)
                 points, cost = self._read_points_and_cost(after)
@@ -2979,7 +3733,7 @@ class ToolExecutor:
                     self._write_state("unavailable")
                     return self._result(
                         True,
-                        f"目标商品“{self.config.card_name}”需要 {cost} 积分，当前仅 {points}，跳过兑换并返回“我们”页",
+                        f"目标商品“{self.config.card_name}”需要 {cost} 积分，当前仅 {points}，已安全跳过兑换",
                         stage=after.stage,
                         reward_unavailable=True,
                         points=points,
@@ -3066,13 +3820,11 @@ class ToolExecutor:
         # WebView 奖励遮罩常完全不进入无障碍树。当前手机布局中，
         # 绿色“开心收下”按钮中心是可验证的亮绿色像素，普通任务行该位置为深色。
         if (
-            not observation.nodes
-            and (
-                observation.stage == "welfare"
-                or WEBVIEW_ACTIVITY_MARKER in observation.activity.lower()
-            )
+            observation.stage == "welfare"
+            or WEBVIEW_ACTIVITY_MARKER in observation.activity.lower()
         ):
-            x, y = self.width // 2, round(self.height * 0.647)
+            x = self.width // 2
+            y = round(self.height * WELFARE_REWARD_BUTTON_Y_RATIO)
             pixel = png_pixel(observation.image, x, y)
             if (
                 pixel is not None
@@ -3224,7 +3976,7 @@ class ToolExecutor:
         if recovered == "unavailable":
             return self._result(
                 True,
-                "已从同日状态恢复：QQ超级会员3天卡积分不足，跳过兑换并返回“我们”页",
+                "已从同日状态恢复：QQ超级会员3天卡积分不足，已安全跳过兑换",
                 stage=observation.stage,
                 reward_unavailable=True,
             )
@@ -3266,7 +4018,7 @@ class ToolExecutor:
             self._write_state("unavailable")
             return self._result(
                 True,
-                f"目标商品“{self.config.card_name}”需要 {cost} 积分，当前仅 {points}，跳过兑换并返回“我们”页",
+                f"目标商品“{self.config.card_name}”需要 {cost} 积分，当前仅 {points}，已安全跳过兑换",
                 stage=observation.stage,
                 reward_unavailable=True,
                 points=points,
@@ -3383,18 +4135,28 @@ class ToolExecutor:
                 and node.bounds.height >= 300
                 for node in observation.nodes
             ),
+            "daily_ability_experience": is_daily_ability_experience_visible(observation),
         }
 
     def execute(self, name: str, args: dict[str, Any]) -> ToolResult:
         guarded = self._guard_generation(name)
         if guarded is not None:
+            if name == "tap":
+                self._daily_ability_experience_navigation = False
             return guarded
         try:
             if name == "tap":
+                ability_experience_action = bool(
+                    getattr(self, "_daily_ability_experience_navigation", False)
+                )
+                self._daily_ability_experience_navigation = False
                 x, y = int(args["x"]), int(args["y"])
                 if x >= self.width or y >= self.height or x < 0 or y < 0:
                     raise AgentError(f"坐标越界：{x},{y}")
                 before_tap = self.observe()
+                experience_navigation_expected = ability_experience_action and self._daily_ability_navigation_button_visible(
+                    before_tap
+                )
                 covered = self._foreground_label_covering_tap(
                     before_tap, x, y, self.width, self.height
                 )
@@ -3405,30 +4167,28 @@ class ToolExecutor:
                         stage=before_tap.stage,
                         visual_replan=True,
                     )
-                resolved_x, resolved_y = self._resolve_tap_point(before_tap, x, y)
+                if ability_experience_action:
+                    resolved_x, resolved_y = x, y
+                else:
+                    resolved_x, resolved_y = self._resolve_tap_point(before_tap, x, y)
                 if (resolved_x, resolved_y) != (x, y):
                     args.update({"x": resolved_x, "y": resolved_y})
                     x, y = resolved_x, resolved_y
                     print("视觉点击落在文字节点，已提升到当前层级的可点击父控件")
-                was_welfare_context = self._welfare_context
+                was_welfare_context = self._welfare_context and not ability_experience_action
+                # 任务入口点击后，下一次观测必须重新判定真实页面。若继续保留
+                # 福利上下文，WebView 的空/滞后无障碍树会把目标页伪装成福利页，
+                # 后续状态机就会在错误页面上重规划。
+                if was_welfare_context:
+                    self._welfare_context = False
                 self._tap_point(x, y)
-                time.sleep(0.8)
-                after_tap = self.observe()
-                # 首页顶部的返回链接有时被标题栏装饰层抢走第一次触摸；
-                # 只要最新观测仍暴露该语义入口，就按当前层级重新点击其可操作父节点。
-                if after_tap.stage != "welfare":
-                    return_node = self._welfare_return_node(after_tap) or self._welfare_entry_click_node(after_tap)
-                    if return_node is not None:
-                        welfare_return = self._welfare_return_node(after_tap)
-                        if welfare_return is not None and return_node == welfare_return:
-                            resolved_x, resolved_y = self._welfare_return_tap_point(
-                                after_tap, welfare_return, self.width, self.height
-                            )
-                            self._tap_point(resolved_x, resolved_y)
-                        else:
-                            self._tap_node(return_node)
-                        time.sleep(0.8)
-                        after_tap = self.observe()
+                if experience_navigation_expected:
+                    after_tap = self._observe_after_daily_ability_action(
+                        before_tap, navigation_expected=True
+                    )
+                else:
+                    time.sleep(0.8)
+                    after_tap = self.observe()
                 # 福利页任务行动按钮是 WebView 的异步路由入口。短暂仍显示福利页
                 # 不代表点击失败，必须给路由和新 Activity 一个有界加载窗口。
                 if was_welfare_context:
@@ -3449,6 +4209,42 @@ class ToolExecutor:
                     stage=stage,
                     activity=after_tap.activity,
                     entry_evidence=self._entry_evidence(after_tap),
+                )
+            if name == "long_press":
+                observation = self.observe()
+                x, y = int(args["x"]), int(args["y"])
+                duration = max(600, min(10000, int(args.get("duration_ms", 2000))))
+                if not (0 <= x < self.width and 0 <= y < self.height):
+                    raise AgentError(f"长按坐标越界：{x},{y}")
+                covered = self._foreground_label_covering_tap(
+                    observation, x, y, self.width, self.height
+                )
+                if covered is not None:
+                    return self._result(
+                        False,
+                        f"长按目标被前景交互层（{covered}）遮挡，请先处理遮挡层",
+                        stage=observation.stage,
+                        visual_replan=True,
+                    )
+                audio_session = None
+                if args.get("_daily_ability_voice") is True:
+                    audio_session = self._start_test_audio()
+                    if audio_session is not None:
+                        time.sleep(0.15)
+                try:
+                    self.device.input(
+                        "swipe", str(x), str(y), str(x), str(y), str(duration)
+                    )
+                finally:
+                    self._finish_test_audio(audio_session)
+                self.pending_generation = True
+                time.sleep(0.5)
+                after = self.observe()
+                return self._result(
+                    True,
+                    "已长按并释放页面控件，下一步调用 wait_5s 等待结果",
+                    stage=after.stage,
+                    audio_injected=audio_session is not None,
                 )
             if name == "swipe":
                 values = [int(args[key]) for key in ("x1", "y1", "x2", "y2")]
@@ -3474,6 +4270,8 @@ class ToolExecutor:
             if name == "open_welfare":
                 after = self._go_to_welfare()
                 return self._result(True, "已进入福利中心", stage=after.stage)
+            if name == "open_daily_ability":
+                return self._open_daily_ability(args, self.observe())
             if name == "input_test_prompt":
                 return self._input_fixed_prompt(self.observe())
             if name == "send_message":
@@ -3481,14 +4279,26 @@ class ToolExecutor:
                 if observation.stage in {"chat", "writing"}:
                     input_node = self._find_input(observation)
                     input_text = input_node.text.strip() if input_node is not None else ""
-                    if not input_text:
+                    variant = getattr(self, "prompt_variant", None)
+                    if observation.stage == "writing" or variant:
+                        if input_text != self._fixed_prompt().strip():
+                            return self._result(
+                                False,
+                                "当前输入框内容与本轮固定测试文本不一致，已拒绝提交",
+                                stage=observation.stage,
+                            )
+                    elif not input_text:
                         return self._result(False, "输入框为空，必须先调用 input_test_prompt")
                 button = self._find_send(observation)
                 if button is None:
-                    input_node = self._find_input(observation)
                     if observation.stage == "writing":
-                        fallback_y = 754
-                    elif input_node is not None:
+                        return self._result(
+                            False,
+                            "写作表单中未找到相对输入框定位的提交控件，未执行点击",
+                            stage=observation.stage,
+                        )
+                    input_node = self._find_input(observation)
+                    if input_node is not None:
                         # 输入框通常延伸到屏幕底部；发送箭头位于其右下角，而不是输入框中心。
                         fallback_y = min(
                             self.height - 45,
@@ -3499,6 +4309,32 @@ class ToolExecutor:
                     self._tap_point(self.width - 60, fallback_y)
                 else:
                     self._tap_node(button)
+                if observation.stage == "writing":
+                    after = self.observe()
+                    variant = getattr(self, "prompt_variant", None)
+                    for _ in range(WRITING_SUBMIT_VERIFY_ATTEMPTS):
+                        marker_visible = not variant or any(
+                            variant in node.text for node in after.nodes
+                        )
+                        if after.stage == "chat" and marker_visible:
+                            break
+                        time.sleep(WRITING_SUBMIT_VERIFY_INTERVAL)
+                        after = self.observe()
+                    marker_visible = not variant or any(
+                        variant in node.text for node in after.nodes
+                    )
+                    if after.stage != "chat" or not marker_visible:
+                        return self._result(
+                            False,
+                            "写作表单提交后未观察到本轮消息进入会话，未标记为已发送",
+                            stage=after.stage,
+                        )
+                    self.pending_generation = True
+                    return self._result(
+                        True,
+                        "已确认本轮写作消息进入会话，下一步必须调用 wait_5s",
+                        stage=after.stage,
+                    )
                 self.pending_generation = True
                 return self._result(True, "已发送，下一步必须调用 wait_5s", stage=self.observe().stage)
             if name == "wait_5s":
@@ -3602,9 +4438,10 @@ class ToolExecutor:
                     return self._result(False, "尚未发现绑定账号使用成功的页面证据", stage=after.stage)
                 self._write_state("used")
                 return self._result(True, "已确认卡片对绑定账号使用成功", stage=after.stage)
-            if name == "return_to_ours":
+            if name == "return_to_home":
                 after = self._go_to_ours()
-                return self._result(True, "已返回“我们”页面", stage=after.stage)
+                destination = "新版聊天首页" if after.stage == "chat" else "旧版“我们”页面"
+                return self._result(True, f"已返回元宝{destination}", stage=after.stage)
             if name == "report_tasks":
                 return self._result(True, "已记录模型观察到的任务进度")
             if name == "complete_task":
@@ -3624,8 +4461,64 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "open_welfare",
-            "description": "自动回到元宝的“我们”页并打开福利中心。",
+            "description": "优先通过新版聊天页左上角抽屉打开“福利中心”；旧版设备兼容“我们”页入口。",
             "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "open_daily_ability",
+            "description": (
+                "能力站主轮播卡的内容和颜色每天会变化。若最新截图确认主卡固定位置显示"
+                "‘去体验’，将 button_visible 设为 true；执行器只点击主卡固定按钮位置并把体验页交给模型。"
+                "顶部横幅里的同名按钮不算；未确认可见时设为 false。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "button_visible": {"type": "boolean"},
+                },
+                "required": ["button_visible"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "continue_daily_ability",
+            "description": (
+                "仅当最新截图已经显示能力卡打开的体验浮层或体验页面时调用；将当前页面交给模型继续处理，"
+                "不会点击卡片。主福利页仍显示普通卡片时不要调用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"experience_visible": {"type": "boolean"}},
+                "required": ["experience_visible"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "verify_daily_ability",
+            "description": (
+                "完成体验并返回福利中心后，读取主轮播卡固定位置的按钮状态，不需要识别标题或颜色。"
+                "只有截图明确显示‘已完成’才报告完成；仍显示‘去体验’不得当作完成。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "card_status": {
+                        "type": "string",
+                        "enum": ["已完成", "去体验", "未显示"],
+                    },
+                },
+                "required": ["card_status"],
+                "additionalProperties": False,
+            },
         },
     },
     {
@@ -3633,8 +4526,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "function": {
             "name": "report_tasks",
             "description": (
-                "只读报告福利中心截图中当前任务目录和进度。available_tasks 必须列出"
-                "本轮页面实际提供的任务；页面改版移除的旧任务不要填入该数组。"
+                "只读报告福利中心最新截图中的每日任务目录和实际计数。报告阶段的恢复进度可能过期，"
+                "必须逐项读取当前页面，不得复制上下文或历史中的数字。2.88.0 新版目录固定为写作、"
+                "拍题、P图三项；若福利页出现‘做同款’任务并明确显示已完成 x/3，须一并纳入；"
+                "没有进度的推荐模板和邀请新用户不属于每日任务。"
+                "只有在编排器已滚动到每日任务区域后，才能按当前截图报告进度。"
             ),
             "parameters": {
                 "type": "object",
@@ -3644,7 +4540,6 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                         "items": {"type": "string", "enum": list(TASK_ORDER)},
                         "uniqueItems": True,
                     },
-                    "daily_done": {"type": "boolean"},
                     "question": {"type": "integer", "minimum": 0, "maximum": 3},
                     "writing": {"type": "integer", "minimum": 0, "maximum": 3},
                     "image": {"type": "integer", "minimum": 0, "maximum": 3},
@@ -3653,7 +4548,6 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 },
                 "required": [
                     "available_tasks",
-                    "daily_done",
                     "question",
                     "writing",
                     "image",
@@ -3673,6 +4567,23 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "type": "object",
                 "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}},
                 "required": ["x", "y"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "long_press",
+            "description": "按住当前截图中可见的控件一段时间后释放。用于页面明确要求‘按住’的操作，如语音录制。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "x": {"type": "integer"},
+                    "y": {"type": "integer"},
+                    "duration_ms": {"type": "integer", "minimum": 600, "maximum": 10000},
+                },
+                "required": ["x", "y", "duration_ms"],
                 "additionalProperties": False,
             },
         },
@@ -3732,7 +4643,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "select_local_image",
-            "description": "选择程序准备好的本地脱敏测试图片；P 图和拍题都用这个工具。",
+            "description": (
+                "选择程序准备好的本地脱敏测试图片。P图聊天页点击输入框左侧‘拍照’，"
+                "相机页再点击语义按钮‘相册入口’；只有进入‘本地相册’并点中"
+                "auto-daily-test.png 才算成功，不得使用固定屏幕坐标猜入口。"
+            ),
             "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
         },
     },
@@ -3832,8 +4747,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "return_to_ours",
-            "description": "兑换和使用成功后回到元宝“我们”页面。",
+            "name": "return_to_home",
+            "description": "完成兑换处理后回到元宝首页；新版聊天首页和旧版“我们”页均有效。",
             "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
         },
     },
@@ -4013,45 +4928,54 @@ class VisionModel:
             *self.history,
             user_message,
         ]
-        response = self._with_retries(
-            lambda: self._request(
-                messages,
-                forced_tool=forced_tool,
-                allowed_tools=allowed_tools,
-            ),
-            "视觉模型调用",
-        )
-        message = response.choices[0].message
-        tool_calls = getattr(message, "tool_calls", None) or []
-        if len(tool_calls) > 1:
-            raise AgentError("模型一次返回了多个工具调用，已拒绝以保持单步状态可验证")
-        if tool_calls:
-            call = tool_calls[0]
+        for repair_attempt in range(TOOL_ARGUMENT_REPAIR_ATTEMPTS + 1):
+            response = self._with_retries(
+                lambda: self._request(
+                    messages,
+                    forced_tool=forced_tool,
+                    allowed_tools=allowed_tools,
+                ),
+                "视觉模型调用",
+            )
+            message = response.choices[0].message
+            tool_calls = getattr(message, "tool_calls", None) or []
+            if len(tool_calls) > 1:
+                raise AgentError("模型一次返回了多个工具调用，已拒绝以保持单步状态可验证")
             try:
-                args = json.loads(call.function.arguments or "{}")
-            except json.JSONDecodeError as exc:
-                raise AgentError("模型工具参数不是有效 JSON") from exc
-            if not isinstance(args, dict):
-                raise AgentError("模型工具参数必须是 JSON 对象")
-            args = normalize_tool_arguments(call.function.name, args)
+                if tool_calls:
+                    call = tool_calls[0]
+                    name = call.function.name
+                    args = json.loads(call.function.arguments or "{}")
+                    if not isinstance(args, dict):
+                        raise AgentError("模型工具参数必须是 JSON 对象")
+                    call_id = call.id
+                else:
+                    name, args = self._parse_json_tool(message.content or "")
+                    call_id = "fallback-current"
+                args = normalize_tool_arguments(name, args)
+            except (AgentError, json.JSONDecodeError, TypeError, ValueError) as exc:
+                if repair_attempt >= TOOL_ARGUMENT_REPAIR_ATTEMPTS:
+                    raise AgentError("模型连续返回无效工具参数，未执行本轮动作") from exc
+                print("模型工具参数无效，已要求按当前工具 JSON Schema 重试一次")
+                messages = [
+                    *messages,
+                    {
+                        "role": "user",
+                        "content": (
+                            "上一次返回的工具参数无效，尚未执行任何操作。请根据当前可用工具的 JSON Schema，"
+                            "重新观察当前页面，只返回一个工具调用及合法的 JSON 对象参数。"
+                        ),
+                    },
+                ]
+                continue
             self._pending_turn = {
                 "context": context,
                 "observation": observation,
-                "name": call.function.name,
+                "name": name,
                 "args": args,
             }
-            return call.function.name, args, call.id
-        content = message.content or ""
-        action = self._parse_json_tool(content)
-        action = (action[0], normalize_tool_arguments(action[0], action[1]))
-        call_id = "fallback-current"
-        self._pending_turn = {
-            "context": context,
-            "observation": observation,
-            "name": action[0],
-            "args": action[1],
-        }
-        return action[0], action[1], call_id
+            return name, args, call_id
+        raise AgentError("模型没有返回可执行的工具调用")
 
     @staticmethod
     def _parse_json_tool(content: str) -> tuple[str, dict[str, Any]]:
@@ -4144,7 +5068,13 @@ class VisionModel:
 class Workflow:
     config: Config
     executor: ToolExecutor
-    daily_done: bool | None = None
+    daily_ability_done: bool = False
+    daily_ability_evidence: str | None = None
+    daily_ability_click_attempts: int = 0
+    daily_ability_button_checks: int = 0
+    daily_ability_verification_checks: int = 0
+    daily_ability_experience_opened: bool = False
+    daily_ability_voice_submitted: bool = False
     progress: dict[str, int | None] = field(default_factory=lambda: {key: None for key in TASK_ORDER})
     phase: str = "navigate_welfare"
     target: str | None = None
@@ -4175,16 +5105,70 @@ class Workflow:
     recover_attempts: int = 0
 
     def restore_state(self) -> None:
-        """恢复当天已确认的进度；旧日期只保留兑换状态的清理语义。"""
+        """恢复新版当天进度；旧流程计数归档，不带入新任务目录。"""
         self.state_restored = False
         self.terminal_restore = False
+        self.daily_ability_done = False
+        self.daily_ability_evidence = None
+        self.daily_ability_click_attempts = 0
+        self.daily_ability_button_checks = 0
+        self.daily_ability_verification_checks = 0
+        self.daily_ability_experience_opened = False
+        self.daily_ability_voice_submitted = False
+        self.progress = {key: None for key in TASK_ORDER}
+        self.skipped_tasks.clear()
         today = datetime.now(ZoneInfo(self.config.timezone_name)).date().isoformat()
         state = read_daily_state(self.config.state_path)
         if state.get("date") != today:
             return
-        saved_daily_done = state.get("daily_done")
-        if isinstance(saved_daily_done, bool):
-            self.daily_done = saved_daily_done
+        if (
+            state.get("task_schema") != TASK_STATE_SCHEMA
+            or state.get("daily_task_mode") != DAILY_TASK_MODE_ABILITY_STATION
+        ):
+            legacy_fields = {
+                key: state[key]
+                for key in (
+                    "task_schema",
+                    "daily_task_mode",
+                    "daily_done",
+                    "task_progress",
+                    "skipped_tasks",
+                )
+                if key in state
+            }
+            if legacy_fields:
+                state["legacy_task_state"] = legacy_fields
+            state.pop("daily_done", None)
+            state.update(
+                {
+                    "task_schema": TASK_STATE_SCHEMA,
+                    "daily_task_mode": DAILY_TASK_MODE_ABILITY_STATION,
+                    "daily_ability_done": False,
+                    "task_progress": {},
+                    "skipped_tasks": [],
+                }
+            )
+            write_daily_state(self.config.state_path, state)
+            return
+        saved_ability_done = state.get("daily_ability_done")
+        saved_ability_evidence = state.get("daily_ability_evidence")
+        saved_ability_rule_version = state.get("daily_ability_rule_version")
+        if isinstance(saved_ability_done, bool):
+            evidence_valid = (
+                saved_ability_done is not True
+                or (
+                    saved_ability_evidence == DAILY_ABILITY_RULE_NAME
+                    and saved_ability_rule_version == DAILY_ABILITY_RULE_VERSION
+                )
+            )
+            self.daily_ability_done = saved_ability_done and evidence_valid
+            if self.daily_ability_done:
+                self.daily_ability_evidence = saved_ability_evidence
+            elif saved_ability_done:
+                print(
+                    "同日能力站完成状态缺少主轮播卡完成证据，"
+                    "本轮将重新点击“去体验”"
+                )
             self.state_restored = True
         saved = state.get("task_progress")
         if not isinstance(saved, dict):
@@ -4199,12 +5183,23 @@ class Workflow:
             self.skipped_tasks = {
                 value for value in skipped if isinstance(value, str) and value in TASK_ORDER
             }
+        if self.config.force_all_daily_tasks:
+            # 强制任务模式不接受历史跳过名单；失败只能保留未完成进度并重新定位。
+            self.skipped_tasks.clear()
+        if "same_template" in self.skipped_tasks:
+            # 旧版把做同款推荐卡固定排除；重新读取新版福利页前先作废该跳过结果。
+            self.skipped_tasks.discard("same_template")
+            self.progress["same_template"] = 0
         # 兑换已经完成或明确因积分不足跳过时，重启只需回到“我们”页收尾。
         # 不再重新打开兑换商城，避免重复扫描商品和无意义的页面竞态。
         if (
-            self.daily_done is True
+            self.daily_ability_done is True
             and all(
-                key in self.skipped_tasks or self.progress.get(key) == 3
+                (
+                    self.progress.get(key) == 3
+                    if self.config.force_all_daily_tasks
+                    else key in self.skipped_tasks or self.progress.get(key) == 3
+                )
                 for key in TASK_ORDER
             )
             and state.get("card") == self.config.card_name
@@ -4225,7 +5220,16 @@ class Workflow:
         state.update(
             {
                 "date": today,
-                "daily_done": self.daily_done is True,
+                "task_schema": TASK_STATE_SCHEMA,
+                "daily_task_mode": DAILY_TASK_MODE_ABILITY_STATION,
+                "daily_ability_done": self.daily_ability_done is True,
+                "daily_ability_rule_version": (
+                    DAILY_ABILITY_RULE_VERSION
+                    if self.daily_ability_done
+                    and self.daily_ability_evidence == DAILY_ABILITY_RULE_NAME
+                    else None
+                ),
+                "daily_ability_evidence": self.daily_ability_evidence,
                 "task_progress": {
                     key: self.progress.get(key) for key in TASK_ORDER
                 },
@@ -4234,12 +5238,20 @@ class Workflow:
         )
         write_daily_state(self.config.state_path, state)
 
-    def _merge_progress(self, daily_done: bool, values: dict[str, int]) -> None:
-        """同一天的进度只允许单调增加，抵抗 WebView/视觉模型瞬时误读。"""
-        self.daily_done = bool(self.daily_done is True or daily_done)
+    def _merge_progress(
+        self, values: dict[str, int], authoritative_keys: set[str] | None = None
+    ) -> None:
+        """普通更新单调增加；首次权威福利页快照可纠正过高的恢复状态。"""
         for key, value in values.items():
             previous = self.progress.get(key)
-            self.progress[key] = max(value, previous if previous is not None else 0)
+            if (
+                authoritative_keys
+                and key in authoritative_keys
+                and not self.config.force_all_daily_tasks
+            ):
+                self.progress[key] = value
+            else:
+                self.progress[key] = max(value, previous if previous is not None else 0)
         self._persist_task_state()
 
     def recovery_hint(self) -> str:
@@ -4261,6 +5273,24 @@ class Workflow:
             and self.substate.get("entry_clicked")
             and not self.substate.get("template_clicked")
         )
+
+    def _welfare_exchange_entry_node(self, observation: Observation) -> Node | None:
+        """识别兑换阶段中仍停留在福利页的“兑换商城”入口。
+
+        福利页和真实商城都可能暴露“兑换商城”文案，不能只按阶段字符串判断。
+        当前无障碍树若没有可见目标商品，则该文案只能作为福利页入口处理；真实
+        商城至少需要在当前视口暴露目标商品，随后才允许进入商品/兑换流程。
+        """
+        if observation.stage not in {"welfare", "exchange"}:
+            return None
+        config = getattr(self.executor, "config", None)
+        card_name = getattr(config, "card_name", DEFAULT_CARD_NAME)
+        if has_visible_exchange_product(observation, card_name):
+            return None
+        node = find_semantic_node(observation.nodes, "兑换商城", exact=True)
+        if node is None:
+            node = find_semantic_node(observation.nodes, "兑换商城")
+        return node
 
     def semantic_visual_recovery_action(
         self, observation: Observation
@@ -4320,26 +5350,44 @@ class Workflow:
                     # 交给 open_welfare 让执行器按当前层级点击，绕过视觉点击的
                     # 前景遮挡判定，仍然不复用历史坐标。
                     return "open_welfare", {}
-        if self.phase == "open_exchange" and observation.stage == "welfare":
-            node = find_semantic_node(observation.nodes, "兑换商城", exact=True)
-            if node is None:
-                node = find_semantic_node(observation.nodes, "兑换商城")
+        if self.phase == "open_exchange":
+            node = self._welfare_exchange_entry_node(observation)
             if node is not None:
                 bounds = node_interaction_bounds(node)
                 if bounds.area > 0:
-                    print("视觉重规划失败，使用当前观测中的“兑换商城”语义控件")
+                    print("视觉重规划失败，使用当前观测中的福利页“兑换商城”语义入口")
                     return "tap", {"x": bounds.center[0], "y": bounds.center[1]}
         return None
 
     def context(self, observation: Observation) -> str:
-        progress = ", ".join(
-            f"{TASK_LABELS[key]}={self.progress.get(key) if self.progress.get(key) is not None else '?'} / 3"
-            for key in TASK_ORDER
-        )
+        if self.phase == "report":
+            progress = "待从当前福利页重新读取；忽略恢复状态中的旧计数"
+        else:
+            progress = ", ".join(
+                f"{TASK_LABELS[key]}={self.progress.get(key) if self.progress.get(key) is not None else '?'} / 3"
+                for key in TASK_ORDER
+            )
         substate = ", ".join(
             name for name, completed in self.substate.items() if completed
         ) or "无"
         coordinate_hint = ""
+        if self.phase == "daily_ability":
+            coordinate_hint = (
+                "能力卡标题、颜色和具体功能会轮换，不作筛选；只点击‘元宝能力站’主轮播卡固定位置、"
+                "当前显示‘去体验’的按钮，忽略页面顶部轮播里的同名按钮。若当前截图已显示刚打开的体验浮层，"
+                "调用 continue_daily_ability 将其交给模型，不要重复点击卡片。"
+            )
+        elif self.phase == "daily_ability_experience":
+            coordinate_hint = (
+                "刚才已点击主轮播卡‘去体验’。当前能力内容每次可能不同，请只依据最新截图完成页面要求的互动；"
+                "如果浮层遮罩下仍能看到‘去体验’，那是背景按钮，不能重复点击；应点击浮层正面的操作入口。"
+                "完成后返回福利中心。不要再切换或点击福利页的其它卡片。"
+            )
+        elif self.phase == "verify_daily_ability":
+            coordinate_hint = (
+                "只检查元宝能力站主轮播卡固定位置的当前按钮状态，不识别标题或颜色；"
+                "只有最新截图明确显示‘已完成’才算成功。仍显示‘去体验’或只是打开过体验页都不算完成。"
+            )
         if self.phase == "open_target" and self.target in TASK_ENTRY_MARKERS:
             width = getattr(self.executor, "width", 0)
             height = getattr(self.executor, "height", 0)
@@ -4360,33 +5408,115 @@ class Workflow:
                     "不要调用 open_exchange，也不要猜测历史坐标。"
                 )
         return (
-            f"阶段={self.phase}; 当前目标={self.target or '无'}; 今日问元宝已完成={self.daily_done}; "
+            f"阶段={self.phase}; 能力站每日大任务已完成={self.daily_ability_done}; "
+            f"强制执行全部任务={self.config.force_all_daily_tasks}; "
+            f"当前目标={self.target or '无'}; "
             f"任务进度={progress}; 当前子步骤已完成={substate}; "
             f"本轮页面未提供的任务={','.join(sorted(self.skipped_tasks)) or '无'}; "
             f"期望计数={self.expected_count if self.expected_count is not None else '无'}; "
             f"奖励使用证据={self.executor.reward_use_confirmed}; {coordinate_hint}"
         )
 
-    def _sanitize_daily_done_report(
-        self, args: dict[str, Any], observation: Observation
-    ) -> tuple[dict[str, Any], bool]:
-        """过滤福利页顶部签到状态对每日任务完成状态的误报。"""
-        if (
-            self.daily_done is True
-            or args.get("daily_done") is not True
-            or observation.stage != "welfare"
+    @staticmethod
+    def _merge_local_report(
+        args: dict[str, Any], observation: Observation
+    ) -> dict[str, Any]:
+        """以福利页当前任务计数校准视觉报告。"""
+        new_welfare_page = is_new_welfare_page(observation)
+        local_report = merge_supplemental_task_progress(
+            observation, parse_local_welfare_progress(observation)
+        )
+        if local_report is None:
+            if new_welfare_page:
+                # 空树时保留新版固定三项；模型只有在当前截图确有进度时才能
+                # 另外报告做同款，不能仅凭推荐模板按钮把它加入目录。
+                merged = dict(args)
+                merged["available_tasks"] = list(NEW_WELFARE_DAILY_TASKS)
+                reported_available = args.get("available_tasks")
+                if (
+                    not observation.nodes
+                    and isinstance(reported_available, list)
+                    and "same_template" in reported_available
+                    and isinstance(args.get("same_template"), int)
+                ):
+                    merged["available_tasks"].append("same_template")
+                return merged
+            return args
+        merged = dict(args)
+        local_available = local_report.get("available_tasks")
+        reported_available = merged.get("available_tasks")
+        if new_welfare_page:
+            merged["available_tasks"] = list(NEW_WELFARE_DAILY_TASKS)
+            merged["question"] = 0
+            if isinstance(local_report.get("same_template"), int):
+                merged["available_tasks"].append("same_template")
+                merged["same_template"] = local_report["same_template"]
+            else:
+                merged["same_template"] = 0
+        elif (
+            isinstance(local_available, list)
+            and has_authoritative_local_task_catalog(observation, local_report)
         ):
-            return args, False
-        local_report = parse_local_welfare_progress(observation)
-        if local_report is None or local_report.get("daily_done") is True:
-            return args, False
-        sanitized = dict(args)
-        sanitized["daily_done"] = False
-        return sanitized, True
+            # “趣问元宝”等活动卡不属于每日任务；已锚定任务区时，目录按本地行精确取值。
+            merged["available_tasks"] = list(dict.fromkeys(local_available))
+        elif (
+            isinstance(local_available, list)
+            and isinstance(reported_available, list)
+            and all(value in TASK_ORDER for value in reported_available)
+        ):
+            merged["available_tasks"] = list(
+                dict.fromkeys((*reported_available, *local_available))
+            )
+        elif "available_tasks" not in merged and isinstance(local_available, list):
+            merged["available_tasks"] = local_available
+        if has_complete_new_welfare_task_catalog(observation, local_report):
+            for key in NEW_WELFARE_DAILY_TASKS:
+                merged[key] = local_report[key]
+            if isinstance(local_report.get("same_template"), int):
+                merged["same_template"] = local_report["same_template"]
+        elif not new_welfare_page:
+            for key in TASK_ORDER:
+                value = local_report.get(key)
+                if isinstance(value, int):
+                    merged[key] = value
+        return merged
 
-    def _parse_report(self, args: dict[str, Any]) -> ToolResult:
+    @staticmethod
+    def _parse_daily_ability_verification(
+        args: dict[str, Any], observation: Observation
+    ) -> ToolResult:
+        """只接受当前福利页主轮播卡固定位置的明确完成文案。"""
+        if observation.stage != "welfare":
+            return ToolResult(
+                False,
+                "能力站完成状态核验要求当前停留在福利中心",
+                {"stage": observation.stage},
+            )
+        status = args.get("card_status")
+        if status not in {"已完成", "去体验", "未显示"}:
+            return ToolResult(False, "状态核验必须按当前截图报告卡片状态")
+        if status == "未显示":
+            return ToolResult(
+                True,
+                "主轮播卡按钮状态当前不可见；未写入完成状态，稍后重新核验",
+                {"stage": "welfare", "card_status": status},
+            )
+        if status == "已完成":
+            return ToolResult(
+                True,
+                "当前截图已确认主轮播卡显示‘已完成’",
+                {"stage": "welfare", "card_status": status},
+            )
+        return ToolResult(
+            True,
+            "主轮播卡仍显示‘去体验’，未确认每日大任务完成",
+            {"stage": "welfare", "card_status": status},
+        )
+
+    def _parse_report(
+        self, args: dict[str, Any], observation: Observation | None = None
+    ) -> ToolResult:
         try:
-            daily_done = bool(args.get("daily_done", self.daily_done is True))
             values = {}
             for key in TASK_ORDER:
                 previous = self.progress.get(key)
@@ -4402,30 +5532,71 @@ class Workflow:
                 not isinstance(value, str) or value not in TASK_ORDER for value in available
             ):
                 return ToolResult(False, "available_tasks 必须是任务目录中的字符串数组")
+        if self.config.force_all_daily_tasks:
+            # 视觉报告仍用于读取当前可见进度；任务目录只决定入口可见性，不能
+            # 在强制模式下将趣问元宝或做同款写入 skipped_tasks。
+            available = list(FORCED_DAILY_TASKS)
+            self.skipped_tasks.clear()
+        authoritative_keys: set[str] = set()
+        if observation is not None and self.phase == "report" and observation.stage == "welfare":
+            local_report = merge_supplemental_task_progress(
+                observation, parse_local_welfare_progress(observation)
+            )
+            new_welfare_page = is_new_welfare_page(observation)
+            complete_catalog = has_complete_new_welfare_task_catalog(
+                observation, local_report
+            )
+            empty_catalog_scrolled = (
+                new_welfare_page
+                and not observation.nodes
+                and getattr(self.executor, "_welfare_task_catalog_scrolled", False)
+            )
+            if new_welfare_page and not complete_catalog and not empty_catalog_scrolled:
+                return ToolResult(
+                    False,
+                    "新版每日任务目录尚未完整显示；先滚动到写作、拍题和P图任务及其进度后再报告",
+                    {"stage": "welfare", "visual_replan": True},
+                )
+            if complete_catalog and local_report is not None:
+                authoritative_keys = {
+                    key
+                    for key in NEW_WELFARE_DAILY_TASKS
+                    if isinstance(local_report.get(key), int)
+                }
+                if isinstance(local_report.get("same_template"), int):
+                    authoritative_keys.add("same_template")
+            elif empty_catalog_scrolled:
+                authoritative_keys = set(NEW_WELFARE_DAILY_TASKS)
+                if local_report is not None and isinstance(
+                    local_report.get("same_template"), int
+                ):
+                    authoritative_keys.add("same_template")
+        if available is not None:
             self.skipped_tasks = set(TASK_ORDER) - set(available)
-        # 普通问答和每日问元宝是福利页上的两个独立奖励任务；只有模型报告
-        # 每日任务行已完成，或本地已经确认过该任务，才能合并 daily_done。
-        merged_daily_done = bool(self.daily_done is True or daily_done)
-        merged_values = {
-            key: max(value, self.progress[key] if self.progress[key] is not None else 0)
-            for key, value in values.items()
-        }
+        merged_values = {}
+        for key, value in values.items():
+            if key in authoritative_keys:
+                merged_values[key] = value
+            elif key in self.skipped_tasks:
+                merged_values[key] = self.progress[key] or 0
+            else:
+                merged_values[key] = max(value, self.progress[key] or 0)
         if self.target and self.expected_count is not None and self.target in TASK_LABELS:
             if self.target in self.skipped_tasks:
-                self._merge_progress(merged_daily_done, merged_values)
+                self._merge_progress(merged_values, authoritative_keys)
                 self.stale_reports = 0
                 self._select_next()
                 return ToolResult(True, f"当前页面未提供任务 {TASK_LABELS[self.target]}，已跳过旧入口")
             current = merged_values[self.target]
             if current < self.expected_count:
                 self.stale_reports += 1
-                self._merge_progress(merged_daily_done, merged_values)
+                self._merge_progress(merged_values, authoritative_keys)
                 self.phase = "open_target"
                 return ToolResult(
                     False,
                     f"任务 {TASK_LABELS[self.target]} 当前仍为 {current}/3，必须重新点击入口完成下一次",
                 )
-        self._merge_progress(merged_daily_done, merged_values)
+        self._merge_progress(merged_values, authoritative_keys)
         self.stale_reports = 0
         self._select_next()
         return ToolResult(True, "已更新福利中心任务进度")
@@ -4488,10 +5659,10 @@ class Workflow:
             if callable(write_state):
                 write_state("unavailable")
             self.substate["exchange_reported"] = True
-            self.phase = "return_ours"
+            self.phase = "return_home"
             return ToolResult(
                 True,
-                f"目标商品“{self.config.card_name}”需要 {cost} 积分，当前仅 {points}，跳过兑换并返回“我们”页",
+                f"目标商品“{self.config.card_name}”需要 {cost} 积分，当前仅 {points}，已安全跳过兑换",
                 {
                     "stage": "exchange",
                     "reward_unavailable": True,
@@ -4520,11 +5691,12 @@ class Workflow:
         report = parse_local_welfare_progress(observation)
         if report is None:
             return False
+        report = self._merge_local_report(report, observation)
         visible_count = report.get(self.target)
         if not isinstance(visible_count, int) or visible_count < self.expected_count:
             return False
         target_label = TASK_LABELS[self.target]
-        result = self._parse_report(report)
+        result = self._parse_report(report, observation)
         if result.ok:
             self._prime_entry_point(observation)
             print(f"福利页面已显示 {target_label} 完成，已同步进度并跳过重复点击")
@@ -4540,9 +5712,9 @@ class Workflow:
 
     def _select_next(self) -> None:
         self._clear_recovery("任务推进")
-        if not self.daily_done:
-            self.target = "daily_question"
-            self.phase = "open_target"
+        if not self.daily_ability_done:
+            self.target = None
+            self.phase = "daily_ability"
             self.expected_count = None
             self.substate = {}
             return
@@ -4604,10 +5776,7 @@ class Workflow:
 
     def _advance_after_task(self) -> None:
         """任务生成和奖励处理均成功后本地推进一次，避免重复请求视觉报告。"""
-        completed_target = self.target
-        if self.target == "daily_question":
-            self.daily_done = True
-        elif self.target in TASK_LABELS:
+        if self.target in TASK_LABELS:
             current = self.progress.get(self.target) or 0
             self.progress[self.target] = min(3, current + 1)
         if self.target == "same_template":
@@ -4616,16 +5785,6 @@ class Workflow:
             self.same_template_revealed = False
         self._persist_task_state()
         self._select_next()
-        # 首次“每日问元宝”和后续“问元宝问题”实际使用福利列表同一行。
-        # 从恢复状态继续运行时可能没有新的 report_tasks，下一轮又恰逢 WebView
-        # 空树；沿用刚完成入口的坐标即可避免再次把顶部签到卡交给模型判断。
-        if (
-            completed_target == "daily_question"
-            and self.target == "question"
-            and "daily_question" in self.entry_points
-        ):
-            self.entry_points["question"] = self.entry_points["daily_question"]
-            self.primed_entry_points.add("question")
 
     def _task_kind(self) -> str:
         return self.target or ""
@@ -4656,6 +5815,8 @@ class Workflow:
 
     def can_conclude_target_unavailable(self, observation: Observation) -> bool:
         """确认目录已渲染但当前目标语义不存在，供有界滚动收敛使用。"""
+        if self.config.force_all_daily_tasks:
+            return False
         if self.phase != "open_target" or self.target not in TASK_ENTRY_ROW_MARKERS:
             return False
         if observation.stage != "welfare":
@@ -4683,6 +5844,9 @@ class Workflow:
 
     def skip_unavailable_target(self) -> bool:
         """将已确认从当前任务目录移除的目标记入恢复状态并选择下一阶段。"""
+        if self.config.force_all_daily_tasks:
+            print("强制任务模式：不跳过当前任务，继续交给 VLM 重新定位")
+            return False
         if self.target not in TASK_ORDER:
             return False
         target = self.target
@@ -4710,7 +5874,7 @@ class Workflow:
         """过滤邀请任务和活动页语义，避免把相邻卡片当成当前任务行。"""
         return bool(
             node.enabled
-            and node.bounds.area > 0
+            and node_interaction_bounds(node).area > 0
             and "邀请新用户" not in node.searchable
             and not any(
                 marker in node.searchable.lower() for marker in ACTIVITY_PAGE_MARKERS
@@ -4740,9 +5904,9 @@ class Workflow:
         height = int(getattr(self.executor, "height", 0))
         nodes = [node for node in observation.nodes if self._usable_entry_node(node)]
         if width <= 0:
-            width = max((node.bounds.right for node in nodes), default=0)
+            width = max((node_interaction_bounds(node).right for node in nodes), default=0)
         if height <= 0:
-            height = max((node.bounds.bottom for node in nodes), default=0)
+            height = max((node_interaction_bounds(node).bottom for node in nodes), default=0)
         if width <= 0 or height <= 0:
             return None
         action_markers = TASK_ENTRY_ACTION_MARKERS.get(self.target, ())
@@ -4755,7 +5919,8 @@ class Workflow:
         row_candidates: list[tuple[int, Node]] = []
         max_row_height = 260
         for node in nodes:
-            if node.bounds.height > max_row_height:
+            bounds = node_interaction_bounds(node)
+            if bounds.height > max_row_height:
                 continue
             for marker_index, marker in enumerate(row_markers):
                 if self._matches_entry_marker(node, marker):
@@ -4768,49 +5933,85 @@ class Workflow:
 
         row = min(
             row_candidates,
-            key=lambda item: (item[0], item[1].bounds.top, item[1].bounds.area),
+            key=lambda item: (
+                item[0],
+                node_interaction_bounds(item[1]).top,
+                node_interaction_bounds(item[1]).area,
+            ),
             default=(0, None),
         )[1]
+        # 新版做同款没有独立的“做同款”文字按钮，任务入口就是推荐模板卡片。
+        # 在已有任务行且未暴露行动文案时，优先返回首张可点击卡片中心；否则
+        # 会把模型坐标校正到标题行右侧，连续点击同一个无效位置。
+        if self.target == "same_template" and not actions and row is not None:
+            row_bounds = node_interaction_bounds(row)
+            cards = [
+                node
+                for node in nodes
+                if node.clickable
+                and node.enabled
+                and node.bounds.area >= 30000
+                and node.bounds.top >= row_bounds.bottom
+            ]
+            if cards:
+                card = min(cards, key=lambda node: (node.bounds.top, node.bounds.left))
+                return card.bounds.center[0], card.bounds.center[1], max(90, card.bounds.height // 3)
         action: Node | None = None
         if actions and row is not None:
             nearby = [
                 node
                 for node in actions
                 if node is not row
-                and abs(node.bounds.center[1] - row.bounds.center[1])
-                <= max(180, row.bounds.height + 80)
+                and abs(
+                    node_interaction_bounds(node).center[1]
+                    - node_interaction_bounds(row).center[1]
+                )
+                <= max(180, node_interaction_bounds(row).height + 80)
             ]
             if nearby:
                 action = min(
                     nearby,
                     key=lambda node: (
-                        abs(node.bounds.center[1] - row.bounds.center[1]),
-                        -node.bounds.center[0],
+                        abs(
+                            node_interaction_bounds(node).center[1]
+                            - node_interaction_bounds(row).center[1]
+                        ),
+                        -node_interaction_bounds(node).center[0],
                     ),
                 )
         if action is None and actions and row is None:
             # “去提问”可能同时出现在顶部签到卡和任务列表；没有任务标题时
             # 选择屏幕中更靠下的行动项，避免点击顶部卡片。
-            action = max(actions, key=lambda node: (node.bounds.center[1], node.bounds.center[0]))
+            action = max(
+                actions,
+                key=lambda node: (
+                    node_interaction_bounds(node).center[1],
+                    node_interaction_bounds(node).center[0],
+                ),
+            )
         if action is None and row is None:
             return None
 
         anchor = action or row
         assert anchor is not None
-        x, y = anchor.bounds.center
+        anchor_bounds = node_interaction_bounds(anchor)
+        x, y = anchor_bounds.center
+        action_bounds = node_interaction_bounds(action) if action is not None else None
+        row_bounds = node_interaction_bounds(row) if row is not None else None
         # 只有右侧的小行动节点才直接使用其中心；整行节点的中心通常落在
         # x=450 左右，必须改用右侧行动列。没有行动节点时同样只借用行的 y。
         if (
             action is not None
-            and action.bounds.width <= round(width * 0.35)
-            and action.bounds.center[0] >= round(width * 0.62)
+            and action_bounds is not None
+            and action_bounds.width <= round(width * 0.35)
+            and action_bounds.center[0] >= round(width * 0.62)
         ):
-            x = action.bounds.center[0]
+            x = action_bounds.center[0]
         else:
             x = round(width * TASK_ENTRY_ACTION_X_RATIO)
         anchor_height = max(
-            row.bounds.height if row is not None else 0,
-            action.bounds.height if action is not None else 0,
+            row_bounds.height if row_bounds is not None else 0,
+            action_bounds.height if action_bounds is not None else 0,
         )
         tolerance = max(70, min(180, anchor_height // 2 + 55))
         return x, y, tolerance
@@ -4865,12 +6066,15 @@ class Workflow:
         if width <= 0 or height <= 0:
             return None
         self.entry_scroll_attempts[self.target] = attempts + 1
-        print(f"福利任务行在视口外，向下滚动以显示入口：{self.target}（{attempts + 1}/{TASK_ENTRY_SCROLL_MAX_ATTEMPTS}）")
+        print(f"福利任务行在视口外，滚动以显示入口：{self.target}（{attempts + 1}/{TASK_ENTRY_SCROLL_MAX_ATTEMPTS}）")
+        start_ratio, end_ratio = (
+            (0.38, 0.84) if self.target == "same_template" else (0.84, 0.38)
+        )
         return "swipe", {
             "x1": width // 2,
-            "y1": round(height * 0.84),
+            "y1": round(height * start_ratio),
             "x2": width // 2,
-            "y2": round(height * 0.38),
+            "y2": round(height * end_ratio),
             "duration_ms": 500,
         }
 
@@ -4914,13 +6118,11 @@ class Workflow:
 
     def _correct_exchange_entry_tap(self, args: dict[str, Any], observation: Observation) -> bool:
         """校验兑换入口点击；空 WebView 层级完全交给截图视觉判断。"""
-        if observation.stage != "welfare":
+        if observation.stage not in {"welfare", "exchange"}:
             return False
-        if not observation.nodes:
+        entry = self._welfare_exchange_entry_node(observation)
+        if entry is None and observation.stage == "welfare" and not observation.nodes:
             return True
-        entry = find_semantic_node(observation.nodes, "兑换商城", exact=True)
-        if entry is None:
-            entry = find_semantic_node(observation.nodes, "兑换商城")
         if entry is None:
             return False
         try:
@@ -4980,11 +6182,13 @@ class Workflow:
             self.entry_points.pop("same_template", None)
             width, height = int(self.executor.width), int(self.executor.height)
             if width > 0 and height > 0:
+                # 做同款模板卡位于每日任务列表上方；从下方目录返回时向下滑动手指，
+                # 让上方卡片重新进入视口。
                 return "swipe", {
                     "x1": width // 2,
-                    "y1": round(height * 0.84),
+                    "y1": round(height * 0.38),
                     "x2": width // 2,
-                    "y2": round(height * 0.38),
+                    "y2": round(height * 0.84),
                     "duration_ms": 500,
                 }
         if (
@@ -5091,7 +6295,21 @@ class Workflow:
         # （tap/swipe/press_back/input/... 均可），这正是智能恢复的意义。
         if self.recovering:
             return None
+        if (
+            self.phase == "daily_ability_experience"
+            and getattr(self.executor, "pending_generation", False)
+        ):
+            return "wait_5s"
+        if (
+            self.phase == "daily_ability_experience"
+            and self.daily_ability_voice_submitted
+            and observation.stage in {"chat", "app"}
+        ):
+            return "return_to_welfare"
         fixed_phases = {
+            "daily_ability_wait": "wait_5s",
+            "verify_daily_ability": "verify_daily_ability",
+            "verify_daily_ability_wait": "wait_5s",
             "report": "report_tasks",
             # 报告后目标已经由本地状态确定；只允许模型在最新截图中找入口坐标。
             # 若保留 auto，视觉模型可能沿用上一子任务的 claim_reward，导致连续失败熔断。
@@ -5108,7 +6326,7 @@ class Workflow:
             "prize_records": "open_prize_records",
             "use_reward": "use_bound_reward",
             "use_confirm": "confirm_reward_use",
-            "return_ours": "return_to_ours",
+            "return_home": "return_to_home",
             "complete": "complete_task",
         }
         if self.phase in fixed_phases:
@@ -5147,6 +6365,40 @@ class Workflow:
         count = self.expected_count or 1
         return f"{self.target.replace('_', '-')}-{count}"
 
+    @staticmethod
+    def _daily_ability_voice_press_point(
+        observation: Observation,
+    ) -> tuple[int, int] | None:
+        """定位能力体验聊天页的“按住说话”控件。"""
+        candidates = []
+        for node in observation.nodes:
+            if "按住" not in node.searchable or "说话" not in node.searchable:
+                continue
+            bounds = node.interaction_bounds
+            if node.enabled and bounds.area > 0:
+                candidates.append((bounds.area, bounds.center))
+        return min(candidates, default=(0, None), key=lambda item: item[0])[1]
+
+    def daily_ability_voice_action(
+        self, observation: Observation
+    ) -> tuple[str, dict[str, Any]] | None:
+        """在能力体验明确要求语音输入时返回本地必做的长按动作。"""
+        if (
+            self.phase != "daily_ability_experience"
+            or self.daily_ability_voice_submitted
+            or getattr(self.executor, "pending_generation", False)
+        ):
+            return None
+        point = self._daily_ability_voice_press_point(observation)
+        if point is None:
+            return None
+        return "long_press", {
+            "x": point[0],
+            "y": point[1],
+            "duration_ms": 2500,
+            "_daily_ability_voice": True,
+        }
+
     def _valid_phase(self, name: str) -> str | None:
         allowed: dict[str, set[str]] = {
             "navigate_welfare": {
@@ -5158,6 +6410,11 @@ class Workflow:
                 "press_back",
             },
             "report": {"report_tasks"},
+            "daily_ability": DAILY_ABILITY_TOOLS,
+            "daily_ability_experience": DAILY_ABILITY_EXPERIENCE_TOOLS,
+            "daily_ability_wait": {"wait_5s"},
+            "verify_daily_ability": {"verify_daily_ability"},
+            "verify_daily_ability_wait": {"wait_5s"},
             "open_target": {"tap", "swipe", "press_back"},
             "perform": {
                 "tap",
@@ -5183,7 +6440,7 @@ class Workflow:
             "prize_records": {"open_prize_records"},
             "use_reward": {"use_bound_reward"},
             "use_confirm": {"confirm_reward_use"},
-            "return_ours": {"return_to_ours"},
+            "return_home": {"return_to_home"},
             "complete": {"complete_task"},
         }
         if name not in allowed.get(self.phase, set()):
@@ -5288,8 +6545,11 @@ class Workflow:
         return card.bounds.center
 
     def _complete_task_assertions(self) -> ToolResult:
-        if self.daily_done is not True:
-            return ToolResult(False, "每日问元宝尚未确认完成")
+        if (
+            self.daily_ability_done is not True
+            or self.daily_ability_evidence != DAILY_ABILITY_RULE_NAME
+        ):
+            return ToolResult(False, "主轮播卡尚未由页面状态确认‘已完成’")
         incomplete = [
             TASK_LABELS[key]
             for key in TASK_ORDER
@@ -5301,10 +6561,10 @@ class Workflow:
         if not self.executor.reward_use_confirmed and not reward_unavailable:
             return ToolResult(False, "尚未确认 QQ 超级会员卡已对绑定账号使用成功")
         if self.phase != "complete":
-            return ToolResult(False, "尚未回到“我们”页面")
+            return ToolResult(False, "尚未完成元宝首页收尾导航")
         self.finished = True
         if reward_unavailable:
-            return ToolResult(True, "每日任务已完成；QQ超级会员3天卡积分不足，已返回“我们”页面")
+            return ToolResult(True, "每日任务已完成；QQ超级会员3天卡积分不足，已安全跳过兑换")
         return ToolResult(True, "每日任务与奖品使用均已完成，本轮进入下一次等待")
 
     def _target_entry_ready(self, result: ToolResult) -> bool:
@@ -5356,7 +6616,8 @@ class Workflow:
         ):
             return ToolResult(
                 False,
-                "视觉导航尚未进入福利中心；请根据最新截图重新定位，必要时先点击底部“我们”再找福利入口",
+                "视觉导航尚未进入福利中心；请根据最新截图优先打开左上角抽屉并点击“福利中心”，"
+                "仅当没有抽屉入口时才尝试旧版“我们”页路径",
                 {"stage": result.data.get("stage", ""), "visual_replan": True},
             )
         if self.phase == "open_target" and name in {"tap", "press_back"}:
@@ -5378,18 +6639,99 @@ class Workflow:
             self.substate = {}
             if self.target == "same_template" and name == "tap":
                 self.substate["entry_clicked"] = True
+                activity = str(result.data.get("activity", "")).lower()
+                if "aitemplatedetailactivity" in activity:
+                    # 入口卡片直接打开模板详情时，模板已经被选中，下一步应发送。
+                    self.substate["template_clicked"] = True
             return result
         # 只缓存已经由执行器接受的点击；随后阶段会改变，因此必须在状态转移前记录。
         self._remember_entry_point(name, args)
         if self.phase == "navigate_welfare" and (
             name == "open_welfare" or result.data.get("stage") == "welfare"
         ):
-            self.phase = "report"
-            if self.state_restored:
-                if self.terminal_restore:
-                    self.phase = "return_ours"
-                # 恢复状态只能提供已完成进度，不能替代当前页面目录；启动视觉
-                # 导航可能经历改版、任务移除或页面滚动，必须再次交给 VLMM 报告。
+            if self.terminal_restore:
+                self.phase = "return_home"
+            elif self.daily_ability_done:
+                self.phase = "report"
+            else:
+                self.phase = "daily_ability"
+            # 恢复状态只能提供已完成进度，不能替代当前页面目录；启动视觉
+            # 导航可能经历改版、任务移除或页面滚动，必须再次报告当前目录。
+        elif self.phase == "daily_ability" and name in {
+            "open_daily_ability",
+            "continue_daily_ability",
+        }:
+            if (
+                name == "open_daily_ability"
+                and result.data.get("ability_card_visible") is False
+            ):
+                self.daily_ability_button_checks += 1
+                if self.daily_ability_button_checks > DAILY_ABILITY_BUTTON_CHECK_LIMIT:
+                    return ToolResult(
+                        False,
+                        "多次检查仍未确认主轮播卡‘去体验’按钮，未点击其它卡片",
+                        {"stage": result.data.get("stage", ""), "visual_replan": True},
+                    )
+                self.phase = "daily_ability_wait"
+                return result
+            if result.data.get("ability_station_clicked") is not True:
+                return ToolResult(
+                    False,
+                    "主轮播卡‘去体验’没有得到点击证据",
+                    {"stage": result.data.get("stage", ""), "visual_replan": True},
+                )
+            self.daily_ability_click_attempts += 1
+            self.daily_ability_button_checks = 0
+            self.daily_ability_verification_checks = 0
+            # 主卡点击证据成立后，体验可能仍在同一福利 WebView 的浮层中；先
+            # 记录“体验已启动”，但完成状态仍必须等返回后的主卡“已完成”证据。
+            self.daily_ability_experience_opened = name == "open_daily_ability" or (
+                result.data.get("stage") != "welfare"
+            )
+            self.daily_ability_voice_submitted = False
+            self.phase = "daily_ability_experience"
+        elif self.phase == "verify_daily_ability" and name == "verify_daily_ability":
+            card_status = result.data.get("card_status")
+            if card_status == "已完成":
+                self.daily_ability_done = True
+                self.daily_ability_evidence = DAILY_ABILITY_RULE_NAME
+                self._persist_task_state()
+                self.phase = "report"
+            elif card_status == "去体验":
+                return ToolResult(
+                    False,
+                    "模型处理体验页面后主轮播卡仍显示‘去体验’，未将大任务记为完成",
+                    {"stage": "welfare", "visual_replan": True},
+                )
+            else:
+                self.daily_ability_verification_checks += 1
+                if self.daily_ability_verification_checks > DAILY_ABILITY_VERIFY_CHECK_LIMIT:
+                    return ToolResult(
+                        False,
+                        "未能读取主轮播卡状态并核验‘已完成’，未写入完成状态",
+                        {"stage": "welfare", "visual_replan": True},
+                    )
+                self.phase = "verify_daily_ability_wait"
+        elif self.phase == "daily_ability_experience":
+            if name == "long_press" and args.get("_daily_ability_voice") is True:
+                self.daily_ability_voice_submitted = True
+            evidence = result.data.get("entry_evidence")
+            experience_visible = isinstance(evidence, dict) and evidence.get(
+                "daily_ability_experience"
+            ) is True
+            experience_visible = experience_visible or result.data.get(
+                "daily_ability_experience"
+            ) is True
+            if getattr(self.executor, "pending_generation", False):
+                self.daily_ability_experience_opened = True
+            elif result.data.get("stage") != "welfare" or experience_visible:
+                self.daily_ability_experience_opened = True
+            elif self.daily_ability_experience_opened or name == "press_back":
+                self.phase = "verify_daily_ability"
+        elif self.phase == "daily_ability_wait" and name == "wait_5s":
+            self.phase = "daily_ability"
+        elif self.phase == "verify_daily_ability_wait" and name == "wait_5s":
+            self.phase = "verify_daily_ability"
         elif self.phase == "perform":
             if name == "input_test_prompt":
                 self.substate["input"] = True
@@ -5436,7 +6778,7 @@ class Workflow:
                 or result.data.get("reward_unavailable")
                 or getattr(self.executor, "reward_unavailable", False)
             ):
-                self.phase = "return_ours"
+                self.phase = "return_home"
             elif result.data.get("prize_records_opened") is False:
                 self.phase = "prize_records"
             else:
@@ -5449,27 +6791,114 @@ class Workflow:
             self.phase = "use_confirm"
         elif self.phase == "use_confirm" and name == "confirm_reward_use":
             if self.executor.reward_use_confirmed:
-                self.phase = "return_ours"
-        elif self.phase == "return_ours" and name == "return_to_ours":
+                self.phase = "return_home"
+        elif self.phase == "return_home" and name == "return_to_home":
             self.phase = "complete"
         return result
 
+    def _execute_observed(
+        self, name: str, args: dict[str, Any], observation: Observation
+    ) -> ToolResult:
+        """对需要严格对应当前截图的动作，复用模型本轮看到的同一份观测。"""
+        if name == "open_daily_ability":
+            opener = getattr(self.executor, "_open_daily_ability", None)
+            if callable(opener):
+                return opener(args, observation)
+        if name == "continue_daily_ability":
+            return self._continue_daily_ability(args, observation)
+        return self.executor.execute(name, args)
+
+    @staticmethod
+    def _continue_daily_ability(
+        args: dict[str, Any], observation: Observation
+    ) -> ToolResult:
+        """接管当前已打开的能力浮层，不重复点击福利卡片。"""
+        if observation.stage != "welfare":
+            return ToolResult(False, "已打开体验页面的恢复入口仅适用于福利 WebView")
+        if args.get("experience_visible") is not True:
+            return ToolResult(False, "只有最新截图明确显示体验浮层时才能继续接管")
+        return ToolResult(
+            True,
+            "当前截图显示能力体验已经打开，已交给视觉模型继续处理",
+            {
+                "stage": observation.stage,
+                "ability_station_clicked": True,
+                "ability_station_evidence": "existing_experience_detected",
+            },
+        )
+
+    def _correct_daily_ability_experience_tap(
+        self, args: dict[str, Any], observation: Observation
+    ) -> tuple[int, int] | None:
+        """把接近浮层行动按钮的视觉点校正到本轮无障碍边界。"""
+        try:
+            x, y = int(args["x"]), int(args["y"])
+            width, height = int(self.executor.width), int(self.executor.height)
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return None
+        if width <= 0 or height <= 0:
+            return None
+        candidates = []
+        for node in observation.nodes:
+            bounds = node.bounds if node.bounds.area > 0 else node.parent_bounds
+            searchable = node.searchable
+            if (
+                not node.enabled
+                or bounds.area <= 0
+                or not any(marker in searchable for marker in DAILY_ABILITY_EXPERIENCE_ACTION_MARKERS)
+            ):
+                continue
+            center_x, center_y = bounds.center
+            max_distance = max(120, round(height * 0.10))
+            if (
+                bounds.left - 65 <= x <= bounds.right + 65
+                and abs(y - center_y) <= max_distance
+            ):
+                candidates.append(
+                    ((x - center_x) ** 2 + (y - center_y) ** 2, (center_x, center_y))
+                )
+        return min(candidates, default=(0, None), key=lambda item: item[0])[1]
+
     def dispatch(self, name: str, args: dict[str, Any], observation: Observation) -> ToolResult:
+        if (
+            self.phase in {"report", "open_target", "open_exchange"}
+            and observation.stage == "welfare"
+        ):
+            dismiss_reward = getattr(self.executor, "_dismiss_reward_popup", None)
+            if callable(dismiss_reward) and dismiss_reward(observation):
+                return ToolResult(
+                    True,
+                    "已收下延迟出现的任务奖励；本次业务动作未执行，请根据最新页面继续",
+                    {"stage": "welfare", "reward_dismissed": True},
+                )
+        # 卡住恢复期间必须先允许模型处理遮挡层、返回键或重新定位；如果先套用
+        # 正常阶段白名单，verify_daily_ability 会把恢复动作直接拦截，恢复机制
+        # 实际上无法工作。
+        if not self.recovering and self.phase == "daily_ability":
+            if name not in DAILY_ABILITY_TOOLS:
+                return ToolResult(False, "当前阶段只允许点击主轮播卡固定位置的‘去体验’")
+        elif (
+            not self.recovering
+            and self.phase == "verify_daily_ability"
+            and name != "verify_daily_ability"
+        ):
+            return ToolResult(False, "体验页面处理后必须先核验主轮播卡是否显示‘已完成’")
         # 卡住恢复期间 VLM 自由决策：跳过阶段白名单（恢复动作本就是打破常规的
         # 关弹窗/返回/重定位），只保留真正危险动作的人工确认逻辑。成败由外层
         # failures 计数判定，成功则退出恢复态回到正常流程。
         if self.recovering:
             if name == "report_tasks":
-                report_args, corrected = self._sanitize_daily_done_report(args, observation)
-                result = self._parse_report(report_args)
-                if corrected and result.ok:
-                    result.message += "；已忽略非每日任务行的‘今日已完成’状态"
+                result = self._parse_report(
+                    self._merge_local_report(args, observation), observation
+                )
+            elif name == "verify_daily_ability":
+                result = self._parse_daily_ability_verification(args, observation)
             elif name == "report_exchange":
                 result = self._parse_exchange_report(args, observation)
             elif name == "complete_task":
                 result = self._complete_task_assertions()
             else:
-                result = self.executor.execute(name, args)
+                result = self._execute_observed(name, args, observation)
             if not result.ok:
                 return result
             if (
@@ -5549,11 +6978,41 @@ class Workflow:
         phase_error = self._valid_phase(name)
         if phase_error:
             return ToolResult(False, phase_error)
+        if name == "continue_daily_ability":
+            result = self._continue_daily_ability(args, observation)
+            if not result.ok:
+                return result
+            return self._after_successful_action(name, args, result)
+        if (
+            self.phase == "daily_ability_experience"
+            and name == "tap"
+            and observation.stage == "welfare"
+            and self._tap_hits_label(args, observation, "去体验")
+        ):
+            return ToolResult(
+                False,
+                "主卡‘去体验’已经点击；当前浮层仍覆盖它，请点击浮层自身的体验入口，不要重复点击背景卡片",
+                {"stage": observation.stage, "visual_replan": True},
+            )
+        if self.phase == "daily_ability_experience" and name == "tap":
+            corrected = self._correct_daily_ability_experience_tap(args, observation)
+            if corrected is not None and corrected != (args.get("x"), args.get("y")):
+                args.update({"x": corrected[0], "y": corrected[1]})
+                print("体验入口坐标按当前无障碍按钮边界校正")
+            prepare = getattr(
+                self.executor, "prepare_daily_ability_experience_navigation", None
+            )
+            if callable(prepare):
+                prepare()
         # 入口点击已确认打开福利活动页（站内活动 WebView）：这是已知误触，
         # 直接关回任务列表并作废当前入口，让视觉模型重新定位真正的入口。
         # 同一 phase/progress 下的重复短路仍会触发全局 stuck 保护并计入有界失败，
         # 不会无限循环；关不回时返回阶段信息，便于外层重试或上报。
-        if observation.stage == "activity" and name in {"tap", "swipe", "press_back", "input_test_prompt"}:
+        if (
+            observation.stage == "activity"
+            and self.phase != "daily_ability_experience"
+            and name in {"tap", "swipe", "press_back", "input_test_prompt"}
+        ):
             after = self.executor._close_activity_page(observation)
             self.fixed_entry_disabled.add(self.target or "")
             self.entry_points.pop(self.target or "", None)
@@ -5594,6 +7053,19 @@ class Workflow:
         if name == "tap" and self.target == "same_template":
             if self.phase == "open_target" and not self._tap_hits_label(
                 args, observation, "做同款", allow_empty_welfare=True
+            ) and not self._tap_matches_task_entry(args, observation):
+                # 新版推荐模板卡片本身就是做同款任务入口，允许按任务行语义
+                # 校正到卡片中心，不要求存在独立“做同款”文字节点。
+                if observation.stage == "welfare" and not observation.nodes:
+                    pass
+                else:
+                    return ToolResult(
+                        False,
+                        "请点击福利中心中“做同款”任务入口或推荐模板卡片",
+                        {"visual_replan": True},
+                    )
+            if self.phase == "open_target" and not self._tap_hits_label(
+                args, observation, "做同款", allow_empty_welfare=True
             ):
                 # WebView 的文字节点和图片节点经常分离，模型坐标可能落在同一
                 # 行的图片上。已有明确“做同款”文字时直接校正到文字中心，避免
@@ -5605,7 +7077,10 @@ class Workflow:
                     args.update(
                         {"x": entry_button.bounds.center[0], "y": entry_button.bounds.center[1]}
                     )
-                elif not (observation.stage == "welfare" and not observation.nodes):
+                elif not (
+                    (observation.stage == "welfare" and not observation.nodes)
+                    or self._tap_matches_task_entry(args, observation)
+                ):
                     return ToolResult(
                         False,
                         "请点击福利中心中“做同款”任务入口"
@@ -5673,20 +7148,24 @@ class Workflow:
                 else:
                     return ToolResult(False, "当前任务尚未发送，必须先调用 send_message")
         if name == "report_tasks":
-            report_args, corrected = self._sanitize_daily_done_report(args, observation)
-            result = self._parse_report(report_args)
-            if corrected and result.ok:
-                result.message += "；已忽略非每日任务行的‘今日已完成’状态"
+            result = self._parse_report(
+                self._merge_local_report(args, observation), observation
+            )
             if result.ok:
                 self._prime_entry_point(observation)
             return result
+        if name == "verify_daily_ability":
+            result = self._parse_daily_ability_verification(args, observation)
+            if not result.ok:
+                return result
+            return self._after_successful_action(name, args, result)
         if name == "complete_task":
             return self._complete_task_assertions()
         if name == "input_test_prompt":
             set_variant = getattr(self.executor, "set_prompt_variant", None)
             if callable(set_variant):
                 set_variant(self._prompt_variant())
-        result = self.executor.execute(name, args)
+        result = self._execute_observed(name, args, observation)
         if (
             self.phase == "return"
             and name in {"tap", "press_back"}
@@ -5764,20 +7243,19 @@ def run_once(config: Config) -> None:
                 # 都可能随 WebView 改版变化，本地不再复用福利入口坐标。
                 startup_observation = executor.observe_startup()
                 if startup_observation.stage == "welfare":
-                    if workflow.state_restored:
-                        if workflow.terminal_restore:
-                            workflow.phase = "return_ours"
-                        else:
-                            # 即使有同日状态，也必须重新读取当前任务目录；页面改版
-                            # 可能移除旧任务，不能直接沿用历史 target。
-                            workflow.phase = "report"
-                    else:
+                    if workflow.terminal_restore:
+                        workflow.phase = "return_home"
+                    elif workflow.daily_ability_done:
+                        # 同日恢复仍重新读取任务目录，页面改版或任务移除不沿用旧 target。
                         workflow.phase = "report"
+                    else:
+                        workflow.phase = "daily_ability"
                     print("步骤 0：已在福利中心，跳过入口点击")
                 else:
                     navigation_observation = startup_observation
                     navigation_replans = 0
                     navigation_replan_reason = ""
+                    local_open_attempted = False
                     for navigation_step in range(1, VISUAL_NAVIGATION_MAX_STEPS + 1):
                         navigation_context = (
                             f"{workflow.context(navigation_observation)}\n"
@@ -5801,6 +7279,12 @@ def run_once(config: Config) -> None:
                             name, args = semantic_action
                             call_id = None
                             action_source = "本地语义"
+                        elif not local_open_attempted:
+                            # 冷启动页面未暴露入口节点时，先复用执行器的语义导航，
+                            # 避免把常规启动流程交给随机性更高的视觉工具参数。
+                            name, args, call_id = "open_welfare", {}, None
+                            action_source = "本地语义"
+                            local_open_attempted = True
                         else:
                             name, args, call_id = model.next_tool(
                                 navigation_observation,
@@ -5878,6 +7362,27 @@ def run_once(config: Config) -> None:
         last_visual_action: str | None = None
         for step in range(1, config.max_steps + 1):
             observation = executor.observe()
+            if workflow.phase == "daily_ability":
+                local_card_status = daily_ability_card_status(observation)
+                if local_card_status == "已完成":
+                    workflow.daily_ability_done = True
+                    workflow.daily_ability_evidence = DAILY_ABILITY_RULE_NAME
+                    workflow._persist_task_state()
+                    workflow.phase = "report"
+                    print("本地已确认主轮播卡固定区域显示‘已完成’，跳过重复体验")
+                    continue
+            if workflow.phase == "daily_ability_experience":
+                if getattr(executor, "pending_generation", False):
+                    workflow.daily_ability_experience_opened = True
+                elif is_daily_ability_experience_visible(observation):
+                    workflow.daily_ability_experience_opened = True
+                elif workflow.daily_ability_experience_opened:
+                    workflow.phase = "verify_daily_ability"
+                    print("体验操作已返回福利中心，进入主轮播卡完成状态核验")
+            if workflow.phase == "report":
+                prepare_report = getattr(executor, "prepare_welfare_task_report", None)
+                if callable(prepare_report):
+                    observation = prepare_report(observation)
             current_state = state_signature(observation.ui, observation.image, observation.activity)
             catalog_signature = workflow.task_catalog_signature(observation)
             phase_key = (workflow.phase, workflow.target)
@@ -5961,8 +7466,9 @@ def run_once(config: Config) -> None:
                         )
                     if workflow.phase == "return":
                         visual_context += (
-                            "当前目标是返回福利中心；顶部链接若未响应，先按截图点击底部“我们”，"
-                            "再从当前页面找到福利中心入口。只有真正进入福利页后才算成功。"
+                            "当前目标是返回福利中心；优先按截图点击左上角抽屉入口，再点侧栏“福利中心”；"
+                            "只有没有抽屉入口时才尝试顶部返回链接或旧版“我们”入口。"
+                            "只有真正进入福利页后才算成功。"
                         )
                     allowed_visual_tools = VISUAL_NAVIGATION_TOOLS
                     if workflow.phase == "open_exchange" and workflow.substate.get("entry_clicked"):
@@ -6000,6 +7506,43 @@ def run_once(config: Config) -> None:
                     name, args = cached_action
                     call_id = None
                     used_cached_action = True
+                elif workflow.phase == "daily_ability" and not workflow.recovering:
+                    ability_context = (
+                        f"{context}\n如果当前是普通福利主页面，只允许调用 open_daily_ability；"
+                        "主轮播卡固定位置明确显示‘去体验’时传 button_visible=true，否则传 false。"
+                        "如果最新截图已显示点击后打开的体验浮层或体验页面，则调用 continue_daily_ability 并传"
+                        " experience_visible=true，把当前页面交给模型处理。不要识别标题/颜色，也不要滑动换卡。"
+                    )
+                    name, args, call_id = model.next_tool(
+                        observation,
+                        ability_context,
+                        allowed_tools=DAILY_ABILITY_TOOLS,
+                    )
+                    used_cached_action = False
+                elif (
+                    workflow.phase == "daily_ability_experience"
+                    and not workflow.recovering
+                    and forced_tool is None
+                ):
+                    experience_context = (
+                        f"{context}\n你接手了主轮播卡当前打开的体验页面。按页面实际要求完成互动，"
+                        "只使用当前截图中可见的控件；如果页面明确要求按住控件（例如语音输入），"
+                        "调用 long_press 并按要求设置时长，然后等待结果。"
+                        "体验可能只是同一福利 WebView 中的浮层（例如出现‘去对话’按钮），此时仍要按截图继续操作，"
+                        "不能因为阶段名称是 welfare 就直接核验或返回。完成后再返回福利中心，不要打开其它福利卡片。"
+                    )
+                    voice_action = workflow.daily_ability_voice_action(observation)
+                    if voice_action is not None:
+                        name, args = voice_action
+                        call_id = None
+                        print("能力体验检测到‘按住说话’，执行本地必做长按")
+                    else:
+                        name, args, call_id = model.next_tool(
+                            observation,
+                            experience_context,
+                            allowed_tools=DAILY_ABILITY_EXPERIENCE_TOOLS,
+                        )
+                    used_cached_action = False
                 elif forced_tool in LOCAL_DETERMINISTIC_TOOLS:
                     # 输入、发送、等待、返回和兑换都有可验证的本地前置/后置条件；
                     # 直接执行可以显著减少重复视觉请求，同时把结果写入同轮历史。
@@ -6010,15 +7553,25 @@ def run_once(config: Config) -> None:
                     # 本地解析器只用于已有任务状态的安全校验，不替代视觉判断。
                     name, args, call_id = model.next_tool(
                         observation,
-                        context,
+                        f"{context}\n本阶段唯一允许调用 {forced_tool}；不得返回滑动、点击或其它工具。",
                         forced_tool=forced_tool,
+                        allowed_tools=frozenset({forced_tool}),
                     )
                     used_cached_action = False
                 else:
+                    forced_context = context
+                    if forced_tool:
+                        forced_context += (
+                            f"\n本阶段唯一允许调用 {forced_tool}；若目标卡或完成状态未显示，"
+                            "仍须使用该工具按 schema 报告未显示，不得改用其它工具。"
+                        )
                     name, args, call_id = model.next_tool(
                         observation,
-                        context,
+                        forced_context,
                         forced_tool=forced_tool,
+                        allowed_tools=(
+                            frozenset({forced_tool}) if forced_tool else None
+                        ),
                     )
                     used_cached_action = False
             except ModelAccessError as exc:

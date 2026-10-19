@@ -628,7 +628,7 @@ class 元宝任务测试(unittest.TestCase):
         executor.observe = Mock(side_effect=[chat, chat, ours, welfare])
         executor._go_to_ours = Mock(return_value=ours)
         with (
-            patch("元宝每日任务.WELFARE_RETURN_LINK_FALLBACK_DELAY", 0),
+            patch("yuanbao_daily.executor.WELFARE_RETURN_LINK_FALLBACK_DELAY", 0),
             patch("元宝每日任务.time.sleep"),
         ):
             result = executor._go_to_welfare()
@@ -824,7 +824,7 @@ class 元宝任务测试(unittest.TestCase):
             activity=lambda: "com.tencent.hunyuan.app.chat/com.tencent.yuanbao.mp.components.websdk.ext.ui.WebBrowserActivity",
             ui_dump=Mock(side_effect=task.AgentError("Android 无障碍树不可用")),
         )
-        with patch("元宝每日任务.print") as output:
+        with patch("yuanbao_daily.executor.print") as output:
             observation = executor.observe()
         self.assertEqual(observation.stage, "welfare")
         self.assertEqual(observation.nodes, ())
@@ -1411,7 +1411,7 @@ class 元宝任务测试(unittest.TestCase):
         device.keep_awake.return_value = "0"
         device.wait_app_ready.side_effect = task.ManualActionRequired("需要人工处理")
         runtime.discover_device.return_value = device
-        with patch("元宝每日任务.WaydroidRuntime", return_value=runtime):
+        with patch("yuanbao_daily.runner.WaydroidRuntime", return_value=runtime):
             with self.assertRaises(task.ManualActionRequired):
                 task.run_once(config)
         device.restore_keep_awake.assert_not_called()
@@ -1567,7 +1567,7 @@ class 元宝任务测试(unittest.TestCase):
         device.keep_awake.return_value = "0"
         runtime.launch_app.side_effect = task.AgentError("首屏加载失败")
         runtime.discover_device.return_value = device
-        with patch("元宝每日任务.WaydroidRuntime", return_value=runtime):
+        with patch("yuanbao_daily.runner.WaydroidRuntime", return_value=runtime):
             with self.assertRaises(task.AgentError):
                 task.run_once(config)
         self.assertEqual(runtime.launch_app.call_count, 2)
@@ -1622,7 +1622,7 @@ class 元宝任务测试(unittest.TestCase):
         )
         completed = SimpleNamespace(returncode=0)
         with (
-            patch("元宝每日任务.subprocess.run", return_value=completed) as run,
+            patch("yuanbao_daily.device.subprocess.run", return_value=completed) as run,
             patch.object(runtime, "_status", side_effect=lambda: next(statuses)),
         ):
             self.assertTrue(runtime.stop())
@@ -4385,7 +4385,7 @@ class 元宝任务测试(unittest.TestCase):
         calls = []
         executor.device = SimpleNamespace(input=lambda *args: calls.append(args))
         observation = task.Observation(b"png", "", "", (), "WebBrowserActivity", "welfare")
-        with patch("元宝每日任务.png_pixel", return_value=(30, 220, 126, 255)):
+        with patch("yuanbao_daily.executor.png_pixel", return_value=(30, 220, 126, 255)):
             with patch("元宝每日任务.time.sleep"):
                 self.assertTrue(executor._dismiss_reward_popup(observation))
         self.assertEqual(calls, [("tap", "450", "976")])
@@ -4408,7 +4408,7 @@ class 元宝任务测试(unittest.TestCase):
             "WebBrowserActivity",
             "welfare",
         )
-        with patch("元宝每日任务.png_pixel", return_value=(0, 253, 131, 255)) as pixel:
+        with patch("yuanbao_daily.executor.png_pixel", return_value=(0, 253, 131, 255)) as pixel:
             with patch("元宝每日任务.time.sleep"):
                 self.assertTrue(executor._dismiss_reward_popup(observation))
 
@@ -4425,7 +4425,7 @@ class 元宝任务测试(unittest.TestCase):
             "com.tencent.hunyuan.app.chat/com.tencent.yuanbao.mp.components.websdk.ext.ui.WebBrowserActivity",
             "app",
         )
-        with patch("元宝每日任务.png_pixel", return_value=(30, 220, 126, 255)):
+        with patch("yuanbao_daily.executor.png_pixel", return_value=(30, 220, 126, 255)):
             with patch("元宝每日任务.time.sleep"):
                 self.assertTrue(executor._dismiss_reward_popup(observation))
         self.assertEqual(calls, [("tap", "450", "976")])
@@ -5514,7 +5514,7 @@ class 元宝任务测试(unittest.TestCase):
                 ]
             )
 
-        with patch("元宝每日任务.OpenAI", return_value=SimpleNamespace()):
+        with patch("yuanbao_daily.vision.OpenAI", return_value=SimpleNamespace()):
             model = task.VisionModel(config)
         model._request = Mock(
             side_effect=[response("{broken", "bad-call"), response('{"x": 10, "y": 20}', "good-call")]
@@ -5533,7 +5533,7 @@ class 元宝任务测试(unittest.TestCase):
 
     def test_视觉模型设置有限请求超时(self):
         fake_client = SimpleNamespace()
-        with patch("元宝每日任务.OpenAI", return_value=fake_client) as openai:
+        with patch("yuanbao_daily.vision.OpenAI", return_value=fake_client) as openai:
             task.VisionModel(self.配置())
         self.assertEqual(openai.call_args.kwargs["timeout"], 180)
 
@@ -5542,7 +5542,7 @@ class 元宝任务测试(unittest.TestCase):
             status_code = 403
 
         config = replace(self.配置(), max_retries=3, retry_cooldown_seconds=0)
-        with patch("元宝每日任务.OpenAI", return_value=SimpleNamespace()):
+        with patch("yuanbao_daily.vision.OpenAI", return_value=SimpleNamespace()):
             model = task.VisionModel(config)
         calls = []
 
@@ -5578,7 +5578,7 @@ class 元宝任务测试(unittest.TestCase):
         fake_client = SimpleNamespace(
             chat=SimpleNamespace(completions=SimpleNamespace(create=recorder))
         )
-        with patch("元宝每日任务.OpenAI", return_value=fake_client):
+        with patch("yuanbao_daily.vision.OpenAI", return_value=fake_client):
             model = task.VisionModel(self.配置())
         observations = [
             task.Observation(
@@ -5675,7 +5675,7 @@ class 元宝任务测试(unittest.TestCase):
         fake_client = SimpleNamespace(
             chat=SimpleNamespace(completions=SimpleNamespace(create=recorder))
         )
-        with patch("元宝每日任务.OpenAI", return_value=fake_client):
+        with patch("yuanbao_daily.vision.OpenAI", return_value=fake_client):
             model = task.VisionModel(self.配置())
         observation = task.Observation(b"png", "", "", (), "Activity", "welfare")
         expected = {
@@ -5736,7 +5736,7 @@ class 元宝任务测试(unittest.TestCase):
         fake_client = SimpleNamespace(
             chat=SimpleNamespace(completions=SimpleNamespace(create=recorder))
         )
-        with patch("元宝每日任务.OpenAI", return_value=fake_client):
+        with patch("yuanbao_daily.vision.OpenAI", return_value=fake_client):
             model = task.VisionModel(self.配置())
         observation = task.Observation(b"png", "", "", (), "Activity", "welfare")
 

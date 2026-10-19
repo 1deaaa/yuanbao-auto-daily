@@ -1,4 +1,7 @@
 """向视觉模型公开的工具声明；工具名与参数是模型与执行层的契约。"""
+
+from __future__ import annotations
+
 from pathlib import Path
 from typing import Any
 

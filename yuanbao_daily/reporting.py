@@ -1,5 +1,7 @@
 """失败报告生成与置顶告警窗口；报告内容需脱敏。"""
-from .constants import DEFAULT_STATE_PATH
+
+from __future__ import annotations
+
 from pathlib import Path
 import contextlib
 import json
@@ -10,6 +12,7 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .constants import DEFAULT_STATE_PATH
 from .config import Config
 from .constants import DEFAULT_TIMEZONE
 from .state import read_daily_state

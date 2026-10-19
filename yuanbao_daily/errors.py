@@ -1,6 +1,8 @@
 """运行期错误类型；区分可重试、需人工处理与模型访问失败。"""
-from typing import Any
 
+from __future__ import annotations
+
+from typing import Any
 
 class AgentError(RuntimeError):
     """代理可以报告给模型、并由外层重试的错误。"""

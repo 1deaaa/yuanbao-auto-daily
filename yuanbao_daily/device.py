@@ -1,4 +1,7 @@
 """ADB 设备通道与 Waydroid 会话生命周期管理。"""
+
+from __future__ import annotations
+
 import contextlib
 from xml.etree import ElementTree as ET
 from pathlib import Path

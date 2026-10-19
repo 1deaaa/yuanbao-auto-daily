@@ -1,15 +1,18 @@
 """视觉模型封装：单工具调用、协议降级与同轮历史维护。"""
+
+from __future__ import annotations
+
 from pathlib import Path
 import base64
 import json
 import time
 from typing import Any, Callable
-
 from openai import (
     APIError,
     BadRequestError,
     OpenAI,
 )
+
 from .config import Config
 from .constants import (
     MAX_HISTORY_RESULT_CHARS,

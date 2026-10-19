@@ -1,7 +1,9 @@
 """不可变数据结构：屏幕节点、观测快照与工具结果。"""
+
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from typing import Any
-
 
 @dataclass(frozen=True)
 class Bounds:

@@ -1,5 +1,7 @@
 """运行入口：装配设备、编排器与模型，并驱动一轮完整任务。"""
-from .device import is_adb_transport_failure
+
+from __future__ import annotations
+
 from pathlib import Path
 import argparse
 import contextlib
@@ -10,6 +12,7 @@ from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from .device import is_adb_transport_failure
 from .config import (
     Config,
     parse_run_time,
@@ -29,6 +32,7 @@ from .constants import (
     VISUAL_NAVIGATION_TOOLS,
     VISUAL_REPLAN_MAX_ATTEMPTS,
 )
+from .executor import ToolExecutor
 from .device import (
     Device,
     WaydroidRuntime,
@@ -40,7 +44,6 @@ from .errors import (
     ModelAccessError,
     RetryLimitExceeded,
 )
-from .executor import ToolExecutor
 from .models import (
     Observation,
     ToolResult,
@@ -54,7 +57,6 @@ from .welfare import (
     daily_ability_card_status,
     is_daily_ability_experience_visible,
 )
-from .workflow import Workflow
 from .ui import (
     action_signature,
     repeated_action_is_stuck,

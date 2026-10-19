@@ -1,4 +1,7 @@
 """无障碍树解析与节点查找；只做结构化读取，不含业务判断。"""
+
+from __future__ import annotations
+
 from pathlib import Path
 import base64
 import hashlib

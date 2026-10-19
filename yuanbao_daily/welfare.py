@@ -1,4 +1,7 @@
 """福利页语义：任务目录、进度解析与页面阶段判定。"""
+
+from __future__ import annotations
+
 from pathlib import Path
 import re
 from typing import Any, Iterable

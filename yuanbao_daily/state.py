@@ -1,9 +1,11 @@
 """当天任务状态的读写；只保存可安全恢复的非敏感字段。"""
+
+from __future__ import annotations
+
 import os
 from pathlib import Path
 import json
 from typing import Any
-
 
 def read_daily_state(path: Path) -> dict[str, Any]:
     """读取可恢复的当天状态；文件损坏时按空状态处理。"""

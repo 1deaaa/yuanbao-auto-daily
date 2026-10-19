@@ -628,7 +628,7 @@ class 元宝任务测试(unittest.TestCase):
         executor.observe = Mock(side_effect=[chat, chat, ours, welfare])
         executor._go_to_ours = Mock(return_value=ours)
         with (
-            patch("yuanbao_daily.executor.WELFARE_RETURN_LINK_FALLBACK_DELAY", 0),
+            patch("yuanbao_daily.executor_navigation.WELFARE_RETURN_LINK_FALLBACK_DELAY", 0),
             patch("元宝每日任务.time.sleep"),
         ):
             result = executor._go_to_welfare()
@@ -824,7 +824,7 @@ class 元宝任务测试(unittest.TestCase):
             activity=lambda: "com.tencent.hunyuan.app.chat/com.tencent.yuanbao.mp.components.websdk.ext.ui.WebBrowserActivity",
             ui_dump=Mock(side_effect=task.AgentError("Android 无障碍树不可用")),
         )
-        with patch("yuanbao_daily.executor.print") as output:
+        with patch("yuanbao_daily.executor_observation.print") as output:
             observation = executor.observe()
         self.assertEqual(observation.stage, "welfare")
         self.assertEqual(observation.nodes, ())
@@ -4385,7 +4385,7 @@ class 元宝任务测试(unittest.TestCase):
         calls = []
         executor.device = SimpleNamespace(input=lambda *args: calls.append(args))
         observation = task.Observation(b"png", "", "", (), "WebBrowserActivity", "welfare")
-        with patch("yuanbao_daily.executor.png_pixel", return_value=(30, 220, 126, 255)):
+        with patch("yuanbao_daily.executor_exchange.png_pixel", return_value=(30, 220, 126, 255)):
             with patch("元宝每日任务.time.sleep"):
                 self.assertTrue(executor._dismiss_reward_popup(observation))
         self.assertEqual(calls, [("tap", "450", "976")])
@@ -4408,7 +4408,7 @@ class 元宝任务测试(unittest.TestCase):
             "WebBrowserActivity",
             "welfare",
         )
-        with patch("yuanbao_daily.executor.png_pixel", return_value=(0, 253, 131, 255)) as pixel:
+        with patch("yuanbao_daily.executor_exchange.png_pixel", return_value=(0, 253, 131, 255)) as pixel:
             with patch("元宝每日任务.time.sleep"):
                 self.assertTrue(executor._dismiss_reward_popup(observation))
 
@@ -4425,7 +4425,7 @@ class 元宝任务测试(unittest.TestCase):
             "com.tencent.hunyuan.app.chat/com.tencent.yuanbao.mp.components.websdk.ext.ui.WebBrowserActivity",
             "app",
         )
-        with patch("yuanbao_daily.executor.png_pixel", return_value=(30, 220, 126, 255)):
+        with patch("yuanbao_daily.executor_exchange.png_pixel", return_value=(30, 220, 126, 255)):
             with patch("元宝每日任务.time.sleep"):
                 self.assertTrue(executor._dismiss_reward_popup(observation))
         self.assertEqual(calls, [("tap", "450", "976")])

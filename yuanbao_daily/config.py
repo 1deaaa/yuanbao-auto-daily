@@ -1,12 +1,15 @@
 """运行配置：环境变量解析与默认值。"""
+
+from __future__ import annotations
+
 import re
 from pathlib import Path
 import os
 from dataclasses import dataclass
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-
 from dotenv import load_dotenv
+
 from .constants import (
     DEFAULT_AUTO_ACCEPT_PROTOCOL,
     DEFAULT_BASE_URL,

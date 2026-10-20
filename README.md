@@ -151,7 +151,7 @@ systemctl --user daemon-reload
 | --- | --- |
 | `constants` / `models` / `ui` / `errors` | 常量、屏幕数据、无障碍解析、错误类型 |
 | `config` / `state` / `reporting` | 环境配置、当天进度、失败报告 |
-| `device` / `welfare` | ADB 与 Waydroid 通道、福利页语义 |
+| `device` / `waydroid_runtime` / `welfare` | ADB 通道、Waydroid 会话生命周期、福利页语义 |
 | `tools` / `vision` | 工具契约、视觉模型封装 |
 | `executor*` | 执行层：把受限动作落到设备并维护页面证据 |
 | `workflow*` | 编排层：阶段状态机、入口定位、动作守卫、任务推进 |

@@ -2731,7 +2731,7 @@ class 元宝任务测试(unittest.TestCase):
             "welfare",
         )
         self.assertEqual(
-            workflow.cached_action(observation),
+            workflow.local_entry_action(observation),
             ("tap", {"x": 640, "y": 940}),
         )
 
@@ -2760,7 +2760,7 @@ class 元宝任务测试(unittest.TestCase):
             "welfare",
         )
         self.assertEqual(
-            workflow.cached_action(observation),
+            workflow.local_entry_action(observation),
             ("tap", {"x": 868, "y": 1201}),
         )
 
@@ -2799,8 +2799,8 @@ class 元宝任务测试(unittest.TestCase):
             },
         )
         for _ in range(task.TASK_ENTRY_SCROLL_MAX_ATTEMPTS):
-            self.assertEqual(workflow.cached_action(offscreen), expected_scroll)
-        self.assertIsNone(workflow.cached_action(offscreen))
+            self.assertEqual(workflow.local_entry_action(offscreen), expected_scroll)
+        self.assertIsNone(workflow.local_entry_action(offscreen))
 
         visible = task.Observation(
             b"",
@@ -2830,7 +2830,7 @@ class 元宝任务测试(unittest.TestCase):
             "welfare",
         )
         self.assertEqual(
-            workflow.cached_action(visible),
+            workflow.local_entry_action(visible),
             ("tap", {"x": 803, "y": 837}),
         )
         self.assertNotIn("image", workflow.entry_scroll_attempts)
@@ -2860,7 +2860,7 @@ class 元宝任务测试(unittest.TestCase):
             "welfare",
         )
         self.assertEqual(
-            workflow.cached_action(offscreen),
+            workflow.local_entry_action(offscreen),
             (
                 "swipe",
                 {
@@ -2899,10 +2899,12 @@ class 元宝任务测试(unittest.TestCase):
             "WebBrowserActivity",
             "welfare",
         )
-        action = workflow.cached_action(visible)
-        self.assertEqual(action, ("tap", {"x": 803, "y": 837}))
-        self.assertTrue(workflow.dispatch(*action, visible).ok)
-        self.assertEqual(workflow.phase, "perform")
+        # 选哪一张模板卡片由视觉模型决定，本地不抢这个决策。
+        self.assertIsNone(workflow.local_entry_action(visible))
+        # 但点击落空时，语义校验仍会把入口定位到任务行上的“做同款”按钮。
+        args = {"x": 100, "y": 100}
+        self.assertIsNone(workflow._resolve_same_template_tap(args, visible))
+        self.assertEqual(args, {"x": 803, "y": 837})
 
     def test_做同款进入推荐页后本地选择首张可点击模板卡(self):
         workflow = task.Workflow(self.配置(), 假执行器())
@@ -2924,7 +2926,7 @@ class 元宝任务测试(unittest.TestCase):
             "app",
         )
 
-        action = workflow.cached_action(observation)
+        action = workflow.local_entry_action(observation)
         self.assertEqual(action, ("tap", {"x": 233, "y": 1249}))
         self.assertTrue(workflow.dispatch(*action, observation).ok)
         self.assertTrue(workflow.substate["template_clicked"])
@@ -2972,10 +2974,12 @@ class 元宝任务测试(unittest.TestCase):
             "welfare",
         )
 
-        self.assertEqual(
-            workflow.cached_action(observation),
-            ("tap", {"x": 198, "y": 1248}),
-        )
+        # 模板卡片由视觉模型挑选，本地不固定首选卡片。
+        self.assertIsNone(workflow.local_entry_action(observation))
+        # 点击落空时回落到当前可见的模板卡片。
+        args = {"x": 868, "y": 1024}
+        self.assertIsNone(workflow._resolve_same_template_tap(args, observation))
+        self.assertEqual(args, {"x": 198, "y": 1248})
 
     def test_做同款任务行旁残留零边界文案时仍以模板卡片为入口(self):
         """页面残留零边界“做同款”文案时，入口必须落在模板卡片上。
@@ -3195,7 +3199,7 @@ class 元宝任务测试(unittest.TestCase):
             "welfare",
         )
         self.assertEqual(
-            workflow.cached_action(observation),
+            workflow.local_entry_action(observation),
             ("tap", {"x": 868, "y": 1201}),
         )
 
@@ -3826,6 +3830,39 @@ class 元宝任务测试(unittest.TestCase):
         self.assertTrue(result.ok)
         executor.device.input.assert_called_once_with("swipe", "506", "1387", "506", "1387", "2000")
 
+    def test_返回首页时先关闭展开的侧边抽屉(self):
+        """从福利页返回会重新打开抽屉；抽屉不关掉，首页判定永远不成立。"""
+        executor = task.ToolExecutor.__new__(task.ToolExecutor)
+        executor.width, executor.height = 1080, 1600
+        calls = []
+        executor.device = SimpleNamespace(input=lambda *args: calls.append(args))
+        drawer = task.Observation(
+            b"", "", "",
+            (
+                task.Node(
+                    "", "", "com.tencent.hunyuan.app.chat:id/cv_drawer_container",
+                    "android.view.View", True, True, task.Bounds(0, 0, 560, 1600),
+                ),
+            ),
+            "com.tencent.hunyuan.app.chat/.home.v2.YBHomeActivityV2", "app",
+        )
+        self.assertTrue(executor._drawer_is_open(drawer))
+        executor._close_open_drawer(drawer)
+        self.assertEqual(calls, [("tap", "620", "800")])
+
+        closed = task.Observation(
+            b"", "", "",
+            (
+                task.Node(
+                    "", "", "com.tencent.hunyuan.app.chat:id/ic_navigation_show",
+                    "android.view.View", True, True, task.Bounds(0, 65, 101, 146),
+                ),
+            ),
+            "com.tencent.hunyuan.app.chat/.home.v2.YBHomeActivityV2", "chat",
+        )
+        self.assertFalse(executor._drawer_is_open(closed))
+        self.assertTrue(executor._is_new_chat_home(closed))
+
     def test_能力体验聊天页检测到按住说话时强制长按(self):
         executor = 假执行器()
         executor.pending_generation = False
@@ -4357,11 +4394,13 @@ class 元宝任务测试(unittest.TestCase):
         )
         self.assertTrue(result.ok)
         self.assertEqual(workflow.target, "writing")
-        self.assertEqual(
-            workflow.cached_action(task.Observation(b"same", "", "", (), "WebBrowserActivity", "welfare")),
-            ("tap", {"x": 803, "y": 1064}),
+        # 福利页层级暂空时没有可靠语义，入口改由视觉模型按截图定位，
+        # 不再复用上一轮缓存的坐标。
+        self.assertIsNone(
+            workflow.local_entry_action(
+                task.Observation(b"same", "", "", (), "WebBrowserActivity", "welfare")
+            ),
         )
-        self.assertNotIn("daily_question", workflow.primed_entry_points)
 
     def test_任务返回福利中心后本地递增而不再报告(self):
         workflow = task.Workflow(self.配置(), 假执行器())
@@ -4430,15 +4469,44 @@ class 元宝任务测试(unittest.TestCase):
 
         self.assertTrue(workflow.dispatch("tap", {"x": 640, "y": 740}, observation).ok)
         workflow.phase = "open_target"
-        cached = workflow.cached_action(observation)
+        cached = workflow.local_entry_action(observation)
         self.assertEqual(cached, ("tap", {"x": 640, "y": 740}))
 
         unrelated = task.Node(
             "去写作", "", "", "android.widget.Button", True, True, task.Bounds(560, 700, 720, 780)
         )
         self.assertIsNone(
-            workflow.cached_action(task.Observation(b"", "", "", (unrelated,), "", "welfare"))
+            workflow.local_entry_action(task.Observation(b"", "", "", (unrelated,), "", "welfare"))
         )
+
+    def test_任务行右侧行动按钮比例按当前布局校正(self):
+        """行动列比例必须落在实测按钮区间内，否则点击会落到卡片留白。"""
+        executor = 假执行器()
+        executor.width, executor.height = 1080, 1600
+        workflow = task.Workflow(self.配置(), executor)
+        workflow.phase = "open_target"
+        workflow.target = "writing"
+        observation = task.Observation(
+            b"", "", "",
+            (
+                task.Node(
+                    "使用写作能力", "", "", "android.widget.TextView", False, True,
+                    task.Bounds(178, 600, 324, 639),
+                ),
+                task.Node(
+                    "已完成", "", "", "android.widget.TextView", False, True,
+                    task.Bounds(867, 609, 982, 663),
+                ),
+            ),
+            "WebBrowserActivity", "welfare",
+        )
+
+        point = workflow._task_entry_point(observation)
+        self.assertIsNotNone(point)
+        x, y, _ = point
+        # 没有暴露行动文案时，回退坐标必须落在实测行动按钮区间 [867,982] 内。
+        self.assertTrue(867 <= x <= 982, f"行动列回退坐标越界：{x}")
+        self.assertTrue(600 <= y <= 663, f"行动列回退纵坐标越界：{y}")
 
     def test_福利入口优先选择右侧行动按钮而不是任务标题(self):
         executor = 假执行器()
@@ -4455,9 +4523,9 @@ class 元宝任务测试(unittest.TestCase):
             task.Bounds(747, 1037, 860, 1091),
         )
         observation = task.Observation(b"", "", "", (title, action), "WebBrowserActivity", "welfare")
-        self.assertEqual(workflow.cached_action(observation), ("tap", {"x": 803, "y": 1064}))
+        self.assertEqual(workflow.local_entry_action(observation), ("tap", {"x": 803, "y": 1064}))
 
-    def test_做同款模板缓存页面变化时失效(self):
+    def test_做同款模板按钮按当前层级定位(self):
         executor = 假执行器()
         executor.width, executor.height = 750, 1333
         workflow = task.Workflow(self.配置(), executor)
@@ -4472,17 +4540,11 @@ class 元宝任务测试(unittest.TestCase):
         workflow.phase = "perform"
         workflow.substate = {"entry_clicked": True}
         self.assertEqual(
-            workflow.cached_action(observation), ("tap", {"x": 200, "y": 1100})
+            workflow.local_entry_action(observation), ("tap", {"x": 233, "y": 1100})
         )
         workflow.substate = {"entry_clicked": True}
         welfare = task.Observation(b"", "", "", (), "", "welfare")
-        self.assertIsNone(workflow.cached_action(welfare))
-        detail = task.Observation(
-            b"", "", "", (),
-            "com.tencent.hunyuan.app.chat/com.tencent.hunyuan.app.AITemplateDetailActivity",
-            "app",
-        )
-        self.assertIsNone(workflow.cached_action(detail))
+        self.assertIsNone(workflow.local_entry_action(welfare))
 
     def test_做同款模板误点图片时回退到可见按钮文字(self):
         executor = 假执行器()
@@ -4693,7 +4755,7 @@ class 元宝任务测试(unittest.TestCase):
             "com.tencent.yuanbao.mp.components.websdk.ext.ui.WebBrowserActivity",
             "welfare",
         )
-        self.assertIsNone(workflow.cached_action(observation))
+        self.assertIsNone(workflow.local_entry_action(observation))
 
     def test_失败报告包含时间状态和堆栈且隐藏密钥(self):
         config = self.配置()
@@ -4730,7 +4792,7 @@ class 元宝任务测试(unittest.TestCase):
             "welfare",
         )
         self.assertEqual(
-            workflow.cached_action(observation),
+            workflow.local_entry_action(observation),
             (
                 "swipe",
                 {
@@ -4742,7 +4804,7 @@ class 元宝任务测试(unittest.TestCase):
                 },
             ),
         )
-        self.assertIsNone(workflow.cached_action(observation))
+        self.assertIsNone(workflow.local_entry_action(observation))
 
     def test_奖励遮罩无障碍为空时用绿色像素探针收下(self):
         executor = task.ToolExecutor.__new__(task.ToolExecutor)
@@ -5456,7 +5518,6 @@ class 元宝任务测试(unittest.TestCase):
         workflow = task.Workflow(self.配置(), executor)
         workflow.phase = "open_target"
         workflow.target = "question"
-        workflow.entry_points["question"] = (0.5, 0.5)
         nodes = task.parse_nodes(
             '<hierarchy><node text="元宝Ai视觉现场" enabled="true" bounds="[0,0][900,1600]" /></hierarchy>'
         )
@@ -5466,8 +5527,6 @@ class 元宝任务测试(unittest.TestCase):
         result = workflow.dispatch("tap", {"x": 450, "y": 800}, tapped)
         self.assertFalse(result.ok)
         self.assertIn("已返回任务列表", result.message)
-        self.assertNotIn("question", workflow.entry_points)
-        self.assertIn("question", workflow.fixed_entry_disabled)
         executor._close_activity_page.assert_called_once()
         self.assertEqual(workflow.phase, "open_target")
         self.assertEqual(executor.calls, [])
@@ -5693,12 +5752,11 @@ class 元宝任务测试(unittest.TestCase):
         self.assertEqual(workflow.recover_attempts, 0)
         self.assertIsNone(workflow.recover_phase)
 
-    def test_卡住恢复时作废坏入口缓存(self):
+    def test_卡住恢复后本地入口按最新层级重新定位(self):
+        """入口不再缓存坐标：恢复后仍按当前无障碍层级重新定位。"""
         workflow = task.Workflow(self.配置(), 假执行器())
         workflow.phase = "open_target"
         workflow.target = "writing"
-        workflow.entry_points["writing"] = (803 / 900, 1201 / 1600)
-        # 恢复前语义入口因已有缓存直接返回 None（复用坏坐标）。
         nodes = task.parse_nodes(
             '<hierarchy><node text="去写作" enabled="true" bounds="[747,1174][860,1228]" /></hierarchy>'
         )
@@ -5708,13 +5766,14 @@ class 元宝任务测试(unittest.TestCase):
             "com.tencent.hunyuan.app.chat/com.tencent.yuanbao.mp.components.websdk.ext.ui.WebBrowserActivity",
             "welfare",
         )
-        self.assertIsNone(workflow._semantic_entry_action(welfare))
-        # 进入恢复即作废坏缓存，语义入口重新按最新层级定位。
-        workflow.note_recovery_attempt()
-        self.assertNotIn("writing", workflow.entry_points)
         action = workflow._semantic_entry_action(welfare)
         self.assertIsNotNone(action)
         self.assertEqual(action[0], "tap")
+
+        workflow.note_recovery_attempt()
+        # 恢复期间由视觉模型按最新截图决策，运行器不再取本地入口。
+        self.assertTrue(workflow.recovering)
+        self.assertTrue(workflow.should_enter_recovery() is False)
 
     def test_本地幂等动作允许同画面有界重试(self):
         signature = task.action_signature("input_test_prompt", {})

@@ -7,6 +7,7 @@ from typing import Any
 from .constants import (
     ACTIVITY_PAGE_MARKERS,
     DEFAULT_CARD_NAME,
+    LEGACY_TASK_ENTRY_ACTION_X_RATIO,
     TASK_ENTRY_ACTION_MARKERS,
     TASK_ENTRY_ACTION_X_RATIO,
     TASK_ENTRY_MARKERS,
@@ -190,7 +191,11 @@ class WorkflowEntriesMixin:
             and action_bounds.center[0] >= round(width * 0.62)
         ):
             x = action_bounds.center[0]
+        elif row_bounds is not None and row_bounds.right >= round(width * 0.9):
+            # 旧版整行任务行：标题节点铺满整行，行动按钮贴在最右侧的固定列。
+            x = round(width * LEGACY_TASK_ENTRY_ACTION_X_RATIO)
         else:
+            # 新版卡片任务行：标题是短节点，行动按钮固定在卡片右侧行动列。
             x = round(width * TASK_ENTRY_ACTION_X_RATIO)
         anchor_height = max(
             row_bounds.height if row_bounds is not None else 0,
@@ -276,22 +281,50 @@ class WorkflowEntriesMixin:
         return "当前福利页可见的推荐模板卡片：" + "、".join(names)
 
     def _same_template_row_action(self, observation: Observation) -> Node | None:
-        """返回“做同款”任务行同一水平带内的“做同款”按钮。"""
+        """返回“做同款”任务行同一水平带内的“做同款”按钮。
+
+        任务标题“使用推荐模板做同款”本身也含“做同款”，必须排除，否则会把
+        点击校正到不可点的标题上。
+        """
         row = self._same_template_row(observation)
         if row is None:
             return None
         row_bounds = node_interaction_bounds(row)
         band = max(40, row_bounds.height)
         for node in observation.nodes:
-            if not node.enabled or node.bounds.area <= 0:
+            if node is row or not node.enabled or node.bounds.area <= 0:
                 continue
-            if "做同款" not in node.searchable:
+            if not any(
+                field.strip() == "做同款" for field in (node.text, node.content_desc)
+            ):
                 continue
             if (
                 row_bounds.top - band <= node.bounds.center[1] <= row_bounds.bottom + band
             ):
                 return node
         return None
+
+
+    def _tap_hits_same_template_label(
+        self, args: dict[str, Any], observation: Observation
+    ) -> bool:
+        """判断点击是否落在真正的“做同款”按钮上（任务标题不算）。"""
+        try:
+            x, y = int(args["x"]), int(args["y"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        row = self._same_template_row(observation)
+        for node in observation.nodes:
+            if node is row or not node.enabled or node.bounds.area <= 0:
+                continue
+            if "做同款" not in node.searchable:
+                continue
+            if (
+                node.bounds.left - 45 <= x <= node.bounds.right + 45
+                and node.bounds.top - 45 <= y <= node.bounds.bottom + 45
+            ):
+                return True
+        return False
 
 
     def _resolve_same_template_tap(
@@ -302,7 +335,7 @@ class WorkflowEntriesMixin:
         返回 None 表示点击有效可以继续执行；否则返回带可操作提示的失败结果，
         让视觉模型知道自己应该点哪一张模板卡片。
         """
-        if self._tap_hits_label(args, observation, "做同款", allow_empty_welfare=True):
+        if self._tap_hits_same_template_label(args, observation):
             return None
         if self._tap_hits_welfare_template_card(args, observation):
             return None
@@ -346,11 +379,6 @@ class WorkflowEntriesMixin:
         if point is None:
             return None
         self.entry_scroll_attempts.pop(self.target, None)
-        # 语义入口失败后不再无条件复用：同一坐标已失败时必须换入口，
-        # 否则语义定位会反复给出同一个点不中的坐标，耗尽重试次数。
-        cached = self._entry_cache_key()
-        if cached is not None and cached in self.entry_points:
-            return None
         x, y, _ = point
         print(f"使用无障碍语义定位任务入口：{self.target}")
         return "tap", {"x": x, "y": y}
@@ -468,78 +496,44 @@ class WorkflowEntriesMixin:
         return True
 
 
-    def _remember_entry_point(self, name: str, args: dict[str, Any]) -> None:
-        """保存一次已成功点击的入口，使用归一化坐标适配同一运行中的尺寸。"""
-        if name != "tap":
-            return
-        key = self._entry_cache_key()
-        if key is None:
-            return
-        try:
-            x, y = int(args["x"]), int(args["y"])
-            width, height = int(self.executor.width), int(self.executor.height)
-        except (KeyError, TypeError, ValueError, AttributeError):
-            return
-        if width <= 0 or height <= 0 or not (0 <= x < width and 0 <= y < height):
-            return
-        self.entry_points[key] = (x / width, y / height)
+    def local_entry_action(
+        self, observation: Observation
+    ) -> tuple[str, dict[str, int]] | None:
+        """返回当前页面可以直接执行的本地动作；None 表示需要视觉模型决策。
 
-
-    def _prime_entry_point(self, observation: Observation) -> None:
-        """用刚完成的稳定福利层级预存当前任务入口，覆盖下一轮空树竞态。"""
-        action = self._semantic_entry_action(observation)
-        if action is None:
-            return
-        self._remember_entry_point(*action)
-        key = self._entry_cache_key()
-        if key is not None and key in self.entry_points:
-            self.primed_entry_points.add(key)
-
-
-    def cached_action(self, observation: Observation) -> tuple[str, dict[str, int]] | None:
-        """在页面仍匹配时复用已验证入口，否则让视觉模型重新定位。"""
-        if (
-            self.phase == "open_target"
-            and self.target == "same_template"
-            and not self.same_template_revealed
-            and observation.stage == "welfare"
-            and not observation.nodes
-        ):
-            self.same_template_revealed = True
-            self.entry_points.pop("same_template", None)
-            width, height = int(self.executor.width), int(self.executor.height)
-            if width > 0 and height > 0:
-                # 做同款模板卡位于每日任务列表上方；从下方目录返回时向下滑动手指，
-                # 让上方卡片重新进入视口。
-                return "swipe", {
-                    "x1": width // 2,
-                    "y1": round(height * 0.38),
-                    "x2": width // 2,
-                    "y2": round(height * 0.84),
-                    "duration_ms": 500,
-                }
+        任务行、行动按钮和推荐模板按钮都是稳定语义，本地定位比“让模型先点、
+        再被本地改写”更准，也省一次视觉请求；只有读不到语义时才交给模型。
+        """
+        if self.phase == "open_target" and self.target == "same_template":
+            # 做同款的入口是任意一张推荐模板卡片，选哪一张属于视觉决策，
+            # 仍由模型按最新截图挑选；这里只负责把离屏的任务行带回视口。
+            scroll_action = self._offscreen_entry_scroll_action(observation)
+            if scroll_action is not None:
+                return scroll_action
+            if (
+                not self.same_template_revealed
+                and observation.stage == "welfare"
+                and not observation.nodes
+            ):
+                self.same_template_revealed = True
+                width, height = int(self.executor.width), int(self.executor.height)
+                if width > 0 and height > 0:
+                    # 做同款模板卡位于每日任务列表上方；从下方目录返回时向下滑动手指，
+                    # 让上方卡片重新进入视口。
+                    return "swipe", {
+                        "x1": width // 2,
+                        "y1": round(height * 0.38),
+                        "x2": width // 2,
+                        "y2": round(height * 0.84),
+                        "duration_ms": 500,
+                    }
+            return None
         if (
             self.phase == "perform"
             and self.target == "same_template"
             and self.substate.get("entry_clicked")
             and not self.substate.get("template_clicked")
         ):
-            key = self._entry_cache_key()
-            if key is not None and key in self.entry_points:
-                width, height = int(self.executor.width), int(self.executor.height)
-                if width > 0 and height > 0:
-                    ratio_x, ratio_y = self.entry_points[key]
-                    cached_args = {
-                        "x": round(width * ratio_x),
-                        "y": round(height * ratio_y),
-                    }
-                    if observation.stage == "app" and (
-                        self._tap_hits_label(cached_args, observation, "做同款")
-                        or self._tap_hits_template_card(cached_args, observation)
-                    ):
-                        return "tap", cached_args
-                if observation.stage == "app":
-                    self.entry_points.pop(key, None)
             button = find_node(observation.nodes, "做同款", exact=True)
             if button is None:
                 button = find_node(observation.nodes, "做同款")
@@ -553,69 +547,7 @@ class WorkflowEntriesMixin:
         semantic_action = self._semantic_entry_action(observation)
         if semantic_action is not None:
             return semantic_action
-        scroll_action = self._offscreen_entry_scroll_action(observation)
-        if scroll_action is not None:
-            return scroll_action
-        key = self._entry_cache_key()
-        if key is None or key not in self.entry_points:
-            return None
-        width, height = int(self.executor.width), int(self.executor.height)
-        if width <= 0 or height <= 0:
-            return None
-        ratio_x, ratio_y = self.entry_points[key]
-        args = {"x": round(width * ratio_x), "y": round(height * ratio_y)}
-        if key == "same_template:template":
-            if observation.stage != "app":
-                return None
-            activity_lower = observation.activity.lower()
-            if "aitemplatedetailactivity" in activity_lower:
-                return None
-            if not observation.nodes:
-                if "home.v2" not in activity_lower and "webbrowseractivity" not in activity_lower:
-                    return None
-                return "tap", args
-            if self._tap_hits_label(args, observation, "做同款"):
-                return "tap", args
-            if self._tap_hits_template_card(args, observation):
-                return "tap", args
-            return None
-        if observation.stage != "welfare":
-            return None
-        if self._ignored_welfare_tap(args, observation):
-            return None
-        if not observation.nodes:
-            # 只有 report_tasks 刚用完整层级确认过的坐标才允许跨过一次空树；
-            # 普通历史缓存仍然禁止复用，避免福利页滚动后误点旧任务行。
-            if key in self.primed_entry_points:
-                self.primed_entry_points.discard(key)
-                print(f"福利 WebView 层级暂空，沿用已确认的任务入口坐标：{key}")
-                return "tap", args
-            return None
-        markers = TASK_ENTRY_MARKERS.get(key, ())
-        if markers:
-            # 优先要求任务专属标题；只有当前版本完全不暴露标题时，才退回通用按钮文字。
-            specific = markers
-            searchable = " ".join(node.searchable for node in observation.nodes)
-            if any(marker.lower() in searchable for marker in specific):
-                if self._tap_hits_label(args, observation, *specific) or self._tap_matches_task_entry(
-                    args, observation
-                ):
-                    return "tap", args
-                return None
-            if self._tap_hits_label(args, observation, *markers) or self._tap_matches_task_entry(
-                args, observation
-            ):
-                return "tap", args
-        return None
-
-
-    def invalidate_cached_action(self) -> None:
-        """丢弃当前入口缓存，让下一轮重新请求视觉定位。"""
-        key = self._entry_cache_key()
-        if key == "same_template":
-            self.fixed_entry_disabled.add(key)
-        if key is not None:
-            self.entry_points.pop(key, None)
+        return self._offscreen_entry_scroll_action(observation)
 
 
     def _welfare_exchange_entry_node(self, observation: Observation) -> Node | None:

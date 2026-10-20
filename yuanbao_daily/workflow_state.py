@@ -221,8 +221,6 @@ class WorkflowStateMixin:
             target = TASK_TARGET_COUNTS.get(self.target, 3)
             self.progress[self.target] = min(target, current + 1)
         if self.target == "same_template":
-            self.entry_points.pop("same_template", None)
-            self.entry_points.pop("same_template:template", None)
             self.same_template_revealed = False
         self._persist_task_state()
         self._select_next()
@@ -250,7 +248,6 @@ class WorkflowStateMixin:
         target_label = TASK_LABELS[self.target]
         result = self._parse_report(report, observation)
         if result.ok:
-            self._prime_entry_point(observation)
             print(f"福利页面已显示 {target_label} 完成，已同步进度并跳过重复点击")
         return result.ok
 

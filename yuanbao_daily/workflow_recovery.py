@@ -134,19 +134,15 @@ class WorkflowRecoveryMixin:
 
 
     def note_recovery_attempt(self) -> None:
-        """记录一次 VLM 自由决策恢复尝试，并作废当前入口缓存。
+        """记录一次 VLM 自由决策恢复尝试。
 
-        同一入口坐标已连续失败，恢复时必须让 VLM 按最新截图重新定位；
-        否则恢复动作会复用同一个坏坐标，再次失败。
+        同一入口已连续失败，恢复时必须让 VLM 按最新截图重新定位；否则恢复
+        动作会复用同一个坏坐标，再次失败。
         """
         self.recovering = True
         self.recover_phase = self.phase
         self.recover_target = self.target
         self.recover_attempts += 1
-        key = self._entry_cache_key()
-        if key is not None and key in self.entry_points:
-            self.entry_points.pop(key, None)
-            print(f"卡住恢复：已作废入口缓存 {key}，VLM 将按最新截图重新定位")
 
 
     def finish_recovery(self, reason: str) -> None:

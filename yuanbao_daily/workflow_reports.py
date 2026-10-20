@@ -188,20 +188,18 @@ class WorkflowReportsMixin:
         if self.target and self.expected_count is not None and self.target in TASK_LABELS:
             if self.target in self.skipped_tasks:
                 self._merge_progress(merged_values, authoritative_keys)
-                self.stale_reports = 0
                 self._select_next()
                 return ToolResult(True, f"当前页面未提供任务 {TASK_LABELS[self.target]}，已跳过旧入口")
             current = merged_values[self.target]
             if current < self.expected_count:
-                self.stale_reports += 1
                 self._merge_progress(merged_values, authoritative_keys)
                 self.phase = "open_target"
                 return ToolResult(
                     False,
-                    f"任务 {TASK_LABELS[self.target]} 当前仍为 {current}/3，必须重新点击入口完成下一次",
+                    f"任务 {TASK_LABELS[self.target]} 当前仍为 {current}/"
+                    f"{self.expected_count}，必须重新点击入口完成下一次",
                 )
         self._merge_progress(merged_values, authoritative_keys)
-        self.stale_reports = 0
         if self.terminal_restore:
             # 收尾快路径只能由福利页的任务计数确认：本地状态可能把实际没做的
             # 任务记成已完成（例如做同款记成 3/3，页面仍是 0/3），此时必须

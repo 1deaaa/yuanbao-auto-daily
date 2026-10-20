@@ -101,7 +101,7 @@ def png_pixel(image: bytes, x: int, y: int) -> tuple[int, int, int, int] | None:
 # 任务的固定子步骤集中维护。入口坐标和任务进度仍交给视觉模型，
 # 进入具体能力页后的动作由本地执行器按这里的配方稳定完成。
 # 入口缓存只在当前运行期间有效，不写入磁盘。布局变化或语义校验失败时，
-# cached_action 会返回 None，下一步仍由视觉模型重新定位。
+# 入口不再缓存坐标：读不到语义时下一步由视觉模型重新定位。
 # “做同款”模板列表也在 WebView 活动里渲染，包含活动规则/参与方式等活动页
 # 语义；用它定位任务行会误触活动横幅，因此语义入口不使用该标题。
     # 先列右侧行动按钮，再列任务标题。新版 WebView 只把这些文本节点
@@ -262,11 +262,6 @@ def find_voice_press_point(nodes: Iterable[Node]) -> tuple[int, int] | None:
     if not candidates:
         return None
     return min(candidates, key=lambda item: item[0])[1]
-
-
-def has_visible_text(nodes: Iterable[Node], *needles: str) -> bool:
-    haystack = " ".join(node.searchable for node in nodes)
-    return all(needle.lower() in haystack for needle in needles)
 
 
 def action_signature(name: str, args: dict[str, Any]) -> str:

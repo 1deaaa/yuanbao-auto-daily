@@ -3,7 +3,8 @@
 具体实现按职责拆在混入类中：
 
 - ``workflow_state`` 同日进度恢复与任务推进；
-- ``workflow_entries`` 任务行语义与入口坐标缓存；
+- ``workflow_entries`` 任务行语义与入口定位；
+- ``workflow_guards`` 动作前置条件、阶段白名单与已知误触的处理；
 - ``workflow_reports`` 福利页进度、兑换读数与能力站核验；
 - ``workflow_recovery`` 卡住恢复、语义救援与阶段白名单。
 """
@@ -48,6 +49,7 @@ from .welfare import (
 )
 from .workflow_ability import WorkflowAbilityMixin
 from .workflow_entries import WorkflowEntriesMixin
+from .workflow_guards import WorkflowGuardsMixin
 from .workflow_recovery import WorkflowRecoveryMixin
 from .workflow_reports import WorkflowReportsMixin
 from .workflow_state import WorkflowStateMixin
@@ -58,6 +60,7 @@ class Workflow(
     WorkflowStateMixin,
     WorkflowAbilityMixin,
     WorkflowEntriesMixin,
+    WorkflowGuardsMixin,
     WorkflowReportsMixin,
     WorkflowRecoveryMixin,
 ):
@@ -77,14 +80,9 @@ class Workflow(
     target: str | None = None
     substate: dict[str, bool] = field(default_factory=dict)
     expected_count: int | None = None
-    stale_reports: int = 0
     finished: bool = False
-    entry_points: dict[str, tuple[float, float]] = field(default_factory=dict)
-    primed_entry_points: set[str] = field(default_factory=set)
     entry_scroll_attempts: dict[str, int] = field(default_factory=dict)
-    entry_failures: int = 0
     state_restored: bool = False
-    fixed_entry_disabled: set[str] = field(default_factory=set)
     skipped_tasks: set[str] = field(default_factory=set)
     same_template_revealed: bool = False
     terminal_restore: bool = False
@@ -94,70 +92,18 @@ class Workflow(
     recover_attempts: int = 0
 
     def dispatch(self, name: str, args: dict[str, Any], observation: Observation) -> ToolResult:
-        if (
-            self.phase in {"report", "open_target", "open_exchange"}
-            and observation.stage == "welfare"
-        ):
-            dismiss_reward = getattr(self.executor, "_dismiss_reward_popup", None)
-            if callable(dismiss_reward) and dismiss_reward(observation):
-                return ToolResult(
-                    True,
-                    "已收下延迟出现的任务奖励；本次业务动作未执行，请根据最新页面继续",
-                    {"stage": "welfare", "reward_dismissed": True},
-                )
+        """执行一个工具动作；前置条件与阶段约束由守卫层逐条判定。"""
+        dismissed = self._dismiss_reward_if_needed(name, observation)
+        if dismissed is not None:
+            return dismissed
         # 卡住恢复期间必须先允许模型处理遮挡层、返回键或重新定位；如果先套用
         # 正常阶段白名单，verify_daily_ability 会把恢复动作直接拦截，恢复机制
         # 实际上无法工作。
-        if not self.recovering and self.phase == "daily_ability":
-            if name not in DAILY_ABILITY_TOOLS:
-                return ToolResult(False, "当前阶段只允许点击主轮播卡固定位置的‘去体验’")
-        elif (
-            not self.recovering
-            and self.phase == "verify_daily_ability"
-            and name != "verify_daily_ability"
-        ):
-            return ToolResult(False, "体验页面处理后必须先核验主轮播卡是否显示‘已完成’")
-        # 卡住恢复期间 VLM 自由决策：跳过阶段白名单（恢复动作本就是打破常规的
-        # 关弹窗/返回/重定位），只保留真正危险动作的人工确认逻辑。成败由外层
-        # failures 计数判定，成功则退出恢复态回到正常流程。
+        allowlist_error = self._guard_phase_allowlist(name)
+        if allowlist_error is not None:
+            return allowlist_error
         if self.recovering:
-            if name == "report_tasks":
-                result = self._parse_report(
-                    self._merge_local_report(args, observation), observation
-                )
-            elif name == "verify_daily_ability":
-                result = self._parse_daily_ability_verification(args, observation)
-            elif name == "report_exchange":
-                result = self._parse_exchange_report(args, observation)
-            elif name == "complete_task":
-                result = self._complete_task_assertions()
-            else:
-                result = self._execute_observed(name, args, observation)
-            if not result.ok:
-                return result
-            if (
-                self.phase == "return"
-                and name in VISUAL_NAVIGATION_TOOLS
-                and result.data.get("stage") != "welfare"
-            ):
-                semantic_navigation = getattr(self.executor, "_go_to_welfare", None)
-                if callable(semantic_navigation):
-                    try:
-                        fallback_observation = semantic_navigation()
-                    except ManualActionRequired:
-                        raise
-                    except AgentError:
-                        fallback_observation = None
-                    if fallback_observation is not None and fallback_observation.stage == "welfare":
-                        result = ToolResult(
-                            True,
-                            "视觉恢复未触发入口，已按当前页面语义导航回福利中心",
-                            {"stage": "welfare"},
-                        )
-            self.finish_recovery(f"{name} 执行成功")
-            if name in {"report_tasks", "complete_task"}:
-                return result
-            return self._after_successful_action(name, args, result)
+            return self._dispatch_recovery(name, args, observation)
         if (
             self.phase == "navigate_welfare"
             and name == "report_tasks"
@@ -168,45 +114,9 @@ class Workflow(
                 "尚未进入福利中心，不能报告任务进度",
                 {"visual_replan": True},
             )
-        if (
-            self.phase == "open_exchange"
-            and observation.stage not in {"welfare", "exchange"}
-        ):
-            # 兑换导航误触后可能落到“我们”页或其它活动页。先让 VLMM 按当前
-            # 截图把页面带回福利中心；此时不能校验兑换入口坐标，也不能报告商城。
-            if name == "report_exchange":
-                return ToolResult(
-                    False,
-                    "当前不在兑换商城，必须先根据最新截图回到福利中心",
-                    {"stage": observation.stage, "visual_replan": True},
-                )
-            if name in VISUAL_NAVIGATION_TOOLS:
-                result = self.executor.execute(name, args)
-                if not result.ok:
-                    return result
-                stage = result.data.get("stage", "")
-                if stage == "welfare":
-                    self.substate.pop("entry_clicked", None)
-                    return ToolResult(
-                        True,
-                        "已回到福利中心，请重新定位兑换商城入口",
-                        {"stage": stage},
-                    )
-                return ToolResult(
-                    False,
-                    "当前仍未回到福利中心，请依据最新截图换策略",
-                    {"stage": stage, "visual_replan": True},
-                )
-        if self.phase == "open_exchange" and name == "tap":
-            if not self._correct_exchange_entry_tap(args, observation):
-                return ToolResult(
-                    False,
-                    "当前点击没有落在兑换商城入口；请根据最新截图重新定位",
-                    {"visual_replan": True},
-                )
-            prepare = getattr(self.executor, "prepare_visual_exchange_navigation", None)
-            if callable(prepare):
-                prepare()
+        exchange_error = self._guard_exchange_navigation(name, args, observation)
+        if exchange_error is not None:
+            return exchange_error
         if self.phase == "open_exchange" and name == "report_exchange":
             return self._parse_exchange_report(args, observation)
         phase_error = self._valid_phase(name)
@@ -217,147 +127,30 @@ class Workflow(
             if not result.ok:
                 return result
             return self._after_successful_action(name, args, result)
-        if (
-            self.phase == "daily_ability_experience"
-            and name == "tap"
-            and observation.stage == "welfare"
-            and self._tap_hits_label(args, observation, "去体验")
-        ):
-            return ToolResult(
-                False,
-                "主卡‘去体验’已经点击；当前浮层仍覆盖它，请点击浮层自身的体验入口，不要重复点击背景卡片",
-                {"stage": observation.stage, "visual_replan": True},
-            )
-        if self.phase == "daily_ability_experience" and name == "tap":
-            corrected = self._correct_daily_ability_experience_tap(args, observation)
-            if corrected is not None and corrected != (args.get("x"), args.get("y")):
-                args.update({"x": corrected[0], "y": corrected[1]})
-                print("体验入口坐标按当前无障碍按钮边界校正")
-            prepare = getattr(
-                self.executor, "prepare_daily_ability_experience_navigation", None
-            )
-            if callable(prepare):
-                prepare()
-        # 入口点击已确认打开福利活动页（站内活动 WebView）：这是已知误触，
-        # 直接关回任务列表并作废当前入口，让视觉模型重新定位真正的入口。
-        # 同一 phase/progress 下的重复短路仍会触发全局 stuck 保护并计入有界失败，
-        # 不会无限循环；关不回时返回阶段信息，便于外层重试或上报。
-        if (
-            observation.stage == "activity"
-            and self.phase != "daily_ability_experience"
-            and name in {"tap", "swipe", "press_back", "input_test_prompt"}
-        ):
-            after = self.executor._close_activity_page(observation)
-            self.fixed_entry_disabled.add(self.target or "")
-            self.entry_points.pop(self.target or "", None)
-            if after.stage == "welfare":
-                return ToolResult(
-                    False,
-                    "任务入口打开了福利活动页，已返回任务列表，请重新定位入口",
-                    {"stage": "welfare", "visual_replan": True},
-                )
-            return ToolResult(
-                False,
-                f"任务入口打开了福利活动页，返回后仍未回到任务列表（阶段={after.stage or '未知'}）",
-                {"stage": after.stage or "", "visual_replan": True},
-            )
-        if (
-            name in {"tap", "swipe", "press_back"}
-            and self.target in {"image", "photo_question"}
-            and observation.stage == "picker"
-        ):
-            return ToolResult(
-                False,
-                "当前已在系统图片选择器，必须调用 select_local_image 选择测试图片",
-                {"visual_replan": True},
-            )
-        if (
-            name == "tap"
-            and self.phase == "open_target"
-            and observation.stage == "welfare"
-            and not self._correct_task_entry_tap(args, observation)
-        ):
-            return ToolResult(
-                False,
-                "当前点击没有落在目标任务行；请根据最新截图重新定位，目标不在视口内时先滑动",
-                {"visual_replan": True},
-            )
-        if name == "tap" and observation.stage == "welfare" and self._ignored_welfare_tap(args, observation):
-            return ToolResult(False, "已拒绝点击“邀请新用户”任务", {"visual_replan": True})
-        if name == "tap" and self.target == "same_template":
-            if self.phase == "open_target":
-                # 福利页的推荐模板卡片本身就是做同款入口：模型可以自由选择
-                # 任意一张卡片，点击落空时再按当前可见卡片校正。
-                same_template_error = self._resolve_same_template_tap(args, observation)
-                if same_template_error is not None:
-                    return same_template_error
-            if self.phase == "perform":
-                if self.substate.get("template_clicked", False):
-                    return ToolResult(False, "推荐模板已经点击，下一步应直接发送并等待生成")
-                if not self.substate.get("entry_clicked", False):
-                    if observation.stage != "welfare" or not self._tap_hits_label(
-                        args, observation, "做同款", allow_empty_welfare=True
-                    ):
-                        return ToolResult(
-                            False,
-                            "请先点击福利中心中“做同款”任务入口",
-                            {"visual_replan": True},
-                        )
-                elif not self._tap_hits_label(args, observation, "做同款"):
-                    # 模板按钮的文字节点常被 Compose 单独暴露，模型可能点到卡片图片；
-                    # 有文字时改用文字中心；首次渲染没有文字时，仅放行卡片父 View 内的点击。
-                    template_button = find_node(observation.nodes, "做同款", exact=True)
-                    if template_button is not None:
-                        args.update(
-                            {
-                                "x": template_button.bounds.center[0],
-                                "y": template_button.bounds.center[1],
-                            }
-                        )
-                    elif not (
-                        observation.stage == "app"
-                        and self._tap_hits_template_card(args, observation)
-                    ):
-                        fallback = self._template_card_fallback(observation)
-                        if fallback is None:
-                            return ToolResult(False, "请在推荐模板页点击任意一个“做同款”按钮")
-                        # 元宝新版把“做同款”文字放在 WebView 卡片的图片层，
-                        # 无效坐标无法通过无障碍文字校验；只在大型卡片已确认时取首张中心。
-                        args.update({"x": fallback[0], "y": fallback[1]})
-        if name == "send_message" and self.target in TEXT_TASKS:
-            if not self.substate.get("input", False):
-                return ToolResult(False, "当前提问/写作任务尚未确认固定测试文本，必须先调用 input_test_prompt")
-        if name == "send_message" and self.target == "image":
-            if not self.substate.get("image", False):
-                return ToolResult(False, "当前 P 图任务尚未确认图片，必须先调用 select_local_image")
-        if name == "send_message" and self.target == "same_template":
-            if not self.substate.get("template_clicked", False):
-                return ToolResult(False, "尚未点击推荐模板，不能发送")
-            if (
-                self.executor._find_input(observation) is None
-                and self.executor._find_send(observation) is None
-                and "aitemplatedetailactivity" not in observation.activity.lower()
-                and observation.stage not in {"app", "chat"}
-            ):
-                return ToolResult(False, "模板详情页尚未加载输入框或发送控件，请重新观察后再发送")
-        if name == "confirm_image" and self.target in {"image", "photo_question"}:
-            if not self.substate.get("image", False):
-                return ToolResult(False, "尚未选择图片，不能确认图片")
-        if name == "wait_5s" and self.target in TASK_STEPS:
-            if not self.substate.get("sent", False):
-                if self.target == "photo_question" and self.substate.get("confirmed", False):
-                    # 拍题有的版本确认图片后自动提交；若当前版本仍显示发送按钮，不能跳过。
-                    if self.executor._find_send(observation) is not None:
-                        return ToolResult(False, "拍题页面仍有发送按钮，必须先调用 send_message")
-                else:
-                    return ToolResult(False, "当前任务尚未发送，必须先调用 send_message")
+        experience_error = self._guard_daily_ability_experience(
+            name, args, observation
+        )
+        if experience_error is not None:
+            return experience_error
+        activity_error = self._guard_activity_page(name, observation)
+        if activity_error is not None:
+            return activity_error
+        picker_error = self._guard_picker_stage(name, observation)
+        if picker_error is not None:
+            return picker_error
+        entry_error = self._guard_task_entry_tap(name, args, observation)
+        if entry_error is not None:
+            return entry_error
+        same_template_error = self._guard_same_template(name, args, observation)
+        if same_template_error is not None:
+            return same_template_error
+        precondition_error = self._guard_task_preconditions(name, observation)
+        if precondition_error is not None:
+            return precondition_error
         if name == "report_tasks":
-            result = self._parse_report(
+            return self._parse_report(
                 self._merge_local_report(args, observation), observation
             )
-            if result.ok:
-                self._prime_entry_point(observation)
-            return result
         if name == "verify_daily_ability":
             result = self._parse_daily_ability_verification(args, observation)
             if not result.ok:
@@ -404,7 +197,6 @@ class Workflow(
             )
         return self._after_successful_action(name, args, result)
 
-
     def _after_successful_action(
         self, name: str, args: dict[str, Any], result: ToolResult
     ) -> ToolResult:
@@ -424,7 +216,6 @@ class Workflow(
             if not self._target_entry_ready(result):
                 # 点击后没有当前目标页证据，不能把残留 WebView、活动页或错误
                 # 首页推进成 perform；下一轮把最新截图重新交给 VLMM。
-                self.entry_failures += 1
                 stage = result.data.get("stage", "")
                 return ToolResult(
                     False,
@@ -434,7 +225,6 @@ class Workflow(
                         "visual_replan": True,
                     },
                 )
-            self.entry_failures = 0
             self.phase = "perform"
             self.substate = {}
             if self.target == "same_template" and name == "tap":
@@ -444,8 +234,6 @@ class Workflow(
                     # 入口卡片直接打开模板详情时，模板已经被选中，下一步应发送。
                     self.substate["template_clicked"] = True
             return result
-        # 只缓存已经由执行器接受的点击；随后阶段会改变，因此必须在状态转移前记录。
-        self._remember_entry_point(name, args)
         if self.phase == "navigate_welfare" and (
             name == "open_welfare" or result.data.get("stage") == "welfare"
         ):

@@ -71,9 +71,6 @@ DEFAULT_AUTO_ACCEPT_PROTOCOL = True
 TASK_STATE_SCHEMA = 2
 
 
-DAILY_TASK_MODE_LEGACY = "legacy_question"
-
-
 DAILY_TASK_MODE_ABILITY_STATION = "ability_station"
 
 
@@ -344,9 +341,6 @@ DAILY_ABILITY_BUTTON_CHECK_LIMIT = 12
 DAILY_ABILITY_VERIFY_CHECK_LIMIT = 8
 
 
-DAILY_ABILITY_CLICK_LIMIT = 1
-
-
 WELFARE_TASK_LIST_SCROLL_START_RATIO = 0.83
 
 
@@ -393,9 +387,6 @@ MAX_HISTORY_SUMMARY_CHARS = 1200
 
 
 MAX_HISTORY_RESULT_CHARS = 1200
-
-
-IGNORED_TASKS = ("邀请新用户",)
 
 
 # 福利任务入口可能打开站内活动 WebView；这是已知误触，需要自动关回福利中心。
@@ -524,15 +515,20 @@ TASK_ENTRY_ROW_MARKERS: dict[str, tuple[str, ...]] = {
 LEGACY_DAILY_QUESTION_MARKERS = ("每日问元宝得积分", "每日问元宝")
 
 
-TASK_ENTRY_ACTION_X_RATIO = 0.965
+# 每日任务行右侧行动按钮（“去写作/去拍题/去P图”）的中心横坐标比例。
+# 2026-10-20 在 2.88.0 / 1080x1600 实测：按钮区间 [867,982]，中心 924，
+# 占比 0.8556；旧值 0.965 会点到卡片右侧留白，点不到按钮。
+TASK_ENTRY_ACTION_X_RATIO = 0.856
+
+
+# 旧版“整行任务行”布局里，行动按钮贴在整行最右侧（实测 900 宽时中心 868）。
+# 只有任务标题节点本身就铺满整行时才使用该比例。
+LEGACY_TASK_ENTRY_ACTION_X_RATIO = 0.965
 
 
 TASK_ENTRY_SCROLL_MAX_ATTEMPTS = 3
 
 
 # 福利页改版后每日任务区顶部插入了签到卡与邀请/创作横幅，旧固定行坐标
-# 已整体下移，继续盲点会误触“已完成”等非入口行。本字典保留为空作为扩展点；
-# 入口一律走语义或视觉定位，不再使用固定行坐标。
-
-
-WELFARE_FIXED_ENTRY_RATIOS: dict[str, tuple[float, float]] = {}
+# 已整体下移，继续盲点会误触“已完成”等非入口行。入口一律走无障碍语义
+# 定位或视觉模型定位，不再保留任何固定行坐标。

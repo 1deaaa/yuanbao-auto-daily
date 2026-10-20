@@ -64,6 +64,12 @@ class ExecutorNavigationMixin:
                 return observation
             if observation.stage == "ours":
                 return observation
+            # 从福利 WebView 返回时元宝会重新打开侧边抽屉，而不是首页；
+            # 抽屉打开时首页的抽屉按钮被替换，首页判定永远不成立。先关掉抽屉。
+            if self._drawer_is_open(observation):
+                self._close_open_drawer(observation)
+                time.sleep(1.2)
+                continue
             # 新版聊天页发送后可能停留在全屏展开输入浮层，该浮层会吞掉底部
             # “我们”的点击；先收起输入框再继续导航。
             if self._collapse_expanded_input(observation):
@@ -180,6 +186,8 @@ class ExecutorNavigationMixin:
         """优先复用现有进程恢复首页，仅在确认失败后清理元宝进程。"""
         # 正常运行中的元宝从详情页返回时，直接发送 MAIN Intent 可以避免
         # ARM64 兼容层在 force-stop 后留下旧进程记录并卡在 Splash。
+        # `am start -W` 会一直等到 Activity 真正显示，比只发 Intent 的
+        # `waydroid app launch` 更可靠：兼容层启动慢时前者会等到应用就绪。
         try:
             self.device.launch_app(PACKAGE_NAME)
             self.device.wait_app_ready(PACKAGE_NAME)
@@ -565,6 +573,30 @@ class ExecutorNavigationMixin:
         fallback_y = min(height - 1, bounds.bottom + max(1, round(bounds.height * 0.4)))
         return x, fallback_y
 
+
+    @staticmethod
+    def _drawer_is_open(observation: Observation) -> bool:
+        """判断侧边抽屉是否处于展开状态。"""
+        for node in observation.nodes:
+            resource_id = node.resource_id.rsplit("/", 1)[-1]
+            if resource_id not in {"cv_drawer", "cv_drawer_container"}:
+                continue
+            if node.enabled and node.bounds.area > 0:
+                return True
+        return False
+
+    def _close_open_drawer(self, observation: Observation) -> None:
+        """关闭展开的侧边抽屉：优先点右侧遮罩，其次返回键。"""
+        drawer_width = 0
+        for node in observation.nodes:
+            resource_id = node.resource_id.rsplit("/", 1)[-1]
+            if resource_id in {"cv_drawer", "cv_drawer_container"}:
+                drawer_width = max(drawer_width, node.bounds.right)
+        if drawer_width and drawer_width + 40 < self.width:
+            # 抽屉右侧是遮罩区域，点击可以关闭抽屉。
+            self._tap_point(min(self.width - 20, drawer_width + 60), self.height // 2)
+            return
+        self.device.input("keyevent", "KEYCODE_BACK")
 
     @staticmethod
     def _is_new_chat_home(observation: Observation) -> bool:

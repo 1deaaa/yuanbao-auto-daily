@@ -1433,6 +1433,112 @@ class 元宝任务测试(unittest.TestCase):
             self.assertTrue(device.app_not_responding())
         adb.assert_called_once_with("shell", "dumpsys", "activity", "processes", timeout=15)
 
+    def test_启动装配成功后进入福利页报告阶段(self):
+        """启动装配：设备就绪 → 拉起应用 → 读取当天状态 → 停在报告阶段。"""
+        config = self.配置()
+        runtime = Mock()
+        runtime.managed = False
+        device = Mock()
+        device.serial = "emulator-5554"
+        device.display_size.return_value = (900, 1600)
+        runtime.discover_device.return_value = device
+        executor = Mock()
+        executor.observe_startup.return_value = task.Observation(
+            b"", "", "", (), "WebBrowserActivity", "welfare"
+        )
+        workflow = Mock()
+        workflow.daily_ability_done = True
+        workflow.terminal_restore = False
+        model = Mock()
+        with (
+            patch("yuanbao_daily.runner_startup.ToolExecutor", return_value=executor),
+            patch("yuanbao_daily.runner_startup.Workflow", return_value=workflow),
+            patch("yuanbao_daily.runner_startup.VisionModel", return_value=model),
+        ):
+            session = task.start_session(config, runtime)
+
+        self.assertIs(session.executor, executor)
+        self.assertIs(session.workflow, workflow)
+        self.assertEqual(workflow.phase, "report")
+        workflow.restore_state.assert_called_once()
+        device.wait_app_ready.assert_called_once()
+        device.wait_network_ready.assert_called_once()
+
+    def test_启动装配失败时按上限抛出重试异常(self):
+        config = self.配置()
+        runtime = Mock()
+        runtime.managed = False
+        device = Mock()
+        device.serial = "emulator-5554"
+        device.display_size.return_value = (900, 1600)
+        runtime.discover_device.return_value = device
+        device.wait_app_ready.side_effect = task.AgentError("首屏加载失败")
+        with (
+            patch("yuanbao_daily.runner_startup.ToolExecutor"),
+            patch("yuanbao_daily.runner_startup.Workflow"),
+            patch("yuanbao_daily.runner_startup.VisionModel"),
+        ):
+            with self.assertRaises(task.RetryLimitExceeded):
+                task.start_session(config, runtime)
+
+    def test_主循环优先执行本地语义入口且不请求模型(self):
+        """任务入口能本地定位时，模型不应再被调用一次。"""
+        workflow = Mock()
+        workflow.phase = "open_target"
+        workflow.target = "writing"
+        workflow.finished = False
+        workflow.recovering = False
+        workflow.expected_tool.return_value = "tap"
+        workflow.requires_visual_navigation.return_value = True
+        workflow.local_entry_action.return_value = ("tap", {"x": 640, "y": 940})
+        workflow.context.return_value = "上下文"
+        workflow.can_conclude_target_unavailable.return_value = False
+        workflow.reconcile_return_to_welfare.return_value = False
+        workflow.reconcile_visible_progress.return_value = False
+        workflow.task_catalog_signature.return_value = ()
+        workflow.dispatch.return_value = task.ToolResult(True, "已点击")
+        executor = Mock()
+        observation = task.Observation(b"", "", "", (), "WebBrowserActivity", "welfare")
+        executor.observe.return_value = observation
+        model = Mock()
+
+        # 让本轮执行一次动作后即完成，验证动作来源与模型调用次数。
+        workflow.dispatch.side_effect = lambda name, args, obs: (
+            setattr(workflow, "finished", True) or task.ToolResult(True, "已点击")
+        )
+        self.assertTrue(task.run_task_loop(self.配置(), executor, workflow, model))
+        workflow.dispatch.assert_called_once()
+        self.assertEqual(workflow.dispatch.call_args[0][0], "tap")
+        self.assertEqual(workflow.dispatch.call_args[0][1], {"x": 640, "y": 940})
+        model.next_tool.assert_not_called()
+
+    def test_主循环连续失败达到上限时抛出重试异常(self):
+        workflow = Mock()
+        workflow.phase = "open_target"
+        workflow.target = "writing"
+        workflow.finished = False
+        workflow.recovering = False
+        workflow.expected_tool.return_value = "tap"
+        workflow.requires_visual_navigation.return_value = False
+        workflow.local_entry_action.return_value = None
+        workflow.context.return_value = "上下文"
+        workflow.can_conclude_target_unavailable.return_value = False
+        workflow.reconcile_return_to_welfare.return_value = False
+        workflow.reconcile_visible_progress.return_value = False
+        workflow.task_catalog_signature.return_value = ()
+        workflow.dispatch.return_value = task.ToolResult(False, "入口未生效")
+        workflow.should_enter_recovery.return_value = False
+        executor = Mock()
+        executor.observe.return_value = task.Observation(
+            b"", "", "", (), "WebBrowserActivity", "welfare"
+        )
+        model = Mock()
+        model.next_tool.return_value = ("tap", {"x": 1, "y": 1}, "call-1")
+
+        config = replace(self.配置(), max_steps=5, retry_cooldown_seconds=0)
+        with self.assertRaises(task.RetryLimitExceeded):
+            task.run_task_loop(config, executor, workflow, model)
+
     def test_运行入口可以完成启动装配(self):
         """run_once 的启动装配必须真的能跑通。
 

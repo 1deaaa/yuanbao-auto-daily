@@ -10,7 +10,7 @@
 - ``tools`` / ``vision`` 工具契约与视觉模型封装；
 - ``executor`` 工具动作执行层；
 - ``workflow`` 任务编排状态机；
-- ``runner`` 运行入口与失败报告。
+- ``runner`` / ``runner_startup`` / ``runner_loop`` 运行入口、会话启动与主循环。
 """
 
 from .config import Config, parse_run_time
@@ -60,6 +60,8 @@ from .executor import ToolExecutor
 from .models import Bounds, Node, Observation, ToolResult
 from .reporting import build_failure_report, show_failure_alert
 from .runner import main, next_run_at, run_daemon, run_once
+from .runner_loop import TaskLoop, run_task_loop
+from .runner_startup import Session, start_session
 from .state import read_daily_state, write_daily_state
 from .tools import TOOL_DEFINITIONS
 from .ui import (
@@ -169,6 +171,10 @@ __all__ = [
     "repeated_action_is_stuck",
     "run_daemon",
     "run_once",
+    "run_task_loop",
+    "Session",
+    "start_session",
+    "TaskLoop",
     "show_failure_alert",
     "state_signature",
     "write_daily_state",

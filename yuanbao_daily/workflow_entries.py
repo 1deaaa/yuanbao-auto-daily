@@ -16,6 +16,7 @@ from .constants import (
 from .models import (
     Node,
     Observation,
+    ToolResult,
 )
 from .ui import (
     find_node,
@@ -117,22 +118,6 @@ class WorkflowEntriesMixin:
             ),
             default=(0, None),
         )[1]
-        # 新版做同款没有独立的“做同款”文字按钮，任务入口就是推荐模板卡片。
-        # 在已有任务行且未暴露行动文案时，优先返回首张可点击卡片中心；否则
-        # 会把模型坐标校正到标题行右侧，连续点击同一个无效位置。
-        if self.target == "same_template" and not actions and row is not None:
-            row_bounds = node_interaction_bounds(row)
-            cards = [
-                node
-                for node in nodes
-                if node.clickable
-                and node.enabled
-                and node.bounds.area >= 30000
-                and node.bounds.top >= row_bounds.bottom
-            ]
-            if cards:
-                card = min(cards, key=lambda node: (node.bounds.top, node.bounds.left))
-                return card.bounds.center[0], card.bounds.center[1], max(90, card.bounds.height // 3)
         action: Node | None = None
         if actions and row is not None:
             nearby = [
@@ -145,6 +130,18 @@ class WorkflowEntriesMixin:
                 )
                 <= max(180, node_interaction_bounds(row).height + 80)
             ]
+            if self.target == "same_template" and row is not None:
+                # 模板卡片内部也可能带“做同款”字样，但它属于卡片而不是任务行
+                # 的行动按钮；只接受与任务行同一水平带的行动节点。
+                row_bounds = node_interaction_bounds(row)
+                band = max(40, row_bounds.height)
+                nearby = [
+                    node
+                    for node in nearby
+                    if row_bounds.top - band
+                    <= node_interaction_bounds(node).center[1]
+                    <= row_bounds.bottom + band
+                ]
             if nearby:
                 action = min(
                     nearby,
@@ -166,6 +163,15 @@ class WorkflowEntriesMixin:
                     node_interaction_bounds(node).center[0],
                 ),
             )
+        # 新版做同款没有独立的“做同款”文字按钮，任务入口就是推荐模板卡片。
+        # 只有在任务行没有可用行动节点时才回退到卡片：页面残留的零边界
+        # “做同款”文案不算可用入口，否则会把点击推到任务行右侧的空白处，
+        # 页面毫无反应，模型只能反复点同一个无效坐标。
+        if self.target == "same_template" and row is not None and not self._usable_action(action):
+            cards = self._template_cards(observation, row)
+            if cards:
+                card = cards[0]
+                return card.bounds.center[0], card.bounds.center[1], max(90, card.bounds.height // 3)
         if action is None and row is None:
             return None
 
@@ -193,6 +199,137 @@ class WorkflowEntriesMixin:
         tolerance = max(70, min(180, anchor_height // 2 + 55))
         return x, y, tolerance
 
+
+    @staticmethod
+    def _usable_action(action: Node | None) -> bool:
+        """判断行动节点是否真的可以点击。
+
+        WebView 改版后常留下零边界的“做同款”文案节点：它能通过文案匹配，
+        但没有可点击区域，用它做入口只会把点击推到空白处。
+        """
+        return action is not None and action.bounds.area > 0
+
+
+    def _template_cards(
+        self, observation: Observation, row: Node | None = None
+    ) -> list[Node]:
+        """列出“做同款”任务行下方的推荐模板卡片。
+
+        卡片本身是做同款任务的入口，具体选哪一张由视觉模型决定；这里只按
+        当前无障碍层级给出可点击区域，避免模型在空白处反复点击。
+        """
+        if row is None:
+            row = self._same_template_row(observation)
+        if row is None:
+            return []
+        floor = node_interaction_bounds(row).bottom
+        cards = [
+            node
+            for node in observation.nodes
+            if node.enabled
+            and node.clickable
+            and node.bounds.area >= 30000
+            and node.bounds.top >= floor
+        ]
+        return sorted(cards, key=lambda node: (node.bounds.top, node.bounds.left))
+
+
+    def _same_template_row(self, observation: Observation) -> Node | None:
+        """返回“做同款”任务行节点；文案变化时返回 None 交由视觉模型判断。"""
+        markers = TASK_ENTRY_ROW_MARKERS.get("same_template", ())
+        for node in observation.nodes:
+            if not self._usable_entry_node(node):
+                continue
+            bounds = node_interaction_bounds(node)
+            if bounds.height > 260:
+                continue
+            if any(self._matches_entry_marker(node, marker) for marker in markers):
+                return node
+        return None
+
+
+    def _tap_hits_welfare_template_card(
+        self, args: dict[str, Any], observation: Observation
+    ) -> bool:
+        """判断点击是否落在福利页的任一推荐模板卡片上。"""
+        try:
+            x, y = int(args["x"]), int(args["y"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        for node in self._template_cards(observation):
+            bounds = node.bounds
+            if bounds.left <= x <= bounds.right and bounds.top <= y <= bounds.bottom:
+                return True
+        return False
+
+
+    def template_card_hint(self, observation: Observation) -> str:
+        """给视觉模型列出当前可见的模板卡片，供其在被拒后重新选择。"""
+        cards = self._template_cards(observation)
+        if not cards:
+            return ""
+        names = []
+        for node in cards[:6]:
+            label = (node.content_desc or node.text or "").strip()
+            center = node.bounds.center
+            names.append(f"{label or '模板卡片'}({center[0]},{center[1]})")
+        return "当前福利页可见的推荐模板卡片：" + "、".join(names)
+
+    def _same_template_row_action(self, observation: Observation) -> Node | None:
+        """返回“做同款”任务行同一水平带内的“做同款”按钮。"""
+        row = self._same_template_row(observation)
+        if row is None:
+            return None
+        row_bounds = node_interaction_bounds(row)
+        band = max(40, row_bounds.height)
+        for node in observation.nodes:
+            if not node.enabled or node.bounds.area <= 0:
+                continue
+            if "做同款" not in node.searchable:
+                continue
+            if (
+                row_bounds.top - band <= node.bounds.center[1] <= row_bounds.bottom + band
+            ):
+                return node
+        return None
+
+
+    def _resolve_same_template_tap(
+        self, args: dict[str, Any], observation: Observation
+    ) -> ToolResult | None:
+        """校验并校正福利页“做同款”入口点击。
+
+        返回 None 表示点击有效可以继续执行；否则返回带可操作提示的失败结果，
+        让视觉模型知道自己应该点哪一张模板卡片。
+        """
+        if self._tap_hits_label(args, observation, "做同款", allow_empty_welfare=True):
+            return None
+        if self._tap_hits_welfare_template_card(args, observation):
+            return None
+        if self._tap_matches_task_entry(args, observation):
+            return None
+        if observation.stage == "welfare" and not observation.nodes:
+            # 空层级时没有本地依据，完全交给视觉模型按截图判断。
+            return None
+        row_action = self._same_template_row_action(observation)
+        if row_action is not None:
+            args.update(
+                {"x": row_action.bounds.center[0], "y": row_action.bounds.center[1]}
+            )
+            return None
+        cards = self._template_cards(observation)
+        if cards:
+            card = cards[0]
+            args.update({"x": card.bounds.center[0], "y": card.bounds.center[1]})
+            print("模型点击未落在模板卡片，已按当前可见的推荐模板卡片重新定位")
+            return None
+        hint = self.template_card_hint(observation)
+        return ToolResult(
+            False,
+            "请点击福利中心中“做同款”任务入口或推荐模板卡片"
+            + (f"；{hint}" if hint else ""),
+            {"visual_replan": True},
+        )
 
     def _semantic_entry_action(
         self, observation: Observation
@@ -276,6 +413,11 @@ class WorkflowEntriesMixin:
 
     def _correct_task_entry_tap(self, args: dict[str, Any], observation: Observation) -> bool:
         """用当前语义行校正视觉点击；无语义时完全交给 VLMM。"""
+        if self.target == "same_template" and self._tap_hits_welfare_template_card(
+            args, observation
+        ):
+            # 模型已经选中了某张模板卡片：选哪一张属于视觉决策，不改写坐标。
+            return True
         point = self._task_entry_point(observation)
         if point is None:
             # 无障碍树没有目标语义时完全交给 VLMM，避免本地规则阻断页面改版。

@@ -22,6 +22,7 @@ from .models import (
 )
 from .ui import (
     find_node,
+    find_voice_press_point,
     node_interaction_bounds,
 )
 
@@ -267,6 +268,8 @@ class WorkflowRecoveryMixin:
             return "confirm_image"
         if kind == "same_template" and not self.substate.get("template_clicked"):
             return "tap"
+        # 做同款直接提交模板自带的内容：模板详情页已经填好了模板提示词和
+        # 参考图，改写输入框会丢掉模板信息，福利页的“做同款 x/3”不会计数。
         if not self.substate.get("sent"):
             # 拍题确认后有些版本会自动提交；有发送按钮时仍必须显式发送。
             if kind == "photo_question" and self.substate.get("confirmed"):
@@ -452,40 +455,23 @@ class WorkflowRecoveryMixin:
         return f"{self.target.replace('_', '-')}-{count}"
 
 
-    @staticmethod
-    def _daily_ability_voice_press_point(
-        observation: Observation,
-    ) -> tuple[int, int] | None:
-        """定位能力体验聊天页的“按住说话”控件。"""
-        candidates = []
-        for node in observation.nodes:
-            if "按住" not in node.searchable or "说话" not in node.searchable:
-                continue
-            bounds = node.interaction_bounds
-            if node.enabled and bounds.area > 0:
-                candidates.append((bounds.area, bounds.center))
-        return min(candidates, default=(0, None), key=lambda item: item[0])[1]
-
-
     def daily_ability_voice_action(
         self, observation: Observation
     ) -> tuple[str, dict[str, Any]] | None:
-        """在能力体验明确要求语音输入时返回本地必做的长按动作。"""
+        """在能力体验明确要求语音输入时返回本地必做的语音动作。
+
+        这里只表达“按住说话”的意图，不计算坐标：控件位置由执行层按当前
+        无障碍语义定位并注入短测试语音，避免编排层与执行层各写一套定位规则。
+        """
         if (
             self.phase != "daily_ability_experience"
             or self.daily_ability_voice_submitted
             or getattr(self.executor, "pending_generation", False)
         ):
             return None
-        point = self._daily_ability_voice_press_point(observation)
-        if point is None:
+        if find_voice_press_point(observation.nodes) is None:
             return None
-        return "long_press", {
-            "x": point[0],
-            "y": point[1],
-            "duration_ms": 2500,
-            "_daily_ability_voice": True,
-        }
+        return "hold_to_speak", {"duration_ms": 2500}
 
 
     def _target_entry_ready(self, result: ToolResult) -> bool:

@@ -10,6 +10,7 @@ from .constants import (
     NEW_WELFARE_DAILY_TASKS,
     TASK_LABELS,
     TASK_ORDER,
+    TASK_TARGET_COUNTS,
 )
 from .models import (
     Observation,
@@ -26,6 +27,27 @@ from .welfare import (
 
 class WorkflowReportsMixin:
     """按职责拆分的混入类；方法实现与原主类完全一致。"""
+
+    def local_task_report(self, observation: Observation) -> dict[str, Any] | None:
+        """从无障碍树直接读出任务计数；读不到时返回 None。
+
+        福利页的任务行会把 ``已完成 x/3`` 作为独立文本节点暴露，精度高于
+        视觉模型读截图；只有本地读不出时才需要模型补充。
+        """
+        local_report = merge_supplemental_task_progress(
+            observation, parse_local_welfare_progress(observation)
+        )
+        if local_report is None:
+            return None
+        report: dict[str, Any] = {}
+        for key in TASK_ORDER:
+            value = local_report.get(key)
+            if isinstance(value, int):
+                report[key] = value
+        available = local_report.get("available_tasks")
+        if isinstance(available, list):
+            report["available_tasks"] = list(available)
+        return report
 
     @staticmethod
     def _merge_local_report(
@@ -103,8 +125,11 @@ class WorkflowReportsMixin:
                 values[key] = int(value)
         except (KeyError, TypeError, ValueError) as exc:
             return ToolResult(False, "report_tasks 缺少固定进度字段")
-        if any(value < 0 or value > 3 for value in values.values()):
-            return ToolResult(False, "任务进度必须在 0 到 3 之间")
+        if any(
+            value < 0 or value > TASK_TARGET_COUNTS.get(key, 3)
+            for key, value in values.items()
+        ):
+            return ToolResult(False, "任务进度超出该任务的合理次数范围")
         available = args.get("available_tasks")
         if available is not None:
             if not isinstance(available, list) or any(
@@ -177,6 +202,27 @@ class WorkflowReportsMixin:
                 )
         self._merge_progress(merged_values, authoritative_keys)
         self.stale_reports = 0
+        if self.terminal_restore:
+            # 收尾快路径只能由福利页的任务计数确认：本地状态可能把实际没做的
+            # 任务记成已完成（例如做同款记成 3/3，页面仍是 0/3），此时必须
+            # 继续把任务补做完，不能直接收尾。
+            undone = [
+                key
+                for key in sorted(authoritative_keys)
+                if merged_values.get(key, 0) < TASK_TARGET_COUNTS.get(key, 3)
+            ]
+            if undone:
+                self.terminal_restore = False
+                self.executor.reward_unavailable = False
+                self.executor.reward_use_confirmed = False
+                print(
+                    "福利页显示任务尚未完成："
+                    + "、".join(TASK_LABELS[key] for key in undone)
+                    + "；继续执行每日任务"
+                )
+            else:
+                self.phase = "return_home"
+                return ToolResult(True, "福利页已确认全部任务完成，直接收尾")
         self._select_next()
         return ToolResult(True, "已更新福利中心任务进度")
 

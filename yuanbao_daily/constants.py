@@ -126,6 +126,7 @@ DAILY_ABILITY_TOOLS = frozenset(
 DAILY_ABILITY_EXPERIENCE_TOOLS = frozenset(
     {
         "tap",
+        "hold_to_speak",
         "long_press",
         "swipe",
         "press_back",
@@ -424,6 +425,21 @@ TASK_LABELS = {
 
 
 TASK_ORDER = tuple(TASK_LABELS)
+
+
+# 每项每日任务需要完成的次数。写作、拍题、P图和做同款都是 3 次；
+# 趣问元宝卡片的进度显示为 (x/4)，问满 4 次才能领到积分奖励，
+# 因此提问任务的目标次数是 4，不能沿用 3 次上限。
+TASK_TARGET_COUNTS: dict[str, int] = {
+    "question": 4,
+    "writing": 3,
+    "image": 3,
+    "photo_question": 3,
+    "same_template": 3,
+}
+
+
+TASK_MAX_PROGRESS = max(TASK_TARGET_COUNTS.values())
 
 
 # 新版福利每日任务固定包含写作、拍题、P图；有明确累计进度的做同款任务也纳入。

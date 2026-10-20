@@ -245,6 +245,25 @@ def find_semantic_node(
     return None
 
 
+def find_voice_press_point(nodes: Iterable[Node]) -> tuple[int, int] | None:
+    """定位“按住说话”一类语音输入控件的按压点。
+
+    语音控件所在页面和位置都会变化，因此这里只按语义查找，不做任何坐标假设。
+    同一行可能同时暴露文字节点和它的可点击父级，取面积最小的可见节点，
+    避免按到整行容器而触发长按滚动。
+    """
+    candidates: list[tuple[int, tuple[int, int]]] = []
+    for node in nodes:
+        if "按住" not in node.searchable or "说话" not in node.searchable:
+            continue
+        bounds = node.interaction_bounds
+        if node.enabled and bounds.area > 0:
+            candidates.append((bounds.area, bounds.center))
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: item[0])[1]
+
+
 def has_visible_text(nodes: Iterable[Node], *needles: str) -> bool:
     haystack = " ".join(node.searchable for node in nodes)
     return all(needle.lower() in haystack for needle in needles)

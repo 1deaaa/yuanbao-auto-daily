@@ -8,6 +8,23 @@
 
 状态文件只保存当天的任务计数、能力站每日大任务完成标志和三天卡兑换状态。普通视觉报告按同日单调合并；新版福利页只有在完整每日任务目录及三项计数均可由当前页面层级核实时，才允许用页面实数纠正旧状态。无障碍树为空时，必须先滚动到任务区，再依据最新截图报告，避免沿用过期进度或把推荐卡当成每日任务。服务重启可从中断任务继续。
 
+## 模型介入边界
+
+视觉模型只负责“看得见才能决定”的部分，其余全部交给本地代码，避免用概率性判断覆盖可确定的证据：
+
+| 场景 | 决策方 | 理由 |
+| --- | --- | --- |
+| 福利页任务计数 `x/3` | 本地无障碍树 | 计数是明确文本节点，模型读截图反而更差 |
+| 主轮播卡“去体验/已完成” | 本地固定区域 | 二元状态固定在同一位置 |
+| 收尾快路径是否成立 | 本地（以福利页计数为准） | 本地状态可能把没做的任务记成已完成 |
+| 语音输入控件定位 | 本地语义定位 | 控件位置多变，由模型猜坐标会误长按 |
+| 推荐模板卡片选择 | 视觉模型 | 卡片数量与位置每天变化 |
+| 任务入口、抽屉、兑换入口、活动页 | 视觉模型 | 页面改版频繁，固定坐标必然过期 |
+| 卡住恢复 | 视觉模型自由决策 | 异常页面无法穷举，需要模型看截图换策略 |
+| 积分与商品价格 | 本地可读时本地优先 | 兑换分支容不得读数错误 |
+
+新增专用工具 `hold_to_speak`：模型只表达“按住说话”的意图，程序按“按住说话”语义定位控件、按住期间通过 `pactl` 临时把一段 1.7 秒测试语音（`语音测试.wav`）注入默认麦克风，结束后恢复原音源，避免模型在多变布局上猜错长按对象。
+
 [![测试](https://github.com/1deaaa/yuanbao-auto-daily/actions/workflows/test.yml/badge.svg)](https://github.com/1deaaa/yuanbao-auto-daily/actions/workflows/test.yml)
 
 ## 设备支持
@@ -47,10 +64,10 @@ chmod 600 .env
 编辑 `.env`：
 
 ```dotenv
-MODEL_ID=gemini-3.5-flash-lite
-BASE_URL=http://localhost:7860/v1
-LOCAL_LLM_API_KEY=请填入本地端点密钥
-REASONING_EFFORT=high
+MODEL_ID=gpt-6-luna
+BASE_URL=https://www.cctq.ai/v1
+LOCAL_LLM_API_KEY=请填入兼容端点密钥
+REASONING_EFFORT=max
 ANDROID_DEVICE=auto
 STOP_WAYDROID_AFTER_RUN=true
 # 仅精确确认元宝首次协议页；登录、验证码和微信/QQ 扫码仍需人工完成
@@ -61,9 +78,27 @@ PROMPT_PATH=每日任务提示词.md
 STATE_PATH=.yuanbao_daily_state.json
 ```
 
+每日任务的目标次数按福利页实际口径执行：写作、拍题、P图和做同款各 3 次，趣问元宝卡片的进度是 `(x/4)`，需要问满 4 次才能领到积分；福利页的计数是唯一权威来源，本地状态不会把没做的任务记成已完成，收尾快路径也必须先由页面计数确认。
+
 新版大任务只点击元宝能力站主轮播卡固定位置显示的“去体验”，不识别卡片标题或颜色；点击后由视觉模型处理卡片对应的体验流程，回福利中心确认主卡明确显示“已完成”才记为完成。启用 `FORCE_ALL_DAILY_TASKS=true` 时，趣问元宝、写作、拍题、P图、做同款五类业务都必须执行到目标进度，不能因一次失败、空树或暂时缺少进度文案而跳过；多变入口和模板仍由视觉模型按最新截图决策。新版聊天页从左上角抽屉进入福利中心；兑换只定位 QQ 超级会员 3 天卡，先读取当前积分和商品价格，积分不足则不扣分并安全完成本轮。任务完成后的导航同时兼容新版聊天首页和旧版“我们”页。
 
 Windows PowerShell 或其他 ADB 主机只需把 `ANDROID_DEVICE` 改成在线设备序列号，使用对应的 Python 虚拟环境运行同一个脚本；不需要安装 Waydroid。设备必须已经安装 `com.tencent.hunyuan.app.chat` 并完成 ADB 授权。
+
+## Waydroid 窗口尺寸
+
+元宝按 `sw600dp` 布局（窗口宽 1012 像素），显示区宽度不足时右侧会被裁掉——
+福利页的“兑换商城”、模板卡片的“做同款”按钮和聊天页最右侧的模式入口都会缺失，
+视觉模型因此看不到入口。当前配置让显示区正好容纳应用宽度：
+
+```bash
+waydroid prop set persist.waydroid.width 720      # 720 × 1.5 = 1080 像素宽
+waydroid prop set persist.waydroid.height 1067    # 1067 × 1.5 = 1600 像素高
+waydroid prop set persist.waydroid.multi_windows false   # 应用铺满显示区
+waydroid session stop && waydroid session start
+```
+
+校验方式：`adb shell wm size` 应输出 `Physical size: 1080x1600`，
+`dumpsys activity top` 里元宝窗口的 `mBounds` 宽度不应超过显示区宽度。
 
 ## 定时运行
 

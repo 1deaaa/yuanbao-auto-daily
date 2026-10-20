@@ -487,10 +487,30 @@ class ExecutorObservationMixin:
 
         observation = attach_supplemental_progress(observation)
         new_welfare_page = is_new_welfare_page(observation)
+
+        def reveal_same_template_progress(current: Observation) -> Observation:
+            """补一次滚动以读到每日任务区末尾的“做同款”行。
+
+            “做同款”排在写作、拍题、P图之后，通常还在屏幕下方；报告看不到它的
+            真实计数时只能按本地缓存判断，可能把实际没做的任务当成已完成。
+            """
+            if "same_template" in self._welfare_supplemental_task_progress:
+                return current
+            self.device.input(
+                "swipe",
+                str(self.width // 2),
+                str(round(self.height * WELFARE_TASK_LIST_SCROLL_START_RATIO)),
+                str(self.width // 2),
+                str(round(self.height * WELFARE_TASK_LIST_SCROLL_END_RATIO)),
+                "500",
+            )
+            time.sleep(1)
+            return attach_supplemental_progress(self.observe())
+
         if new_welfare_page:
             if has_complete_new_welfare_task_catalog(observation, local_report):
                 self._welfare_task_catalog_scrolled = True
-                return observation
+                return reveal_same_template_progress(observation)
             if (
                 not observation.nodes
                 and getattr(self, "_welfare_task_catalog_scrolled", False)
@@ -519,7 +539,7 @@ class ExecutorObservationMixin:
             if new_welfare_page:
                 if has_complete_new_welfare_task_catalog(observation, local_report):
                     self._welfare_task_catalog_scrolled = True
-                    return observation
+                    return reveal_same_template_progress(observation)
                 if not observation.nodes:
                     # 层级为空时，只有完成目录滚动后才允许模型读取当前截图。
                     self._welfare_task_catalog_scrolled = True

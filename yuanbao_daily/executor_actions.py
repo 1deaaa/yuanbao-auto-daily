@@ -15,7 +15,7 @@ from .errors import (
 from .models import (
     ToolResult,
 )
-from .ui import png_pixel
+from .ui import find_voice_press_point, png_pixel
 
 
 class ExecutorActionsMixin:
@@ -24,6 +24,7 @@ class ExecutorActionsMixin:
     # 工具名 -> 处理方法；新增工具只需实现同名处理方法。
     _TOOL_HANDLERS = {
         "tap": "_do_tap",
+        "hold_to_speak": "_do_hold_to_speak",
         "long_press": "_do_long_press",
         "swipe": "_do_swipe",
         "press_back": "_do_press_back",
@@ -114,10 +115,43 @@ class ExecutorActionsMixin:
         )
 
 
-    def _do_long_press(self, args: dict[str, Any]) -> ToolResult:
+    def _do_hold_to_speak(self, args: dict[str, Any]) -> ToolResult:
+        """按住语音输入控件并注入短测试语音。
+
+        控件位置由本地按“按住说话”语义定位，模型只负责表达意图，避免它在
+        多变布局上猜错长按对象而误触其它控件。
+        """
         observation = self.observe()
+        point = find_voice_press_point(observation.nodes)
+        if point is None:
+            return self._result(
+                False,
+                "当前页面没有找到语音输入控件，请根据最新截图确认页面要求",
+                stage=observation.stage,
+                visual_replan=True,
+            )
+        duration = max(600, min(10000, int(args.get("duration_ms", 2500))))
+        return self._press_control(point[0], point[1], duration, inject_audio=True)
+
+    def _do_long_press(self, args: dict[str, Any]) -> ToolResult:
         x, y = int(args["x"]), int(args["y"])
         duration = max(600, min(10000, int(args.get("duration_ms", 2000))))
+        return self._press_control(
+            x,
+            y,
+            duration,
+            inject_audio=args.get("_daily_ability_voice") is True,
+        )
+
+    def _press_control(
+        self,
+        x: int,
+        y: int,
+        duration: int,
+        inject_audio: bool = False,
+    ) -> ToolResult:
+        """长按页面控件；语音场景额外注入一段短测试语音。"""
+        observation = self.observe()
         if not (0 <= x < self.width and 0 <= y < self.height):
             raise AgentError(f"长按坐标越界：{x},{y}")
         covered = self._foreground_label_covering_tap(
@@ -131,7 +165,7 @@ class ExecutorActionsMixin:
                 visual_replan=True,
             )
         audio_session = None
-        if args.get("_daily_ability_voice") is True:
+        if inject_audio:
             audio_session = self._start_test_audio()
             if audio_session is not None:
                 time.sleep(0.15)

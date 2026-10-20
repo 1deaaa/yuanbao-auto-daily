@@ -37,6 +37,7 @@ from .device import (
     Device,
     WaydroidRuntime,
 )
+from .workflow import Workflow
 from .errors import (
     AgentError,
     AppUnresponsiveError,
@@ -106,7 +107,9 @@ def run_once(config: Config) -> None:
                 startup_observation = executor.observe_startup()
                 if startup_observation.stage == "welfare":
                     if workflow.terminal_restore:
-                        workflow.phase = "return_home"
+                        # 本地状态显示全部完成时，也要先读一次福利页任务目录，
+                        # 确认没有把没做的任务误记成已完成。
+                        workflow.phase = "report"
                     elif workflow.daily_ability_done:
                         # 同日恢复仍重新读取任务目录，页面改版或任务移除不沿用旧 target。
                         workflow.phase = "report"
@@ -326,6 +329,13 @@ def run_once(config: Config) -> None:
                             "请只依据这次最新截图重新规划，禁止重复相同动作或相同位置；"
                             "目标不可见时先滑动，浮层遮挡时先关闭浮层，点击后必须等待并确认页面阶段变化。"
                         )
+                    if workflow.phase == "open_target" and workflow.target == "same_template":
+                        visual_context += (
+                            "\n当前目标是福利中心的“做同款”任务：该任务行下方的一张推荐模板卡片"
+                            "就是入口，标题行右侧没有可点按钮。请点击任意一张模板卡片；"
+                            "工具返回的失败信息里会列出当前可点击的卡片及其坐标，"
+                            "卡片不在视口内时先滑动。"
+                        )
                     if workflow.phase == "return":
                         visual_context += (
                             "当前目标是返回福利中心；优先按截图点击左上角抽屉入口，再点侧栏“福利中心”；"
@@ -369,17 +379,33 @@ def run_once(config: Config) -> None:
                     call_id = None
                     used_cached_action = True
                 elif workflow.phase == "daily_ability" and not workflow.recovering:
-                    ability_context = (
-                        f"{context}\n如果当前是普通福利主页面，只允许调用 open_daily_ability；"
-                        "主轮播卡固定位置明确显示‘去体验’时传 button_visible=true，否则传 false。"
-                        "如果最新截图已显示点击后打开的体验浮层或体验页面，则调用 continue_daily_ability 并传"
-                        " experience_visible=true，把当前页面交给模型处理。不要识别标题/颜色，也不要滑动换卡。"
-                    )
-                    name, args, call_id = model.next_tool(
-                        observation,
-                        ability_context,
-                        allowed_tools=DAILY_ABILITY_TOOLS,
-                    )
+                    # 主卡状态在无障碍树里是固定位置的明确文案（“去体验”/“已完成”），
+                    # 本地已能读出；只有读不到时才让 VLM 从截图补充判断，避免模型
+                    # 在同一个二元问题上反复误判并耗尽重规划次数。
+                    local_card_status = daily_ability_card_status(observation)
+                    if local_card_status == "已完成":
+                        workflow.daily_ability_done = True
+                        workflow.daily_ability_evidence = DAILY_ABILITY_RULE_NAME
+                        workflow._persist_task_state()
+                        workflow.phase = "report"
+                        print("主轮播卡固定区域显示‘已完成’，本地直接确认完成")
+                        continue
+                    if local_card_status is None:
+                        ability_context = (
+                            f"{context}\n主卡固定位置的状态在无障碍树里读不到；"
+                            "请只依据最新截图判断：显示‘去体验’时传 button_visible=true，"
+                            "已显示‘已完成’时传 button_visible=false 并调用 continue_daily_ability "
+                            "把当前页面交给模型处理。不要识别标题/颜色，也不要滑动换卡。"
+                        )
+                        name, args, call_id = model.next_tool(
+                            observation,
+                            ability_context,
+                            allowed_tools=DAILY_ABILITY_TOOLS,
+                        )
+                    else:
+                        name, args = "open_daily_ability", {"button_visible": True}
+                        call_id = None
+                        print(f"主轮播卡本地读出状态：{local_card_status}，直接点击")
                     used_cached_action = False
                 elif (
                     workflow.phase == "daily_ability_experience"
@@ -388,8 +414,10 @@ def run_once(config: Config) -> None:
                 ):
                     experience_context = (
                         f"{context}\n你接手了主轮播卡当前打开的体验页面。按页面实际要求完成互动，"
-                        "只使用当前截图中可见的控件；如果页面明确要求按住控件（例如语音输入），"
-                        "调用 long_press 并按要求设置时长，然后等待结果。"
+                        "只使用当前截图中可见的控件。"
+                        "如果页面要求语音输入（出现‘按住说话’一类控件），调用 hold_to_speak 并设置时长，"
+                        "程序会按住该控件并注入短测试语音，随后你再调用 wait_5s 等待结果；"
+                        "不要用 long_press 去猜语音控件的坐标。"
                         "体验可能只是同一福利 WebView 中的浮层（例如出现‘去对话’按钮），此时仍要按截图继续操作，"
                         "不能因为阶段名称是 welfare 就直接核验或返回。完成后再返回福利中心，不要打开其它福利卡片。"
                     )
@@ -411,14 +439,41 @@ def run_once(config: Config) -> None:
                     name, args, call_id = forced_tool, {}, None
                     used_cached_action = False
                 elif forced_tool == "report_tasks":
-                    # 进度文字和页面语义也属于易变 UI，报告由 VLMM 读取最新截图；
-                    # 本地解析器只用于已有任务状态的安全校验，不替代视觉判断。
-                    name, args, call_id = model.next_tool(
-                        observation,
-                        f"{context}\n本阶段唯一允许调用 {forced_tool}；不得返回滑动、点击或其它工具。",
-                        forced_tool=forced_tool,
-                        allowed_tools=frozenset({forced_tool}),
-                    )
+                    # 进度计数在无障碍树里是明确文本，本地能读到时直接采用；
+                    # 只有读不到（空树或字段缺失）才让 VLMM 从最新截图补充，
+                    # 避免把可确定的读数交给概率性模型。
+                    local_report = workflow.local_task_report(observation)
+                    if local_report:
+                        name, args = forced_tool, local_report
+                        call_id = None
+                        print("任务进度由无障碍树直接读出，跳过视觉报告")
+                    else:
+                        name, args, call_id = model.next_tool(
+                            observation,
+                            f"{context}\n本阶段唯一允许调用 {forced_tool}；不得返回滑动、点击或其它工具。",
+                            forced_tool=forced_tool,
+                            allowed_tools=frozenset({forced_tool}),
+                        )
+                    used_cached_action = False
+                elif forced_tool == "verify_daily_ability":
+                    # 主卡状态是固定位置的明确文案，本地能读出时直接确认；
+                    # 读不到才让 VLMM 从截图补充。
+                    local_card_status = daily_ability_card_status(observation)
+                    if local_card_status in {"已完成", "去体验"}:
+                        name, args = forced_tool, {"card_status": local_card_status}
+                        call_id = None
+                        print(f"主轮播卡状态本地读出：{local_card_status}")
+                    else:
+                        forced_context = context + (
+                            f"\n本阶段唯一允许调用 {forced_tool}；"
+                            "主卡固定位置若读不到，请按 schema 报告‘未显示’，不得改用其它工具。"
+                        )
+                        name, args, call_id = model.next_tool(
+                            observation,
+                            forced_context,
+                            forced_tool=forced_tool,
+                            allowed_tools=frozenset({forced_tool}),
+                        )
                     used_cached_action = False
                 else:
                     forced_context = context

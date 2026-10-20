@@ -11,8 +11,10 @@ from .constants import (
     DAILY_TASK_MODE_ABILITY_STATION,
     TASK_ENTRY_ROW_MARKERS,
     TASK_LABELS,
+    TASK_MAX_PROGRESS,
     TASK_ORDER,
     TASK_STATE_SCHEMA,
+    TASK_TARGET_COUNTS,
 )
 from .models import (
     Observation,
@@ -101,7 +103,7 @@ class WorkflowStateMixin:
             return
         for key in TASK_ORDER:
             value = saved.get(key)
-            if isinstance(value, int) and 0 <= value <= 3:
+            if isinstance(value, int) and 0 <= value <= TASK_MAX_PROGRESS:
                 self.progress[key] = value
                 self.state_restored = True
         skipped = state.get("skipped_tasks")
@@ -122,9 +124,10 @@ class WorkflowStateMixin:
             self.daily_ability_done is True
             and all(
                 (
-                    self.progress.get(key) == 3
+                    self.progress.get(key) == TASK_TARGET_COUNTS.get(key, 3)
                     if self.config.force_all_daily_tasks
-                    else key in self.skipped_tasks or self.progress.get(key) == 3
+                    else key in self.skipped_tasks
+                    or self.progress.get(key) == TASK_TARGET_COUNTS.get(key, 3)
                 )
                 for key in TASK_ORDER
             )
@@ -169,14 +172,15 @@ class WorkflowStateMixin:
     def _merge_progress(
         self, values: dict[str, int], authoritative_keys: set[str] | None = None
     ) -> None:
-        """普通更新单调增加；首次权威福利页快照可纠正过高的恢复状态。"""
+        """普通更新单调增加；权威福利页快照可纠正过高或过低的恢复状态。
+
+        福利页任务行自己的“已完成 x/3”是唯一权威来源：即使处于强制任务模式
+        也必须以页面为准，否则会把实际没做的任务记成已完成（例如做同款被
+        记成 3/3，页面却仍是 0/3），当天就再也不会补做。
+        """
         for key, value in values.items():
             previous = self.progress.get(key)
-            if (
-                authoritative_keys
-                and key in authoritative_keys
-                and not self.config.force_all_daily_tasks
-            ):
+            if authoritative_keys and key in authoritative_keys:
                 self.progress[key] = value
             else:
                 self.progress[key] = max(value, previous if previous is not None else 0)
@@ -195,10 +199,13 @@ class WorkflowStateMixin:
             if key in self.skipped_tasks:
                 continue
             count = self.progress.get(key)
-            if count is None or count < 3:
+            if count is None or count < TASK_TARGET_COUNTS.get(key, 3):
                 self.target = key
                 self.phase = "open_target"
-                self.expected_count = min(3, (count or 0) + 1) if count is not None else 1
+                target = TASK_TARGET_COUNTS.get(key, 3)
+                self.expected_count = (
+                    min(target, (count or 0) + 1) if count is not None else 1
+                )
                 self.substate = {}
                 return
         self.target = None
@@ -211,7 +218,8 @@ class WorkflowStateMixin:
         """任务生成和奖励处理均成功后本地推进一次，避免重复请求视觉报告。"""
         if self.target in TASK_LABELS:
             current = self.progress.get(self.target) or 0
-            self.progress[self.target] = min(3, current + 1)
+            target = TASK_TARGET_COUNTS.get(self.target, 3)
+            self.progress[self.target] = min(target, current + 1)
         if self.target == "same_template":
             self.entry_points.pop("same_template", None)
             self.entry_points.pop("same_template:template", None)
@@ -265,7 +273,8 @@ class WorkflowStateMixin:
         incomplete = [
             TASK_LABELS[key]
             for key in TASK_ORDER
-            if key not in self.skipped_tasks and self.progress.get(key) != 3
+            if key not in self.skipped_tasks
+            and self.progress.get(key) != TASK_TARGET_COUNTS.get(key, 3)
         ]
         if incomplete:
             return ToolResult(False, f"仍有未完成任务：{'、'.join(incomplete)}")

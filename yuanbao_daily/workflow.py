@@ -285,42 +285,12 @@ class Workflow(
         if name == "tap" and observation.stage == "welfare" and self._ignored_welfare_tap(args, observation):
             return ToolResult(False, "已拒绝点击“邀请新用户”任务", {"visual_replan": True})
         if name == "tap" and self.target == "same_template":
-            if self.phase == "open_target" and not self._tap_hits_label(
-                args, observation, "做同款", allow_empty_welfare=True
-            ) and not self._tap_matches_task_entry(args, observation):
-                # 新版推荐模板卡片本身就是做同款任务入口，允许按任务行语义
-                # 校正到卡片中心，不要求存在独立“做同款”文字节点。
-                if observation.stage == "welfare" and not observation.nodes:
-                    pass
-                else:
-                    return ToolResult(
-                        False,
-                        "请点击福利中心中“做同款”任务入口或推荐模板卡片",
-                        {"visual_replan": True},
-                    )
-            if self.phase == "open_target" and not self._tap_hits_label(
-                args, observation, "做同款", allow_empty_welfare=True
-            ):
-                # WebView 的文字节点和图片节点经常分离，模型坐标可能落在同一
-                # 行的图片上。已有明确“做同款”文字时直接校正到文字中心，避免
-                # 把可确定的定位误判成模型失败。
-                entry_button = find_node(observation.nodes, "做同款", exact=True)
-                if entry_button is None:
-                    entry_button = find_node(observation.nodes, "做同款")
-                if entry_button is not None:
-                    args.update(
-                        {"x": entry_button.bounds.center[0], "y": entry_button.bounds.center[1]}
-                    )
-                elif not (
-                    (observation.stage == "welfare" and not observation.nodes)
-                    or self._tap_matches_task_entry(args, observation)
-                ):
-                    return ToolResult(
-                        False,
-                        "请点击福利中心中“做同款”任务入口"
-                        f"（阶段={observation.stage or '未知'}，Activity={observation.activity[:100] or '未知'}）",
-                        {"visual_replan": True},
-                    )
+            if self.phase == "open_target":
+                # 福利页的推荐模板卡片本身就是做同款入口：模型可以自由选择
+                # 任意一张卡片，点击落空时再按当前可见卡片校正。
+                same_template_error = self._resolve_same_template_tap(args, observation)
+                if same_template_error is not None:
+                    return same_template_error
             if self.phase == "perform":
                 if self.substate.get("template_clicked", False):
                     return ToolResult(False, "推荐模板已经点击，下一步应直接发送并等待生成")
@@ -480,7 +450,8 @@ class Workflow(
             name == "open_welfare" or result.data.get("stage") == "welfare"
         ):
             if self.terminal_restore:
-                self.phase = "return_home"
+                # 先读一次福利页任务目录再决定是否直接收尾。
+                self.phase = "report"
             elif self.daily_ability_done:
                 self.phase = "report"
             else:

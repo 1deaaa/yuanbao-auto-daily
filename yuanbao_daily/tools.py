@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from .constants import TASK_ORDER
+from .constants import TASK_ORDER, TASK_TARGET_COUNTS
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
@@ -82,6 +82,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "拍题、P图三项；若福利页出现‘做同款’任务并明确显示已完成 x/3，须一并纳入；"
                 "没有进度的推荐模板和邀请新用户不属于每日任务。"
                 "只有在编排器已滚动到每日任务区域后，才能按当前截图报告进度。"
+                "趣问元宝卡片的进度写作 (x/4)，x 是今天已完成的次数，"
+                "按实际数字报告，不要套用 3 次上限。"
             ),
             "parameters": {
                 "type": "object",
@@ -91,11 +93,31 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                         "items": {"type": "string", "enum": list(TASK_ORDER)},
                         "uniqueItems": True,
                     },
-                    "question": {"type": "integer", "minimum": 0, "maximum": 3},
-                    "writing": {"type": "integer", "minimum": 0, "maximum": 3},
-                    "image": {"type": "integer", "minimum": 0, "maximum": 3},
-                    "photo_question": {"type": "integer", "minimum": 0, "maximum": 3},
-                    "same_template": {"type": "integer", "minimum": 0, "maximum": 3},
+                    "question": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": TASK_TARGET_COUNTS["question"],
+                    },
+                    "writing": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": TASK_TARGET_COUNTS["writing"],
+                    },
+                    "image": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": TASK_TARGET_COUNTS["image"],
+                    },
+                    "photo_question": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": TASK_TARGET_COUNTS["photo_question"],
+                    },
+                    "same_template": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": TASK_TARGET_COUNTS["same_template"],
+                    },
                 },
                 "required": [
                     "available_tasks",
@@ -118,6 +140,25 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "type": "object",
                 "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}},
                 "required": ["x", "y"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "hold_to_speak",
+            "description": (
+                "按住页面上的语音输入控件并说话，用于明确要求语音输入的页面。"
+                "只需确认存在语音输入控件，无需自行判断坐标；"
+                "程序会按住该控件并注入短测试语音。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "duration_ms": {"type": "integer", "minimum": 600, "maximum": 10000},
+                },
+                "required": ["duration_ms"],
                 "additionalProperties": False,
             },
         },

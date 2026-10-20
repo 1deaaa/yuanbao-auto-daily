@@ -32,20 +32,6 @@ from .welfare import (
 class WorkflowEntriesMixin:
     """按职责拆分的混入类；方法实现与原主类完全一致。"""
 
-    def _entry_cache_key(self) -> str | None:
-        """返回当前可以复用的入口类型；未知阶段不使用坐标缓存。"""
-        if self.phase == "open_target" and self.target in TASK_ENTRY_MARKERS:
-            return self.target
-        if (
-            self.phase == "perform"
-            and self.target == "same_template"
-            and self.substate.get("entry_clicked")
-            and not self.substate.get("template_clicked")
-        ):
-            return "same_template:template"
-        return None
-
-
     @staticmethod
     def _usable_entry_node(node: Node) -> bool:
         """过滤邀请任务和活动页语义，避免把相邻卡片当成当前任务行。"""
@@ -88,13 +74,24 @@ class WorkflowEntriesMixin:
             height = max((node_interaction_bounds(node).bottom for node in nodes), default=0)
         if width <= 0 or height <= 0:
             return None
-        action_markers = TASK_ENTRY_ACTION_MARKERS.get(self.target, ())
+        row = self._entry_row_node(nodes)
+        action = self._entry_action_node(nodes, row)
+        # 新版做同款没有独立的“做同款”文字按钮，任务入口就是推荐模板卡片。
+        # 只有在任务行没有可用行动节点时才回退到卡片：页面残留的零边界
+        # “做同款”文案不算可用入口，否则会把点击推到任务行右侧的空白处，
+        # 页面毫无反应，模型只能反复点同一个无效坐标。
+        if self.target == "same_template" and row is not None and not self._usable_action(action):
+            cards = self._template_cards(observation, row)
+            if cards:
+                card = cards[0]
+                return card.bounds.center[0], card.bounds.center[1], max(90, card.bounds.height // 3)
+        if action is None and row is None:
+            return None
+        return self._entry_click_point(action, row, width)
+
+    def _entry_row_node(self, nodes: list[Node]) -> Node | None:
+        """按任务标题文案选出当前任务行节点。"""
         row_markers = TASK_ENTRY_ROW_MARKERS.get(self.target, ())
-        actions = [
-            node
-            for node in nodes
-            if any(self._matches_entry_marker(node, marker) for marker in action_markers)
-        ]
         row_candidates: list[tuple[int, Node]] = []
         max_row_height = 260
         for node in nodes:
@@ -109,8 +106,7 @@ class WorkflowEntriesMixin:
                     )
                     row_candidates.append((marker_index * 2 + (0 if exact else 1), node))
                     break
-
-        row = min(
+        return min(
             row_candidates,
             key=lambda item: (
                 item[0],
@@ -119,63 +115,64 @@ class WorkflowEntriesMixin:
             ),
             default=(0, None),
         )[1]
-        action: Node | None = None
-        if actions and row is not None:
-            nearby = [
-                node
-                for node in actions
-                if node is not row
-                and abs(
-                    node_interaction_bounds(node).center[1]
-                    - node_interaction_bounds(row).center[1]
-                )
-                <= max(180, node_interaction_bounds(row).height + 80)
-            ]
-            if self.target == "same_template" and row is not None:
-                # 模板卡片内部也可能带“做同款”字样，但它属于卡片而不是任务行
-                # 的行动按钮；只接受与任务行同一水平带的行动节点。
-                row_bounds = node_interaction_bounds(row)
-                band = max(40, row_bounds.height)
-                nearby = [
-                    node
-                    for node in nearby
-                    if row_bounds.top - band
-                    <= node_interaction_bounds(node).center[1]
-                    <= row_bounds.bottom + band
-                ]
-            if nearby:
-                action = min(
-                    nearby,
-                    key=lambda node: (
-                        abs(
-                            node_interaction_bounds(node).center[1]
-                            - node_interaction_bounds(row).center[1]
-                        ),
-                        -node_interaction_bounds(node).center[0],
-                    ),
-                )
-        if action is None and actions and row is None:
-            # “去提问”可能同时出现在顶部签到卡和任务列表；没有任务标题时
-            # 选择屏幕中更靠下的行动项，避免点击顶部卡片。
-            action = max(
+
+    def _entry_action_node(self, nodes: list[Node], row: Node | None) -> Node | None:
+        """选出与任务行同一水平带的行动按钮节点。"""
+        action_markers = TASK_ENTRY_ACTION_MARKERS.get(self.target, ())
+        actions = [
+            node
+            for node in nodes
+            if any(self._matches_entry_marker(node, marker) for marker in action_markers)
+        ]
+        if not actions:
+            return None
+        if row is None:
+            # 没有任务标题时（页面只暴露行动按钮），取屏幕中更靠下的行动项，
+            # 避免点到顶部签到卡的同名按钮。
+            return max(
                 actions,
                 key=lambda node: (
                     node_interaction_bounds(node).center[1],
                     node_interaction_bounds(node).center[0],
                 ),
             )
-        # 新版做同款没有独立的“做同款”文字按钮，任务入口就是推荐模板卡片。
-        # 只有在任务行没有可用行动节点时才回退到卡片：页面残留的零边界
-        # “做同款”文案不算可用入口，否则会把点击推到任务行右侧的空白处，
-        # 页面毫无反应，模型只能反复点同一个无效坐标。
-        if self.target == "same_template" and row is not None and not self._usable_action(action):
-            cards = self._template_cards(observation, row)
-            if cards:
-                card = cards[0]
-                return card.bounds.center[0], card.bounds.center[1], max(90, card.bounds.height // 3)
-        if action is None and row is None:
+        row_bounds = node_interaction_bounds(row)
+        nearby = [
+            node
+            for node in actions
+            if node is not row
+            and abs(
+                node_interaction_bounds(node).center[1] - row_bounds.center[1]
+            )
+            <= max(180, row_bounds.height + 80)
+        ]
+        if self.target == "same_template":
+            # 模板卡片内部也可能带“做同款”字样，但它属于卡片而不是任务行
+            # 的行动按钮；只接受与任务行同一水平带的行动节点。
+            band = max(40, row_bounds.height)
+            nearby = [
+                node
+                for node in nearby
+                if row_bounds.top - band
+                <= node_interaction_bounds(node).center[1]
+                <= row_bounds.bottom + band
+            ]
+        if not nearby:
             return None
+        return min(
+            nearby,
+            key=lambda node: (
+                abs(
+                    node_interaction_bounds(node).center[1] - row_bounds.center[1]
+                ),
+                -node_interaction_bounds(node).center[0],
+            ),
+        )
 
+    def _entry_click_point(
+        self, action: Node | None, row: Node | None, width: int
+    ) -> tuple[int, int, int]:
+        """合成入口点击坐标与纵向容差。"""
         anchor = action or row
         assert anchor is not None
         anchor_bounds = node_interaction_bounds(anchor)
@@ -203,7 +200,6 @@ class WorkflowEntriesMixin:
         )
         tolerance = max(70, min(180, anchor_height // 2 + 55))
         return x, y, tolerance
-
 
     @staticmethod
     def _usable_action(action: Node | None) -> bool:

@@ -47,7 +47,8 @@ from .constants import (
     VISUAL_EXCHANGE_TOOLS,
     VISUAL_NAVIGATION_TOOLS,
 )
-from .device import Device, WaydroidRuntime, is_adb_transport_failure
+from .device import Device, is_adb_transport_failure
+from .waydroid_runtime import WaydroidRuntime
 from .errors import (
     AgentError,
     AppUnresponsiveError,

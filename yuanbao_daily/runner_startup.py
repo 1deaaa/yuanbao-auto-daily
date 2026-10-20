@@ -17,7 +17,8 @@ from .constants import (
     VISUAL_NAVIGATION_TOOLS,
     VISUAL_REPLAN_MAX_ATTEMPTS,
 )
-from .device import Device, WaydroidRuntime
+from .device import Device
+from .waydroid_runtime import WaydroidRuntime
 from .errors import AgentError, AppUnresponsiveError, ManualActionRequired, RetryLimitExceeded
 from .executor import ToolExecutor
 from .models import Observation

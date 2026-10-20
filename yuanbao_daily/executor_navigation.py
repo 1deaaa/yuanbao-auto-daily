@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import time
 
 from .constants import (
@@ -33,6 +35,17 @@ from .ui import (
     find_node,
     node_interaction_bounds,
 )
+
+
+@dataclass
+class _WelfareEntryState:
+    """打开福利中心入口时的重试状态。"""
+
+    fallback_tapped: bool = False
+    return_link_fallback_attempted: bool = False
+    last_entry_tap_at: float | None = None
+    drawer_tap_attempts: int = 0
+    last_drawer_tap_at: float | None = None
 
 
 class ExecutorNavigationMixin:
@@ -402,78 +415,10 @@ class ExecutorNavigationMixin:
             ):
                 observation = self._go_to_ours()
             last_observation = observation
-            # 入口本身也可能在抽屉恢复期间暂时缺失；最多等待几秒后再使用已知布局坐标。
-            entry_deadline = time.monotonic() + min(8, WELFARE_LOAD_TIMEOUT)
-            fallback_tapped = False
-            return_link_fallback_attempted = False
-            last_entry_tap_at: float | None = None
-            drawer_tap_attempts = 0
-            last_drawer_tap_at: float | None = None
-            while time.monotonic() < entry_deadline:
-                if observation.stage == "welfare":
-                    return observation
-                webview_observation = self._welfare_webview_observation(
-                    observation, last_entry_tap_at
-                )
-                if webview_observation is not None:
-                    print("福利中心 WebView 已打开，无障碍树暂时为空，交由模型确认")
-                    return webview_observation
-                # 新版优先走左上角抽屉；只有没有抽屉控件的旧版页面才尝试
-                # “返回福利中心”消息入口及“我们”页兼容路径。
-                if (
-                    not return_link_fallback_attempted
-                    and last_entry_tap_at is not None
-                    and time.monotonic() - last_entry_tap_at
-                    >= WELFARE_RETURN_LINK_FALLBACK_DELAY
-                    and observation.stage == "chat"
-                    and PACKAGE_NAME in observation.activity.lower()
-                    and self._welfare_return_node(observation) is not None
-                    and self._welfare_drawer_toggle_node(observation) is None
-                ):
-                    return_link_fallback_attempted = True
-                    try:
-                        observation = self._go_to_ours()
-                        last_observation = observation
-                        last_entry_tap_at = None
-                        continue
-                    except AgentError as exc:
-                        print(f"返回福利中心链接无响应，旧版“我们”导航失败：{str(exc)[:160]}")
-                entry_node = self._welfare_entry_click_node(observation)
-                drawer_node = self._welfare_drawer_toggle_node(observation)
-                return_node = self._welfare_return_node(observation)
-                now = time.monotonic()
-                if entry_node is not None and last_entry_tap_at is None:
-                    self._tap_node(entry_node)
-                    last_entry_tap_at = time.monotonic()
-                elif drawer_node is not None and drawer_tap_attempts < 2 and (
-                    last_drawer_tap_at is None or now - last_drawer_tap_at >= 5
-                ):
-                    self._tap_node(drawer_node)
-                    drawer_tap_attempts += 1
-                    last_drawer_tap_at = now
-                    last_entry_tap_at = None
-                    print("新版聊天页未直接暴露福利入口，改从抽屉打开福利中心")
-                elif return_node is not None and last_entry_tap_at is None:
-                    x, y = self._welfare_return_tap_point(
-                        observation, return_node, self.width, self.height
-                    )
-                    self._tap_point(x, y)
-                    last_entry_tap_at = now
-                elif (
-                    not fallback_tapped
-                    and observation.stage == "ours"
-                    and time.monotonic() + 1 >= entry_deadline
-                ):
-                    # 仅在已识别的“我们”页使用历史布局后备，未知页面不得盲点。
-                    self._tap_point(
-                        round(self.width * WELFARE_ENTRY_FALLBACK_X_RATIO),
-                        round(self.height * WELFARE_ENTRY_FALLBACK_Y_RATIO),
-                    )
-                    fallback_tapped = True
-                    last_entry_tap_at = time.monotonic()
-                time.sleep(OURS_NAV_POLL_INTERVAL)
-                observation = self.observe()
-                last_observation = observation
+            entry_state = _WelfareEntryState()
+            opened = self._open_welfare_entry(observation, entry_state)
+            if opened is not None:
+                return opened
             # WebView 从详情页返回时偶尔需要数十秒恢复层级；在执行层内等待，避免把临时加载状态交给模型。
             deadline = time.monotonic() + WELFARE_LOAD_TIMEOUT
             while time.monotonic() < deadline:
@@ -522,6 +467,80 @@ class ExecutorNavigationMixin:
             detail = f"（阶段={last_observation.stage or '未知'}，Activity={last_observation.activity[:120] or '未知'}）"
         raise AgentError(f"福利中心没有加载出任务页面{detail}")
 
+
+
+    def _open_welfare_entry(
+        self,
+        observation: Observation,
+        state: _WelfareEntryState,
+    ) -> Observation | None:
+        """尝试打开福利中心入口；成功进入福利页时返回该观测。"""
+        # 入口本身也可能在抽屉恢复期间暂时缺失；最多等待几秒后再使用已知布局坐标。
+        entry_deadline = time.monotonic() + min(8, WELFARE_LOAD_TIMEOUT)
+        while time.monotonic() < entry_deadline:
+            if observation.stage == "welfare":
+                return observation
+            webview_observation = self._welfare_webview_observation(
+                observation, state.last_entry_tap_at
+            )
+            if webview_observation is not None:
+                print("福利中心 WebView 已打开，无障碍树暂时为空，交由模型确认")
+                return webview_observation
+            # 新版优先走左上角抽屉；只有没有抽屉控件的旧版页面才尝试
+            # “返回福利中心”消息入口及“我们”页兼容路径。
+            if (
+                not state.return_link_fallback_attempted
+                and state.last_entry_tap_at is not None
+                and time.monotonic() - state.last_entry_tap_at
+                >= WELFARE_RETURN_LINK_FALLBACK_DELAY
+                and observation.stage == "chat"
+                and PACKAGE_NAME in observation.activity.lower()
+                and self._welfare_return_node(observation) is not None
+                and self._welfare_drawer_toggle_node(observation) is None
+            ):
+                state.return_link_fallback_attempted = True
+                try:
+                    observation = self._go_to_ours()
+                    state.last_entry_tap_at = None
+                    continue
+                except AgentError as exc:
+                    print(f"返回福利中心链接无响应，旧版“我们”导航失败：{str(exc)[:160]}")
+            entry_node = self._welfare_entry_click_node(observation)
+            drawer_node = self._welfare_drawer_toggle_node(observation)
+            return_node = self._welfare_return_node(observation)
+            now = time.monotonic()
+            if entry_node is not None and state.last_entry_tap_at is None:
+                self._tap_node(entry_node)
+                state.last_entry_tap_at = time.monotonic()
+            elif drawer_node is not None and state.drawer_tap_attempts < 2 and (
+                state.last_drawer_tap_at is None or now - state.last_drawer_tap_at >= 5
+            ):
+                self._tap_node(drawer_node)
+                state.drawer_tap_attempts += 1
+                state.last_drawer_tap_at = now
+                state.last_entry_tap_at = None
+                print("新版聊天页未直接暴露福利入口，改从抽屉打开福利中心")
+            elif return_node is not None and state.last_entry_tap_at is None:
+                x, y = self._welfare_return_tap_point(
+                    observation, return_node, self.width, self.height
+                )
+                self._tap_point(x, y)
+                state.last_entry_tap_at = now
+            elif (
+                not state.fallback_tapped
+                and observation.stage == "ours"
+                and time.monotonic() + 1 >= entry_deadline
+            ):
+                # 仅在已识别的“我们”页使用历史布局后备，未知页面不得盲点。
+                self._tap_point(
+                    round(self.width * WELFARE_ENTRY_FALLBACK_X_RATIO),
+                    round(self.height * WELFARE_ENTRY_FALLBACK_Y_RATIO),
+                )
+                state.fallback_tapped = True
+                state.last_entry_tap_at = time.monotonic()
+            time.sleep(OURS_NAV_POLL_INTERVAL)
+            observation = self.observe()
+        return None
 
     @staticmethod
     def _welfare_webview_observation(

@@ -33,10 +33,8 @@ from .constants import (
     VISUAL_REPLAN_MAX_ATTEMPTS,
 )
 from .executor import ToolExecutor
-from .device import (
-    Device,
-    WaydroidRuntime,
-)
+from .device import Device
+from .waydroid_runtime import WaydroidRuntime
 from .workflow import Workflow
 from .errors import (
     AgentError,

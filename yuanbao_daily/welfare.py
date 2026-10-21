@@ -8,19 +8,26 @@ from typing import Any, Iterable
 
 from .constants import (
     ACTIVITY_PAGE_MARKERS,
+    QUESTION_CARD_TITLE,
+    WELFARE_ACTIVITY_MARKERS,
     DAILY_ABILITY_EXPERIENCE_OVERLAY_MARKERS,
     DEFAULT_CARD_NAME,
     LEGACY_DAILY_QUESTION_MARKERS,
     NEW_WELFARE_DAILY_TASKS,
     PACKAGE_NAME,
     TASK_ENTRY_ROW_MARKERS,
-    WEBVIEW_ACTIVITY_MARKER,
 )
 from .models import (
     Node,
     Observation,
 )
 from .ui import find_node
+
+def is_welfare_activity(activity: str) -> bool:
+    """判断 Activity 是否是元宝福利中心所在的 WebView 容器。"""
+    activity_lower = activity.lower()
+    return any(marker in activity_lower for marker in WELFARE_ACTIVITY_MARKERS)
+
 
 def is_daily_ability_experience_visible(observation: Observation) -> bool:
     """识别能力体验页或仍覆盖在福利页上的体验浮层。"""
@@ -84,7 +91,7 @@ def has_visible_exchange_product(
 def is_new_welfare_webview(nodes: Iterable[Node], activity: str) -> bool:
     """识别 2.88.0 福利 WebView 的页面外壳，而不是把积分栏当商城。"""
     activity_lower = activity.lower()
-    if WEBVIEW_ACTIVITY_MARKER not in activity_lower:
+    if not is_welfare_activity(activity_lower):
         return False
     visible = [node for node in nodes if node.bounds.area > 0]
     root_ids = {node.resource_id for node in visible}
@@ -105,6 +112,37 @@ def is_new_welfare_webview(nodes: Iterable[Node], activity: str) -> bool:
             "做同款模板",
         )
     )
+
+
+def parse_question_card_target(observation: Observation) -> int | None:
+    """读取趣问元宝卡片进度括号里的目标次数（如 (0/3) → 3）。
+
+    新版把计数拆成 “(”“0”“/”“3”“)” 五个兄弟节点，必须按同一行从左到右
+    拼起来才能读出分母；目标次数每天可能变化（3 或 4），不能写死在常量里。
+    """
+    if observation.stage != "welfare" or not observation.nodes:
+        return None
+    title = find_node(observation.nodes, QUESTION_CARD_TITLE)
+    if title is None or title.bounds.area <= 0:
+        return None
+    parts: list[tuple[int, str]] = []
+    for node in observation.nodes:
+        text = node.text.strip()
+        if not text or node is title or node.bounds.area <= 0:
+            continue
+        if not (title.bounds.top - 24 <= node.bounds.top <= title.bounds.bottom + 24):
+            continue
+        if node.bounds.left < title.bounds.right - 8:
+            continue
+        parts.append((node.bounds.left, text))
+    parts.sort()
+    joined = ""
+    for _, part in parts:
+        joined += part
+        match = re.search(r"([0-9])\s*/\s*([0-9])", joined)
+        if match is not None:
+            return int(match.group(2))
+    return None
 
 
 def parse_local_welfare_progress(observation: Observation) -> dict[str, Any] | None:
@@ -196,7 +234,7 @@ def is_new_welfare_page(observation: Observation) -> bool:
     """识别新版福利 WebView，避免把旧版问题列表套用新版目录约束。"""
     if (
         observation.stage != "welfare"
-        or WEBVIEW_ACTIVITY_MARKER not in observation.activity.lower()
+        or not is_welfare_activity(observation.activity)
     ):
         return False
     if not observation.nodes or is_new_welfare_webview(
@@ -287,7 +325,7 @@ def detect_stage(nodes: Iterable[Node], activity: str) -> str:
     # （活动规则/参与方式/做同款），不能当成提问/写作输入页，否则本地输入会在
     # 错误页面上耗尽重试次数。节点为空但 Activity 明确是元宝 WebView 时也视为
     # 活动页候选，交给 _close_activity_page 按返回键关闭。
-    if "webbrowseractivity" in activity_lower and any(
+    if is_welfare_activity(activity_lower) and any(
         marker in text for marker in ACTIVITY_PAGE_MARKERS
     ) and not has_welfare_catalog:
         return "activity"
@@ -304,7 +342,7 @@ def detect_stage(nodes: Iterable[Node], activity: str) -> str:
         # 正向证据。真实商城没有这些能力站或每日任务语义时再进入 exchange。
         return "welfare"
     if (
-        "webbrowseractivity" in activity_lower
+        is_welfare_activity(activity_lower)
         and {"规则", "记录"}.issubset(exact_visible)
         and "兑换商城" not in text
         and not any(

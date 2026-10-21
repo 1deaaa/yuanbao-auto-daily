@@ -26,6 +26,7 @@ from .errors import (
     AgentError,
     ManualActionRequired,
 )
+from .welfare import is_welfare_activity
 from .models import (
     Bounds,
     Node,
@@ -427,7 +428,7 @@ class ExecutorNavigationMixin:
                 if observation.stage == "welfare":
                     return observation
                 webview_observation = self._welfare_webview_observation(
-                    observation, last_entry_tap_at
+                    observation, entry_state.last_entry_tap_at
                 )
                 if webview_observation is not None:
                     print("福利中心 WebView 已打开，无障碍树暂时为空，交由模型确认")
@@ -438,26 +439,29 @@ class ExecutorNavigationMixin:
                 return_node = self._welfare_return_node(observation)
                 now = time.monotonic()
                 if entry_node is not None and (
-                    last_entry_tap_at is None or now - last_entry_tap_at >= 5
+                    entry_state.last_entry_tap_at is None
+                    or now - entry_state.last_entry_tap_at >= 5
                 ):
                     self._tap_node(entry_node)
-                    last_entry_tap_at = now
-                elif drawer_node is not None and drawer_tap_attempts < 2 and (
-                    last_drawer_tap_at is None or now - last_drawer_tap_at >= 5
+                    entry_state.last_entry_tap_at = now
+                elif drawer_node is not None and entry_state.drawer_tap_attempts < 2 and (
+                    entry_state.last_drawer_tap_at is None
+                    or now - entry_state.last_drawer_tap_at >= 5
                 ):
                     self._tap_node(drawer_node)
-                    drawer_tap_attempts += 1
-                    last_drawer_tap_at = now
-                    last_entry_tap_at = None
+                    entry_state.drawer_tap_attempts += 1
+                    entry_state.last_drawer_tap_at = now
+                    entry_state.last_entry_tap_at = None
                     print("福利侧栏尚未打开，重试新版抽屉入口")
                 elif return_node is not None and (
-                    last_entry_tap_at is None or now - last_entry_tap_at >= 5
+                    entry_state.last_entry_tap_at is None
+                    or now - entry_state.last_entry_tap_at >= 5
                 ):
                     x, y = self._welfare_return_tap_point(
                         observation, return_node, self.width, self.height
                     )
                     self._tap_point(x, y)
-                    last_entry_tap_at = now
+                    entry_state.last_entry_tap_at = now
                 time.sleep(WELFARE_LOAD_POLL_INTERVAL)
             if attempt == 0:
                 print("福利中心页面加载超时，正在重启元宝并重试")
@@ -549,7 +553,7 @@ class ExecutorNavigationMixin:
         """福利页 WebView 偶发没有无障碍文本时，等待渲染后交给视觉模型确认。"""
         if entry_started_at is None:
             return None
-        if "webbrowseractivity" not in observation.activity.lower():
+        if not is_welfare_activity(observation.activity):
             return None
         if time.monotonic() - entry_started_at < WELFARE_WEBVIEW_READY_DELAY:
             return None

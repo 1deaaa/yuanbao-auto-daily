@@ -83,7 +83,11 @@ class WorkflowAbilityMixin:
         self, name: str, args: dict[str, Any], result: ToolResult
     ) -> ToolResult:
         """体验阶段：记录语音提交，并在浮层消失后转入完成核验。"""
-        if name == "long_press" and args.get("_daily_ability_voice") is True:
+        if name == "hold_to_speak" or (
+            name == "long_press" and args.get("_daily_ability_voice") is True
+        ):
+            # 语音只提交一次：没有这个标记，本地强制动作会在每次生成结束后
+            # 再次按住“按住说话”，体验阶段永远退不出去（曾把 260 步耗尽）。
             self.daily_ability_voice_submitted = True
         evidence = result.data.get("entry_evidence")
         experience_visible = isinstance(evidence, dict) and evidence.get(
@@ -105,6 +109,8 @@ class WorkflowAbilityMixin:
     ) -> ToolResult:
         """能力站阶段推进：按当前阶段分派到对应的状态迁移。"""
         phase = self.phase
+        if phase == "daily_ability_experience":
+            self.daily_ability_experience_steps += 1
         if phase == "daily_ability" and name in {
             "open_daily_ability",
             "continue_daily_ability",

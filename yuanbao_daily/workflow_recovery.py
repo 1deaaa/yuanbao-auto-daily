@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from .constants import (
+    DAILY_ABILITY_EXPERIENCE_STEP_LIMIT,
     DAILY_ABILITY_EXPERIENCE_TOOLS,
     DAILY_ABILITY_TOOLS,
     IMAGE_TASKS,
@@ -15,6 +16,7 @@ from .constants import (
     TASK_STEPS,
     TEXT_TASKS,
 )
+from .welfare import is_welfare_activity
 from .models import (
     Node,
     Observation,
@@ -226,6 +228,17 @@ class WorkflowRecoveryMixin:
             and self.daily_ability_voice_submitted
             and observation.stage in {"chat", "app"}
         ):
+            return "return_to_welfare"
+        if (
+            self.phase == "daily_ability_experience"
+            and self.daily_ability_experience_steps > DAILY_ABILITY_EXPERIENCE_STEP_LIMIT
+        ):
+            # 体验页交互没有按预期结束时强制收尾：继续耗下去只会把整轮步数
+            # 耗在同一个页面上。
+            print(
+                "能力体验阶段步数超过上限，强制返回福利中心"
+                f"（{self.daily_ability_experience_steps} 步）"
+            )
             return "return_to_welfare"
         fixed_phases = {
             "daily_ability_wait": "wait_5s",
@@ -505,5 +518,5 @@ class WorkflowRecoveryMixin:
         if target == "same_template":
             if bool(evidence.get("template")):
                 return True
-            return stage == "app" and "webbrowseractivity" not in activity_lower
+            return stage == "app" and not is_welfare_activity(activity_lower)
         return False

@@ -1,5 +1,6 @@
-import os
+import ast
 import json
+import os
 import tempfile
 import unittest
 from dataclasses import replace
@@ -1432,6 +1433,81 @@ class 元宝任务测试(unittest.TestCase):
         with patch.object(device, "adb", return_value=processes) as adb:
             self.assertTrue(device.app_not_responding())
         adb.assert_called_once_with("shell", "dumpsys", "activity", "processes", timeout=15)
+
+    @staticmethod
+    def _星号导入的名字(module_path: Path, module: str | None) -> set:
+        """返回通配导入目标模块导出的公开名字。"""
+        package_dir = module_path.parent
+        target = (package_dir / f"{module}.py").resolve()
+        if not target.exists():
+            # 通配导入的是包：读取包的 __init__.py 里的 __all__。
+            package_init = (package_dir / module / "__init__.py").resolve()
+            if package_init.exists():
+                target = package_init
+            else:
+                return set()
+        tree = ast.parse(target.read_text(encoding="utf-8"))
+        exported = set()
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                for item in node.targets:
+                    if isinstance(item, ast.Name) and item.id == "__all__":
+                        exported |= {
+                            element.value
+                            for element in node.value.elts
+                            if isinstance(element, ast.Constant)
+                        }
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                exported.add(node.name)
+        return exported
+
+    def test_包内不得出现未定义的名称引用(self):
+        """静态检查：拆分后的模块不得引用未导入/未定义的名称。
+
+        分层重构中最容易漏掉的就是跨模块的名字（例如漏掉的导入、拆分后
+        留在旧作用域的局部变量），这类问题只在真机运行时才暴露。
+        """
+        import builtins
+
+        builtin_names = set(dir(builtins))
+        import yuanbao_daily
+
+        package_dir = Path(yuanbao_daily.__file__).parent
+        problems = []
+        for module_path in sorted(package_dir.glob("*.py")):
+            source = module_path.read_text(encoding="utf-8")
+            tree = ast.parse(source)
+            defined = set(builtin_names) | {"__name__", "__file__", "__doc__", "annotations"}
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        defined.add((alias.asname or alias.name).split(".")[0])
+                elif isinstance(node, ast.ImportFrom):
+                    for alias in node.names:
+                        if alias.name == "*":
+                            # 通配导入：把被导入模块的公开名字都算作已定义。
+                            defined |= self._星号导入的名字(module_path, node.module)
+                        else:
+                            defined.add((alias.asname or alias.name).split(".")[0])
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    defined.add(node.name)
+                elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                    defined.add(node.id)
+                elif isinstance(node, ast.arg):
+                    defined.add(node.arg)
+                elif isinstance(node, ast.ExceptHandler) and node.name:
+                    defined.add(node.name)
+                elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                    defined.update(node.names)
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Name)
+                    and isinstance(node.ctx, ast.Load)
+                    and node.id not in defined
+                ):
+                    problems.append(f"{module_path.name}:{node.lineno} 未定义名称 {node.id}")
+
+        self.assertEqual(problems, [], "\n".join(problems))
 
     def test_启动装配成功后进入福利页报告阶段(self):
         """启动装配：设备就绪 → 拉起应用 → 读取当天状态 → 停在报告阶段。"""
@@ -3968,6 +4044,132 @@ class 元宝任务测试(unittest.TestCase):
         )
         self.assertFalse(executor._drawer_is_open(closed))
         self.assertTrue(executor._is_new_chat_home(closed))
+
+    def test_趣问元宝目标次数按页面口径读取(self):
+        """卡片进度是 (0/3) 或 (0/4)，目标次数必须以页面为准。"""
+        def 卡片观测(分母: int):
+            return task.Observation(
+                b"", "", "",
+                (
+                    task.Node(
+                        "点击查看趣味内容或自主提问", "", "",
+                        "android.widget.TextView", False, True,
+                        task.Bounds(97, 379, 364, 406),
+                    ),
+                    task.Node("(", "", "", "android.widget.TextView", False, True,
+                              task.Bounds(361, 379, 376, 406)),
+                    task.Node("0", "", "", "android.widget.TextView", False, True,
+                              task.Bounds(372, 379, 388, 406)),
+                    task.Node("/", "", "", "android.widget.TextView", False, True,
+                              task.Bounds(384, 379, 396, 406)),
+                    task.Node(str(分母), "", "", "android.widget.TextView", False, True,
+                              task.Bounds(393, 379, 406, 406)),
+                    task.Node(")", "", "", "android.widget.TextView", False, True,
+                              task.Bounds(405, 379, 413, 406)),
+                ),
+                "WebBrowserActivity", "welfare",
+            )
+
+        self.assertEqual(task.parse_question_card_target(卡片观测(3)), 3)
+        self.assertEqual(task.parse_question_card_target(卡片观测(4)), 4)
+
+        workflow = task.Workflow(self.配置(), 假执行器())
+        workflow.phase = "report"
+        workflow.daily_ability_done = True
+        workflow._parse_report(
+            {
+                "available_tasks": ["question", "writing", "image", "photo_question"],
+                "question": 0,
+                "writing": 0,
+                "image": 0,
+                "photo_question": 0,
+                "same_template": 0,
+            },
+            卡片观测(3),
+        )
+        self.assertEqual(workflow.task_targets.get("question"), 3)
+        self.assertEqual(workflow._task_target("question"), 3)
+
+    def test_趣问元宝用推荐问题卡片作为入口(self):
+        """新版趣问元宝卡片：标题是零高度节点，入口是卡片里的推荐问题。"""
+        executor = 假执行器()
+        executor.width, executor.height = 1080, 1600
+        workflow = task.Workflow(self.配置(), executor)
+        workflow.phase = "open_target"
+        workflow.target = "question"
+        observation = task.Observation(
+            b"", "", "",
+            (
+                task.Node(
+                    "点击查看趣味内容或自主提问", "", "",
+                    "android.widget.TextView", False, True,
+                    task.Bounds(97, 379, 364, 406),
+                ),
+                task.Node(
+                    "冬天呼气为什么会看到白雾", "", "",
+                    "android.widget.Button", True, True,
+                    task.Bounds(97, 433, 310, 659),
+                ),
+                task.Node(
+                    "换一波", "", "",
+                    "android.widget.Button", True, True,
+                    task.Bounds(494, 676, 585, 708),
+                ),
+            ),
+            "WebBrowserActivity", "welfare",
+        )
+
+        action = workflow.local_entry_action(observation)
+        self.assertEqual(action, ("tap", {"x": 203, "y": 546}))
+        # 点击推荐问题卡片即完成一次提问，不再等待聊天输入框。
+        args = {"x": 203, "y": 546}
+        self.assertTrue(workflow._tap_hits_question_card(args, observation))
+        self.assertFalse(
+            workflow._tap_hits_question_card({"x": 540, "y": 692}, observation)
+        )
+
+    def test_语音提交成功后不再重复按住说话(self):
+        """hold_to_speak 成功后必须置位语音标志，否则体验阶段会无限循环。"""
+        workflow = task.Workflow(self.配置(), 假执行器())
+        workflow.phase = "daily_ability_experience"
+        workflow.daily_ability_experience_opened = True
+        result = task.ToolResult(True, "已长按并释放页面控件")
+        result.data["stage"] = "chat"
+
+        workflow._advance_daily_ability_experience(
+            "hold_to_speak", {"duration_ms": 2500}, result
+        )
+        self.assertTrue(workflow.daily_ability_voice_submitted)
+        # 语音提交且回到聊天页后，下一步应返回福利中心。
+        self.assertEqual(
+            workflow.expected_tool(task.Observation(b"", "", "", (), "", "chat")),
+            "return_to_welfare",
+        )
+        # 语音已提交后不再强制按住说话。
+        self.assertIsNone(
+            workflow.daily_ability_voice_action(
+                task.Observation(
+                    b"", "", "",
+                    (task.Node(
+                        "按住 说话", "", "", "android.widget.TextView", False, True,
+                        task.Bounds(447, 1367, 566, 1408),
+                    ),),
+                    "YBHomeActivityV2", "chat",
+                )
+            )
+        )
+
+    def test_能力体验阶段步数超上限时强制收尾(self):
+        """体验页卡住时必须有界退出，不能把整轮步数耗在同一个页面。"""
+        workflow = task.Workflow(self.配置(), 假执行器())
+        workflow.phase = "daily_ability_experience"
+        workflow.daily_ability_experience_steps = (
+            task.DAILY_ABILITY_EXPERIENCE_STEP_LIMIT + 1
+        )
+        self.assertEqual(
+            workflow.expected_tool(task.Observation(b"", "", "", (), "", "chat")),
+            "return_to_welfare",
+        )
 
     def test_能力体验聊天页检测到按住说话时强制长按(self):
         executor = 假执行器()

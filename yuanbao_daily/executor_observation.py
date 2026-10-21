@@ -8,12 +8,13 @@ from dataclasses import dataclass, field, replace
 import time
 
 from .constants import (
+    DAILY_ABILITY_VERIFY_PREPARE_TIMEOUT,
     PACKAGE_NAME,
     STARTUP_OBSERVE_POLL_INTERVAL,
     STARTUP_OBSERVE_TIMEOUT,
     UI_DUMP_ATTEMPTS,
     UI_DUMP_TIMEOUT,
-    WEBVIEW_ACTIVITY_MARKER,
+    WELFARE_ACTIVITY_MARKERS,
     WEBVIEW_UI_DUMP_ATTEMPTS,
     WEBVIEW_UI_DUMP_RETRY_DELAY,
     WEBVIEW_UI_DUMP_TIMEOUT,
@@ -38,6 +39,7 @@ from .ui import (
     parse_nodes,
 )
 from .welfare import (
+    daily_ability_card_status,
     detect_stage,
     has_complete_new_welfare_task_catalog,
     is_daily_ability_experience_visible,
@@ -57,7 +59,9 @@ class ExecutorObservationMixin:
             # 福利页探针给足完成一次压缩树 dump 的时间；仍失败时保留截图回退，
             # 不能把页面渲染竞态误判成 ADB 故障。
             activity = self.device.activity()
-            webview = WEBVIEW_ACTIVITY_MARKER in activity.lower()
+            webview = any(
+                marker in activity.lower() for marker in WELFARE_ACTIVITY_MARKERS
+            )
             ui_xml = ""
             nodes: tuple[Node, ...] = ()
             probe_count = (
@@ -439,6 +443,29 @@ class ExecutorObservationMixin:
         self._welfare_scroll_normalized = True
         print("福利 WebView 空层级，已将任务列表滚动位置标准化")
 
+
+    def prepare_daily_ability_card(self, observation: Observation) -> Observation:
+        """读主轮播卡状态前，把福利页滚回顶部并等待状态可读。
+
+        福利页会记住滚动位置：停在每日任务列表时主轮播卡不在视口，WebView
+        刚返回时又常有几秒空层级。此时直接点击或核验只会得到“状态不可见”，
+        模型反复空转也无法推进。
+        """
+        if observation.stage != "welfare":
+            return observation
+        deadline = time.monotonic() + DAILY_ABILITY_VERIFY_PREPARE_TIMEOUT
+        while time.monotonic() < deadline:
+            if daily_ability_card_status(observation) in {"已完成", "去体验"}:
+                return observation
+            if observation.nodes:
+                # 层级可读但主卡不在视口：滚回顶部再读一次。
+                self.reset_welfare_scroll()
+                self.normalize_welfare_scroll()
+                observation = self.observe()
+                continue
+            time.sleep(1.0)
+            observation = self.observe()
+        return observation
 
     def reset_welfare_scroll(self) -> None:
         """福利页每次重新打开后都重新校准滚动位置。"""

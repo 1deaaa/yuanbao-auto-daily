@@ -16,6 +16,7 @@ from .config import Config
 from .constants import (
     DAILY_ABILITY_EXPERIENCE_TOOLS,
     DAILY_ABILITY_RULE_NAME,
+    DAILY_ABILITY_TOOLS,
     LOCAL_DETERMINISTIC_TOOLS,
     PACKAGE_NAME,
     STABLE_MISSING_TASK_SCROLLS,
@@ -169,6 +170,12 @@ class TaskLoop:
             )
             if callable(prepare_report):
                 observation = prepare_report(observation)
+        if workflow.phase in {"daily_ability", "verify_daily_ability"}:
+            prepare_card = getattr(
+                self.executor, "prepare_daily_ability_card", None
+            )
+            if callable(prepare_card):
+                observation = prepare_card(observation)
         current_state = state_signature(
             observation.ui, observation.image, observation.activity
         )

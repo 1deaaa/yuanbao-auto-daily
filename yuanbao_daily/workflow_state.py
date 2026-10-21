@@ -124,10 +124,10 @@ class WorkflowStateMixin:
             self.daily_ability_done is True
             and all(
                 (
-                    self.progress.get(key) == TASK_TARGET_COUNTS.get(key, 3)
+                    self.progress.get(key) == self._task_target(key)
                     if self.config.force_all_daily_tasks
                     else key in self.skipped_tasks
-                    or self.progress.get(key) == TASK_TARGET_COUNTS.get(key, 3)
+                    or self.progress.get(key) == self._task_target(key)
                 )
                 for key in TASK_ORDER
             )
@@ -202,7 +202,7 @@ class WorkflowStateMixin:
             if count is None or count < TASK_TARGET_COUNTS.get(key, 3):
                 self.target = key
                 self.phase = "open_target"
-                target = TASK_TARGET_COUNTS.get(key, 3)
+                target = self._task_target(key)
                 self.expected_count = (
                     min(target, (count or 0) + 1) if count is not None else 1
                 )
@@ -214,11 +214,15 @@ class WorkflowStateMixin:
         self.substate = {}
 
 
+    def _task_target(self, key: str) -> int:
+        """返回任务的目标次数；页面给出的口径优先于默认常量。"""
+        return self.task_targets.get(key) or TASK_TARGET_COUNTS.get(key, 3)
+
     def _advance_after_task(self) -> None:
         """任务生成和奖励处理均成功后本地推进一次，避免重复请求视觉报告。"""
         if self.target in TASK_LABELS:
             current = self.progress.get(self.target) or 0
-            target = TASK_TARGET_COUNTS.get(self.target, 3)
+            target = self._task_target(self.target)
             self.progress[self.target] = min(target, current + 1)
         if self.target == "same_template":
             self.same_template_revealed = False
@@ -271,7 +275,7 @@ class WorkflowStateMixin:
             TASK_LABELS[key]
             for key in TASK_ORDER
             if key not in self.skipped_tasks
-            and self.progress.get(key) != TASK_TARGET_COUNTS.get(key, 3)
+            and self.progress.get(key) != self._task_target(key)
         ]
         if incomplete:
             return ToolResult(False, f"仍有未完成任务：{'、'.join(incomplete)}")

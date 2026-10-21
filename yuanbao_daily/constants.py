@@ -168,6 +168,16 @@ DAILY_ABILITY_EXPERIENCE_NAVIGATION_MARKERS = (
 )
 
 
+# 能力体验阶段允许的最大步数。体验页交互复杂（语音、问答、返回），但仍必须
+# 有界：超过该步数就强制返回福利中心，避免整轮步数被一个页面耗尽。
+DAILY_ABILITY_EXPERIENCE_STEP_LIMIT = 12
+
+
+# 核验主轮播卡前等待福利页渲染的最长时间：返回福利页后 WebView 常有几秒
+# 空层级或停在任务列表，直接核验会读不到主卡状态而空转。
+DAILY_ABILITY_VERIFY_PREPARE_TIMEOUT = 15.0
+
+
 DAILY_ABILITY_EXPERIENCE_NAVIGATION_TIMEOUT = 8.0
 
 
@@ -244,7 +254,10 @@ UI_DUMP_READ_DELAY = 0.25
 UI_DUMP_OPTIONS = ("--compressed",)
 
 
-WEBVIEW_ACTIVITY_MARKER = "webbrowseractivity"
+# 福利中心 WebView 的 Activity 标记。元宝 2.88 之后把福利页搬到了
+# .biz.welfare.ui.WelfareWebActivity，旧的 com.tencent.yuanbao.mp.components
+# .websdk.ext.ui.WebBrowserActivity 仍会出现在其它站内页，两者都要认。
+WELFARE_ACTIVITY_MARKERS = ("webbrowseractivity", "welfarewebactivity")
 
 
 WEBVIEW_UI_DUMP_ATTEMPTS = 1
@@ -498,8 +511,13 @@ TASK_ENTRY_ACTION_MARKERS: dict[str, tuple[str, ...]] = {
 }
 
 
+# 趣问元宝卡片在 2.88 之后的标题文案；卡片标题是零高度节点，
+# 用它可以把福利页滚回卡片位置，真正的入口是卡片里的推荐问题。
+QUESTION_CARD_TITLE = "点击查看趣味内容或自主提问"
+
+
 TASK_ENTRY_ROW_MARKERS: dict[str, tuple[str, ...]] = {
-    "question": ("问元宝任意问题", "问元宝问题"),
+    "question": ("问元宝任意问题", "问元宝问题", QUESTION_CARD_TITLE),
     "writing": ("使用写作能力",),
     "image": ("使用p图能力",),
     "photo_question": ("使用拍题能力",),

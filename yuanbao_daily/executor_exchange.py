@@ -7,7 +7,7 @@ import re
 import time
 
 from .constants import (
-    WEBVIEW_ACTIVITY_MARKER,
+    WELFARE_ACTIVITY_MARKERS,
     WELFARE_REWARD_BUTTON_Y_RATIO,
 )
 from .models import (
@@ -172,7 +172,10 @@ class ExecutorExchangeMixin:
         # 绿色“开心收下”按钮中心是可验证的亮绿色像素，普通任务行该位置为深色。
         if (
             observation.stage == "welfare"
-            or WEBVIEW_ACTIVITY_MARKER in observation.activity.lower()
+            or any(
+                marker in observation.activity.lower()
+                for marker in WELFARE_ACTIVITY_MARKERS
+            )
         ):
             x = self.width // 2
             y = round(self.height * WELFARE_REWARD_BUTTON_Y_RATIO)

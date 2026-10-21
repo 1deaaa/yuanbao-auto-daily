@@ -8,6 +8,7 @@ from .constants import (
     ACTIVITY_PAGE_MARKERS,
     DEFAULT_CARD_NAME,
     LEGACY_TASK_ENTRY_ACTION_X_RATIO,
+    QUESTION_CARD_TITLE,
     TASK_ENTRY_ACTION_MARKERS,
     TASK_ENTRY_ACTION_X_RATIO,
     TASK_ENTRY_MARKERS,
@@ -74,6 +75,21 @@ class WorkflowEntriesMixin:
             height = max((node_interaction_bounds(node).bottom for node in nodes), default=0)
         if width <= 0 or height <= 0:
             return None
+        if self.target == "question":
+            # 趣问元宝的入口是卡片里的推荐问题：点击卡片会带着该问题进入聊天，
+            # 本地入口与坐标校正都用同一个锚点，避免点到卡片标题旁的空白处。
+            cards = self._question_cards(observation)
+            if cards:
+                center = cards[0].bounds.center
+                print("使用无障碍语义定位趣问元宝推荐问题入口")
+                return center[0], center[1], max(90, cards[0].bounds.height // 3)
+            # 卡片不在视口时不能用通用锚点（标题行右侧没有可点按钮），
+            # 交给滚动逻辑把趣问元宝卡片带回视口；只有旧版页面直接暴露
+            # “去提问”按钮时才继续用通用锚点。
+            if not any(
+                self._matches_entry_marker(node, "去提问") for node in nodes
+            ):
+                return None
         row = self._entry_row_node(nodes)
         action = self._entry_action_node(nodes, row)
         # 新版做同款没有独立的“做同款”文字按钮，任务入口就是推荐模板卡片。
@@ -360,6 +376,39 @@ class WorkflowEntriesMixin:
             {"visual_replan": True},
         )
 
+    def _question_cards(self, observation: Observation) -> list[Node]:
+        """列出趣问元宝卡片里的推荐问题入口（点击卡片即完成一次提问）。"""
+        title = find_node(observation.nodes, QUESTION_CARD_TITLE)
+        if title is None or title.bounds.height <= 0:
+            return []
+        floor = title.bounds.bottom
+        cards = [
+            node
+            for node in observation.nodes
+            if node.enabled
+            and node.clickable
+            and node.bounds.area > 0
+            and node.bounds.top >= floor
+            and node.bounds.top <= floor + 400
+            and "换一波" not in node.searchable
+        ]
+        return sorted(cards, key=lambda node: (node.bounds.top, node.bounds.left))
+
+
+    def _tap_hits_question_card(
+        self, args: dict[str, Any], observation: Observation
+    ) -> bool:
+        """判断点击是否落在趣问元宝的推荐问题卡片上。"""
+        try:
+            x, y = int(args["x"]), int(args["y"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        return any(
+            node.bounds.left <= x <= node.bounds.right
+            and node.bounds.top <= y <= node.bounds.bottom
+            for node in self._question_cards(observation)
+        )
+
     def _semantic_entry_action(
         self, observation: Observation
     ) -> tuple[str, dict[str, int]] | None:
@@ -371,6 +420,7 @@ class WorkflowEntriesMixin:
             or not observation.nodes
         ):
             return None
+
         point = self._task_entry_point(observation)
         if point is None:
             return None

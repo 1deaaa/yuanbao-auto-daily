@@ -18,6 +18,7 @@ from .models import (
 )
 from .welfare import (
     has_authoritative_local_task_catalog,
+    parse_question_card_target,
     has_complete_new_welfare_task_catalog,
     is_new_welfare_page,
     merge_supplemental_task_progress,
@@ -136,6 +137,12 @@ class WorkflowReportsMixin:
                 not isinstance(value, str) or value not in TASK_ORDER for value in available
             ):
                 return ToolResult(False, "available_tasks 必须是任务目录中的字符串数组")
+        if observation is not None and self.phase == "report":
+            # 趣问元宝的目标次数写在卡片进度里（(0/3) 或 (0/4)），每天可能变化，
+            # 以页面为准，不能写死。
+            question_target = parse_question_card_target(observation)
+            if question_target is not None:
+                self.task_targets["question"] = question_target
         if self.config.force_all_daily_tasks:
             # 视觉报告仍用于读取当前可见进度；任务目录只决定入口可见性，不能
             # 在强制模式下将趣问元宝或做同款写入 skipped_tasks。

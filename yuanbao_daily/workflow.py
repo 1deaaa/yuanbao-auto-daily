@@ -75,6 +75,8 @@ class Workflow(
     daily_ability_verification_checks: int = 0
     daily_ability_experience_opened: bool = False
     daily_ability_voice_submitted: bool = False
+    daily_ability_experience_steps: int = 0
+    task_targets: dict[str, int] = field(default_factory=dict)
     progress: dict[str, int | None] = field(default_factory=lambda: {key: None for key in TASK_ORDER})
     phase: str = "navigate_welfare"
     target: str | None = None
@@ -126,7 +128,7 @@ class Workflow(
             result = self._continue_daily_ability(args, observation)
             if not result.ok:
                 return result
-            return self._after_successful_action(name, args, result)
+            return self._after_successful_action(name, args, result, observation)
         experience_error = self._guard_daily_ability_experience(
             name, args, observation
         )
@@ -155,7 +157,7 @@ class Workflow(
             result = self._parse_daily_ability_verification(args, observation)
             if not result.ok:
                 return result
-            return self._after_successful_action(name, args, result)
+            return self._after_successful_action(name, args, result, observation)
         if name == "complete_task":
             return self._complete_task_assertions()
         if name == "input_test_prompt":
@@ -195,10 +197,14 @@ class Workflow(
                 "兑换商城入口点击后仍停留在福利页，请依据最新截图重新定位",
                 {"stage": "welfare", "visual_replan": True},
             )
-        return self._after_successful_action(name, args, result)
+        return self._after_successful_action(name, args, result, observation)
 
     def _after_successful_action(
-        self, name: str, args: dict[str, Any], result: ToolResult
+        self,
+        name: str,
+        args: dict[str, Any],
+        result: ToolResult,
+        observation: Observation | None = None,
     ) -> ToolResult:
         """统一推进正常动作和卡住恢复动作后的工作流状态。"""
         if (

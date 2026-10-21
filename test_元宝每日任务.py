@@ -4045,6 +4045,18 @@ class 元宝任务测试(unittest.TestCase):
         self.assertFalse(executor._drawer_is_open(closed))
         self.assertTrue(executor._is_new_chat_home(closed))
 
+    def test_切换任务时清空上一轮的测试短语标记(self):
+        """拍题等任务不填测试文本，不能继承上一轮标记导致发送被拒。"""
+        executor = 假执行器()
+        executor.set_prompt_variant = Mock()
+        workflow = task.Workflow(self.配置(), executor)
+        workflow.daily_ability_done = True
+        workflow.progress.update({key: 3 for key in task.TASK_ORDER})
+        workflow.progress["photo_question"] = 0
+        workflow.target = "writing"
+        workflow._select_next()
+        executor.set_prompt_variant.assert_called_with(None)
+
     def test_趣问元宝目标次数按页面口径读取(self):
         """卡片进度是 (0/3) 或 (0/4)，目标次数必须以页面为准。"""
         def 卡片观测(分母: int):

@@ -189,6 +189,10 @@ class WorkflowStateMixin:
 
     def _select_next(self) -> None:
         self._clear_recovery("任务推进")
+        # 切换任务时清掉上一轮留下的测试短语标记：否则拍题这类不需要
+        # input_test_prompt 的任务会继承上一个任务的标记，发送校验把
+        # 应用自己填好的拍照题干误判成“不是固定测试文本”而一直拒绝提交。
+        self._reset_prompt_variant()
         if not self.daily_ability_done:
             self.target = None
             self.phase = "daily_ability"
@@ -213,6 +217,12 @@ class WorkflowStateMixin:
         self.phase = "open_exchange"
         self.substate = {}
 
+
+    def _reset_prompt_variant(self) -> None:
+        """清空执行器上的测试短语标记。"""
+        setter = getattr(self.executor, "set_prompt_variant", None)
+        if callable(setter):
+            setter(None)
 
     def _task_target(self, key: str) -> int:
         """返回任务的目标次数；页面给出的口径优先于默认常量。"""

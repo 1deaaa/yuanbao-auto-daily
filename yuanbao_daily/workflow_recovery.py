@@ -280,10 +280,16 @@ class WorkflowRecoveryMixin:
         # 做同款直接提交模板自带的内容：模板详情页已经填好了模板提示词和
         # 参考图，改写输入框会丢掉模板信息，福利页的“做同款 x/3”不会计数。
         if not self.substate.get("sent"):
-            # 拍题确认后有些版本会自动提交；有发送按钮时仍必须显式发送。
+            # 拍题确认后有些版本自动提交；另一些新版会留下一个空输入框，
+            # 这时必须先填入固定测试短语，否则执行层会拒绝空发送。
             if kind == "photo_question" and self.substate.get("confirmed"):
                 if self.executor._find_send(observation) is None:
                     return "wait_5s"
+                if (
+                    not self.substate.get("input")
+                    and self.executor._find_input(observation) is not None
+                ):
+                    return "input_test_prompt"
             return "send_message"
         if not self.substate.get("waited"):
             return "wait_5s"

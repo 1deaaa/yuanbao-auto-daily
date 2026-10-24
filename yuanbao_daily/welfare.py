@@ -114,25 +114,28 @@ def is_new_welfare_webview(nodes: Iterable[Node], activity: str) -> bool:
     )
 
 
-def parse_question_card_target(observation: Observation) -> int | None:
-    """读取趣问元宝卡片进度括号里的目标次数（如 (0/3) → 3）。
-
-    新版把计数拆成 “(”“0”“/”“3”“)” 五个兄弟节点，必须按同一行从左到右
-    拼起来才能读出分母；目标次数每天可能变化（3 或 4），不能写死在常量里。
-    """
+def _question_card_progress_parts(
+    observation: Observation,
+) -> tuple[int, int] | None:
+    """读取趣问元宝卡片的 (已完成/目标) 数字。"""
     if observation.stage != "welfare" or not observation.nodes:
         return None
     title = find_node(observation.nodes, QUESTION_CARD_TITLE)
-    if title is None or title.bounds.area <= 0:
+    if title is None:
         return None
+    title_bounds = title.interaction_bounds
     parts: list[tuple[int, str]] = []
     for node in observation.nodes:
         text = node.text.strip()
         if not text or node is title or node.bounds.area <= 0:
             continue
-        if not (title.bounds.top - 24 <= node.bounds.top <= title.bounds.bottom + 24):
+        if not (
+            title_bounds.top - 24
+            <= node.bounds.top
+            <= title_bounds.bottom + 24
+        ):
             continue
-        if node.bounds.left < title.bounds.right - 8:
+        if node.bounds.left < title_bounds.right - 8:
             continue
         parts.append((node.bounds.left, text))
     parts.sort()
@@ -141,8 +144,24 @@ def parse_question_card_target(observation: Observation) -> int | None:
         joined += part
         match = re.search(r"([0-9])\s*/\s*([0-9])", joined)
         if match is not None:
-            return int(match.group(2))
+            return int(match.group(1)), int(match.group(2))
+    # 某些 WebView 版本把整个计数合并到标题文本。
+    match = re.search(r"([0-9])\s*/\s*([0-9])", title.text)
+    if match is not None:
+        return int(match.group(1)), int(match.group(2))
     return None
+
+
+def parse_question_card_target(observation: Observation) -> int | None:
+    """读取趣问元宝卡片进度括号里的目标次数（如 (0/3) → 3）。"""
+    progress = _question_card_progress_parts(observation)
+    return progress[1] if progress is not None else None
+
+
+def parse_question_card_progress(observation: Observation) -> int | None:
+    """读取趣问元宝卡片当前已完成次数。"""
+    progress = _question_card_progress_parts(observation)
+    return progress[0] if progress is not None else None
 
 
 def parse_local_welfare_progress(observation: Observation) -> dict[str, Any] | None:
@@ -155,8 +174,14 @@ def parse_local_welfare_progress(observation: Observation) -> dict[str, Any] | N
     )
     progress: dict[str, int] = {}
     available: list[str] = []
+    question_progress = parse_question_card_progress(observation)
+    if question_progress is not None:
+        progress["question"] = question_progress
+        available.append("question")
     count_pattern = re.compile(r"(?:已完成|完成)?\s*([0-3])\s*/\s*3")
     for key, markers in TASK_ENTRY_ROW_MARKERS.items():
+        if key == "question" and "question" in progress:
+            continue
         label_nodes = [
             node
             for node in searchable_nodes

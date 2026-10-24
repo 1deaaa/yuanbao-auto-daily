@@ -80,7 +80,28 @@ class TaskLoop:
     def run(self) -> bool:
         """执行每日任务主循环；返回 True 表示本轮已全部完成。"""
         for step in range(1, self.config.max_steps + 1):
-            reconciled = self._reconcile_phase(step)
+            try:
+                reconciled = self._reconcile_phase(step)
+            except AgentError as exc:
+                # WebView 重绘期间 uiautomator 可能暂时没生成 XML 文件；
+                # 这是观测瞬态失败，不应直接终止整轮任务。
+                self.failures += 1
+                print(
+                    f"步骤 {step}：页面观测失败（{str(exc)[:160]}），"
+                    "将在下一步重新观测"
+                )
+                if self.failures >= self.config.max_retries:
+                    raise RetryLimitExceeded(
+                        f"页面观测连续失败 {self.failures} 次，达到最大重试次数",
+                        phase=self.workflow.phase,
+                        target=self.workflow.target or "",
+                        step=step,
+                        failures=self.failures,
+                        recent_action=self.recent_action,
+                    ) from exc
+                if self.config.retry_cooldown_seconds:
+                    time.sleep(self.config.retry_cooldown_seconds)
+                continue
             if reconciled is None:
                 continue
             observation, current_state, catalog_signature = reconciled

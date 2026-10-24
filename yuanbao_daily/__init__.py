@@ -91,6 +91,7 @@ from .welfare import (
     is_new_welfare_webview,
     merge_supplemental_task_progress,
     parse_local_welfare_progress,
+    parse_question_card_progress,
     parse_question_card_target,
 )
 from .workflow import Workflow
@@ -167,6 +168,7 @@ __all__ = [
     "normalize_tool_arguments",
     "parse_bounds",
     "parse_local_welfare_progress",
+    "parse_question_card_progress",
     "parse_question_card_target",
     "parse_nodes",
     "parse_run_time",

@@ -13,6 +13,7 @@ from .errors import (
     AgentError,
 )
 from .models import (
+    Observation,
     ToolResult,
 )
 from .ui import find_voice_press_point, png_pixel
@@ -362,13 +363,45 @@ class ExecutorActionsMixin:
         if self._has_evidence(after, "确认兑换", "确定兑换"):
             clicked = self._tap_text_button("确认兑换", "确定兑换", "确认") or clicked
             after = self.observe()
-        if not clicked and not self._has_exchange_success(after):
+        explicit_success = self._has_exchange_success(after)
+        debit = self._exchange_debit_evidence(after)
+        if not clicked and not explicit_success and debit is None:
             return self._result(False, "没有兑换确认弹窗或成功提示", stage=after.stage)
-        if not self._has_exchange_success(after):
+        if not explicit_success and debit is None:
             return self._result(False, "兑换后没有发现明确成功证据", stage=after.stage)
+        if not explicit_success and debit is not None:
+            before_points, cost, after_points = debit
+            self.exchange_confirmed = True
+            self._write_state("pending")
+            return self._result(
+                True,
+                f"已确认兑换成功：积分从 {before_points} 扣减 {cost}，余额 {after_points}",
+                stage=after.stage,
+                points_before=before_points,
+                cost=cost,
+                points_after=after_points,
+            )
         self.exchange_confirmed = True
         self._write_state("pending")
         return self._result(True, "已确认兑换且发现成功证据", stage=after.stage)
+
+
+    def _exchange_debit_evidence(
+        self, observation: Observation
+    ) -> tuple[int, int, int] | None:
+        """返回“兑换前积分 - 目标价格 = 当前积分”的账务证据。"""
+        before_points = getattr(self, "visual_exchange_points", None)
+        cost = getattr(self, "visual_exchange_cost", None)
+        after_points = self._read_exchange_points(observation)
+        if (
+            isinstance(before_points, int)
+            and isinstance(cost, int)
+            and isinstance(after_points, int)
+            and before_points >= cost
+            and after_points == before_points - cost
+        ):
+            return before_points, cost, after_points
+        return None
 
 
     def _do_open_prize_records(self, args: dict[str, Any]) -> ToolResult:

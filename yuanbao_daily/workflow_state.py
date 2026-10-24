@@ -44,6 +44,7 @@ class WorkflowStateMixin:
         self.daily_ability_experience_opened = False
         self.daily_ability_voice_submitted = False
         self.progress = {key: None for key in TASK_ORDER}
+        self.task_targets = {}
         self.skipped_tasks.clear()
         today = datetime.now(ZoneInfo(self.config.timezone_name)).date().isoformat()
         state = read_daily_state(self.config.state_path)
@@ -98,6 +99,13 @@ class WorkflowStateMixin:
                     "本轮将重新点击“去体验”"
                 )
             self.state_restored = True
+        saved_targets = state.get("task_targets")
+        if isinstance(saved_targets, dict):
+            self.task_targets = {
+                key: value
+                for key, value in saved_targets.items()
+                if key in TASK_ORDER and isinstance(value, int) and value > 0
+            }
         saved = state.get("task_progress")
         if not isinstance(saved, dict):
             return
@@ -163,6 +171,7 @@ class WorkflowStateMixin:
                 "task_progress": {
                     key: self.progress.get(key) for key in TASK_ORDER
                 },
+                "task_targets": dict(self.task_targets),
                 "skipped_tasks": sorted(self.skipped_tasks),
             }
         )
@@ -203,7 +212,7 @@ class WorkflowStateMixin:
             if key in self.skipped_tasks:
                 continue
             count = self.progress.get(key)
-            if count is None or count < TASK_TARGET_COUNTS.get(key, 3):
+            if count is None or count < self._task_target(key):
                 self.target = key
                 self.phase = "open_target"
                 target = self._task_target(key)
@@ -257,7 +266,11 @@ class WorkflowStateMixin:
             return False
         report = self._merge_local_report(report, observation)
         visible_count = report.get(self.target)
-        if not isinstance(visible_count, int) or visible_count < self.expected_count:
+        # expected_count 是下一轮要做的次数（例如 1/4），不是任务完成阈值。
+        # 页面已经显示 3/4 时不能把它误判为“任务已完成”而反复对账；
+        # 只有达到该任务页面实际目标次数才跳过入口。
+        target_count = self._task_target(self.target)
+        if not isinstance(visible_count, int) or visible_count < target_count:
             return False
         target_label = TASK_LABELS[self.target]
         result = self._parse_report(report, observation)

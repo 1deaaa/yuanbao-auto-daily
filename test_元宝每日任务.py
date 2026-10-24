@@ -1557,6 +1557,33 @@ class 元宝任务测试(unittest.TestCase):
             with self.assertRaises(task.RetryLimitExceeded):
                 task.start_session(config, runtime)
 
+    def test_主循环页面观测瞬态失败会重试而非直接崩溃(self):
+        """WebView XML 短暂缺失时，主循环应回到下一步观测。"""
+        workflow = Mock()
+        workflow.phase = "open_target"
+        workflow.target = "writing"
+        workflow.finished = False
+        workflow.recovering = False
+        workflow.expected_tool.return_value = "tap"
+        workflow.requires_visual_navigation.return_value = False
+        workflow.local_entry_action.return_value = ("tap", {"x": 1, "y": 1})
+        workflow.context.return_value = "上下文"
+        workflow.can_conclude_target_unavailable.return_value = False
+        workflow.reconcile_return_to_welfare.return_value = False
+        workflow.reconcile_visible_progress.return_value = False
+        workflow.task_catalog_signature.return_value = ()
+        workflow.dispatch.side_effect = lambda *args: (
+            setattr(workflow, "finished", True) or task.ToolResult(True, "完成")
+        )
+        executor = Mock()
+        obs = task.Observation(b"", "", "", (), "WebBrowserActivity", "welfare")
+        executor.observe.side_effect = [task.AgentError("XML 暂缺"), obs]
+        model = Mock()
+        config = replace(self.配置(), max_retries=3, retry_cooldown_seconds=0)
+
+        self.assertTrue(task.run_task_loop(config, executor, workflow, model))
+        self.assertEqual(executor.observe.call_count, 2)
+
     def test_主循环优先执行本地语义入口且不请求模型(self):
         """任务入口能本地定位时，模型不应再被调用一次。"""
         workflow = Mock()
@@ -4083,7 +4110,9 @@ class 元宝任务测试(unittest.TestCase):
             )
 
         self.assertEqual(task.parse_question_card_target(卡片观测(3)), 3)
+        self.assertEqual(task.parse_question_card_progress(卡片观测(3)), 0)
         self.assertEqual(task.parse_question_card_target(卡片观测(4)), 4)
+        self.assertEqual(task.parse_question_card_progress(卡片观测(4)), 0)
 
         workflow = task.Workflow(self.配置(), 假执行器())
         workflow.phase = "report"
@@ -5289,6 +5318,33 @@ class 元宝任务测试(unittest.TestCase):
         self.assertTrue(workflow.substate["entry_clicked"])
         self.assertEqual(executor.calls, [("tap", {"x": 50, "y": 30})])
 
+    def test_兑换成功仅刷新积分时用扣款证据确认(self):
+        """新版商城不显示成功文案时，积分从 39700 变 9700 仍是有效成功证据。"""
+        executor = task.ToolExecutor.__new__(task.ToolExecutor)
+        executor.exchange_target_clicked = True
+        executor.exchange_confirmed = False
+        executor.reward_card_name = "QQ超级会员3天卡"
+        executor.visual_exchange_points = 39700
+        executor.visual_exchange_cost = 30000
+        executor.visual_exchange_points_verified = True
+        executor.config = self.配置()
+        executor.today = "2026-10-25"
+        executor._tap_text_button = Mock(return_value=False)
+        executor._has_exchange_success = Mock(return_value=False)
+        executor._read_exchange_points = Mock(return_value=9700)
+        executor._write_state = Mock()
+        executor.observe = Mock(
+            return_value=task.Observation(b"", "", "", (), "WelfareWebActivity", "exchange")
+        )
+
+        result = executor._do_confirm_exchange({})
+
+        self.assertTrue(result.ok)
+        self.assertTrue(executor.exchange_confirmed)
+        executor._write_state.assert_called_once_with("pending")
+        self.assertIn("39700", result.message)
+        self.assertIn("9700", result.message)
+
     def test_视觉兑换页报告积分不足时跳过兑换(self):
         class 商城执行器(假执行器):
             def execute(self, name, args):
@@ -6162,6 +6218,24 @@ class 元宝任务测试(unittest.TestCase):
         )
         observation = task.Observation(b"", "", "", nodes, "", "exchange")
         self.assertTrue(task.ToolExecutor._has_exchange_success(observation))
+
+    def test_拍题确认后有空输入框时先填测试文本(self):
+        """新版拍题页确认图片后仍有输入框，必须先填文字再发送。"""
+        executor = 假执行器()
+        executor._find_send = Mock(return_value=task.Node(
+            "", "", "send", "android.widget.Button", True, True,
+            task.Bounds(900, 1300, 980, 1380),
+        ))
+        executor._find_input = Mock(return_value=task.Node(
+            "", "", "edConversationInput", "android.widget.EditText", True, True,
+            task.Bounds(50, 1250, 850, 1400),
+        ))
+        workflow = task.Workflow(self.配置(), executor)
+        workflow.phase = "perform"
+        workflow.target = "photo_question"
+        workflow.substate = {"image": True, "confirmed": True}
+        observation = task.Observation(b"", "", "", (), "", "photo_question")
+        self.assertEqual(workflow.expected_tool(observation), "input_test_prompt")
 
     def test_拍题确认图片后允许自动提交版本等待(self):
         executor = 假执行器()

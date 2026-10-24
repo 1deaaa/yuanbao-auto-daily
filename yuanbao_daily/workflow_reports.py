@@ -80,7 +80,15 @@ class WorkflowReportsMixin:
         reported_available = merged.get("available_tasks")
         if new_welfare_page:
             merged["available_tasks"] = list(NEW_WELFARE_DAILY_TASKS)
-            merged["question"] = 0
+            # 趣问元宝如今也是福利页的固定卡片任务，若当前层级读到了
+            # (x/N)，保留页面实数；读不到才临时按 0 处理。
+            merged["question"] = (
+                local_report.get("question")
+                if isinstance(local_report.get("question"), int)
+                else 0
+            )
+            if "question" in local_report:
+                merged["available_tasks"].insert(0, "question")
             if isinstance(local_report.get("same_template"), int):
                 merged["available_tasks"].append("same_template")
                 merged["same_template"] = local_report["same_template"]

@@ -25,6 +25,8 @@ from .state import (
     write_daily_state,
 )
 from .welfare import (
+    has_complete_new_welfare_task_catalog,
+    merge_supplemental_task_progress,
     parse_local_welfare_progress,
 )
 
@@ -46,6 +48,7 @@ class WorkflowStateMixin:
         self.progress = {key: None for key in TASK_ORDER}
         self.task_targets = {}
         self.skipped_tasks.clear()
+        self.confirmed_unavailable_tasks.clear()
         today = datetime.now(ZoneInfo(self.config.timezone_name)).date().isoformat()
         state = read_daily_state(self.config.state_path)
         if state.get("date") != today:
@@ -114,16 +117,28 @@ class WorkflowStateMixin:
             if isinstance(value, int) and 0 <= value <= TASK_MAX_PROGRESS:
                 self.progress[key] = value
                 self.state_restored = True
+        unavailable = state.get("confirmed_unavailable_tasks")
+        if isinstance(unavailable, list):
+            self.confirmed_unavailable_tasks = {
+                value for value in unavailable
+                if isinstance(value, str) and value in TASK_ORDER
+            }
         skipped = state.get("skipped_tasks")
         if isinstance(skipped, list):
-            self.skipped_tasks = {
+            restored_skips = {
                 value for value in skipped if isinstance(value, str) and value in TASK_ORDER
             }
-        if self.config.force_all_daily_tasks:
-            # 强制任务模式不接受历史跳过名单；失败只能保留未完成进度并重新定位。
-            self.skipped_tasks.clear()
-        if "same_template" in self.skipped_tasks:
-            # 旧版把做同款推荐卡固定排除；重新读取新版福利页前先作废该跳过结果。
+            self.skipped_tasks = (
+                restored_skips & self.confirmed_unavailable_tasks
+                if self.config.force_all_daily_tasks
+                else restored_skips
+            )
+        if (
+            "same_template" in self.skipped_tasks
+            and "same_template" not in self.confirmed_unavailable_tasks
+        ):
+            # 旧版把做同款推荐卡固定排除；重新读取新版福利页前先作废该历史跳过。
+            # 当前日期的“完整目录确认未提供”是新证据，应保留以免重启后再次空转。
             self.skipped_tasks.discard("same_template")
             self.progress["same_template"] = 0
         # 兑换已经完成或明确因积分不足跳过时，重启只需回到“我们”页收尾。
@@ -173,6 +188,7 @@ class WorkflowStateMixin:
                 },
                 "task_targets": dict(self.task_targets),
                 "skipped_tasks": sorted(self.skipped_tasks),
+                "confirmed_unavailable_tasks": sorted(self.confirmed_unavailable_tasks),
             }
         )
         write_daily_state(self.config.state_path, state)
@@ -314,9 +330,7 @@ class WorkflowStateMixin:
 
 
     def can_conclude_target_unavailable(self, observation: Observation) -> bool:
-        """确认目录已渲染但当前目标语义不存在，供有界滚动收敛使用。"""
-        if self.config.force_all_daily_tasks:
-            return False
+        """完整目录多次滚动仍不含当前任务时，确认页面没有提供该任务。"""
         if self.phase != "open_target" or self.target not in TASK_ENTRY_ROW_MARKERS:
             return False
         if observation.stage != "welfare":
@@ -329,6 +343,15 @@ class WorkflowStateMixin:
         target_markers = TASK_ENTRY_ROW_MARKERS[self.target]
         if any(any(marker.lower() in text for marker in target_markers) for text in visible):
             return False
+        if self.config.force_all_daily_tasks:
+            # 强制模式不能因失败跳过；只有本日首次报告已用完整目录确认任务
+            # 缺席，且当前仍能读取完整目录时，才允许稳定滚动后记为“页面未提供”。
+            if self.target not in self.confirmed_unavailable_tasks:
+                return False
+            report = merge_supplemental_task_progress(
+                observation, parse_local_welfare_progress(observation)
+            )
+            return has_complete_new_welfare_task_catalog(observation, report)
         other_rows = 0
         for key, row_markers in TASK_ENTRY_ROW_MARKERS.items():
             if key == self.target:
@@ -343,16 +366,18 @@ class WorkflowStateMixin:
         )
 
 
-    def skip_unavailable_target(self) -> bool:
-        """将已确认从当前任务目录移除的目标记入恢复状态并选择下一阶段。"""
-        if self.config.force_all_daily_tasks:
-            print("强制任务模式：不跳过当前任务，继续交给 VLM 重新定位")
-            return False
+    def skip_unavailable_target(self, observation: Observation | None = None) -> bool:
+        """仅将页面证实未提供的目标记入恢复状态；普通失败不可跳过。"""
         if self.target not in TASK_ORDER:
             return False
+        if self.config.force_all_daily_tasks:
+            if observation is None or not self.can_conclude_target_unavailable(observation):
+                print("强制任务模式：未获得完整目录缺席证据，不跳过当前任务")
+                return False
+            self.confirmed_unavailable_tasks.add(self.target)
         target = self.target
         self.skipped_tasks.add(target)
         self._persist_task_state()
         self._select_next()
-        print(f"当前福利任务目录未提供 {TASK_LABELS[target]}，已跳过旧任务入口")
+        print(f"当前福利任务目录已确认未提供 {TASK_LABELS[target]}，不再反复尝试入口")
         return True

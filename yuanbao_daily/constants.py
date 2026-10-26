@@ -452,9 +452,9 @@ TASK_MAX_PROGRESS = max(TASK_TARGET_COUNTS.values())
 NEW_WELFARE_DAILY_TASKS = ("writing", "photo_question", "image")
 
 
-# 用户可通过 FORCE_ALL_DAILY_TASKS=true 要求本轮始终执行全部五类业务：
-# 趣问元宝、写作、P图、拍题和做同款。页面是否存在入口仍交给 VLM 判断，
-# 但不能因为当前目录缺少文案、一次点击失败或页面暂时空树而写入跳过集合。
+# 用户可通过 FORCE_ALL_DAILY_TASKS=true 要求本轮始终尝试全部五类业务：
+# 趣问元宝、写作、P图、拍题和做同款。失败、空树、暂时缺少入口文案均不能跳过；
+# 只有完整任务目录及有界滚动共同证明页面没有提供某项任务时才允许收敛。
 
 
 FORCED_DAILY_TASKS = TASK_ORDER

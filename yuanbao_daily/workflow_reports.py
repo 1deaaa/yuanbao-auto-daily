@@ -184,6 +184,19 @@ class WorkflowReportsMixin:
                 }
                 if isinstance(local_report.get("same_template"), int):
                     authoritative_keys.add("same_template")
+                # 强制任务模式下不接受“失败即跳过”；但完整福利目录已读且
+                # “做同款”整行和进度都不存在，是页面明确未提供该任务的证据。
+                # 入口阶段仍要做稳定滚动确认后才允许收敛。
+                if self.config.force_all_daily_tasks:
+                    available_local = local_report.get("available_tasks", [])
+                    if (
+                        isinstance(available_local, list)
+                        and "same_template" not in available_local
+                        and not isinstance(local_report.get("same_template"), int)
+                    ):
+                        self.confirmed_unavailable_tasks.add("same_template")
+                    else:
+                        self.confirmed_unavailable_tasks.discard("same_template")
             elif empty_catalog_scrolled:
                 authoritative_keys = set(NEW_WELFARE_DAILY_TASKS)
                 if local_report is not None and isinstance(

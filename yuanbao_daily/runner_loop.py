@@ -223,7 +223,7 @@ class TaskLoop:
             self.stable_missing_scrolls >= STABLE_MISSING_TASK_SCROLLS
             and workflow.can_conclude_target_unavailable(observation)
         ):
-            workflow.skip_unavailable_target()
+            workflow.skip_unavailable_target(observation)
             self._reset_progress(current_state)
             return None
         if workflow.reconcile_return_to_welfare(observation):

@@ -86,6 +86,7 @@ class Workflow(
     entry_scroll_attempts: dict[str, int] = field(default_factory=dict)
     state_restored: bool = False
     skipped_tasks: set[str] = field(default_factory=set)
+    confirmed_unavailable_tasks: set[str] = field(default_factory=set)
     same_template_revealed: bool = False
     terminal_restore: bool = False
     recovering: bool = False

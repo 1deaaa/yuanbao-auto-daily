@@ -62,7 +62,7 @@ class 元宝任务测试(unittest.TestCase):
             return task.Config.from_env(Path(__file__).with_name(".env.test"))
 
     @staticmethod
-    def 完整福利页观测(做同款计数: int = 3):
+    def 完整福利页观测(做同款计数: int | None = 3):
         """构造一份含完整每日任务目录与计数的福利页观测。"""
         rows = (
             task.Node(
@@ -81,10 +81,13 @@ class 元宝任务测试(unittest.TestCase):
                 "使用P图能力生成3次结果，已完成3/3", "", "", "android.widget.TextView", False, True,
                 task.Bounds(40, 1200, 800, 1250),
             ),
-            task.Node(
-                f"试试大家都在玩的模版，已完成{做同款计数}/3", "", "",
-                "android.widget.TextView", False, True,
-                task.Bounds(40, 1300, 800, 1350),
+            *(
+                [task.Node(
+                    f"试试大家都在玩的模版，已完成{做同款计数}/3", "", "",
+                    "android.widget.TextView", False, True,
+                    task.Bounds(40, 1300, 800, 1350),
+                )]
+                if 做同款计数 is not None else []
             ),
         )
         return task.Observation(b"", "", "", rows, "WebBrowserActivity", "welfare")
@@ -2608,6 +2611,54 @@ class 元宝任务测试(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(workflow.skipped_tasks, {"same_template"})
         self.assertEqual(workflow.phase, "open_exchange")
+
+    def test_强制模式只在完整目录确认缺席后收敛做同款(self):
+        """失败时不跳过；完整福利目录确实没有做同款且稳定滚动后允许结束。"""
+        with tempfile.TemporaryDirectory() as directory:
+            config = replace(
+                self.配置(),
+                force_all_daily_tasks=True,
+                state_path=Path(directory) / "state.json",
+            )
+            workflow = task.Workflow(config, 假执行器())
+            workflow.daily_ability_done = True
+            workflow.task_targets["question"] = 3
+            workflow.phase = "report"
+            page_without_same_template = self.完整福利页观测(做同款计数=None)
+            result = workflow._parse_report(
+                {
+                    "available_tasks": list(task.TASK_ORDER),
+                    "question": 3,
+                    "writing": 3,
+                    "image": 3,
+                    "photo_question": 3,
+                    "same_template": 0,
+                },
+                page_without_same_template,
+            )
+            self.assertTrue(result.ok)
+            self.assertIn("same_template", workflow.confirmed_unavailable_tasks)
+            self.assertEqual(workflow.target, "same_template")
+            # 强制任务模式下，只有完整任务目录可以证明目标没有被页面提供；
+            # 空树、入口失败或不完整目录都不能作为跳过依据。
+            self.assertFalse(
+                workflow.can_conclude_target_unavailable(
+                    task.Observation(b"", "", "", (), "WebBrowserActivity", "welfare")
+                )
+            )
+            self.assertTrue(workflow.can_conclude_target_unavailable(page_without_same_template))
+            self.assertTrue(workflow.skip_unavailable_target(page_without_same_template))
+            self.assertIn("same_template", workflow.skipped_tasks)
+            self.assertEqual(workflow.phase, "open_exchange")
+
+    def test_强制模式不能仅因页面入口失败就跳过任务(self):
+        workflow = task.Workflow(
+            replace(self.配置(), force_all_daily_tasks=True), 假执行器()
+        )
+        workflow.phase = "open_target"
+        workflow.target = "same_template"
+        self.assertFalse(workflow.skip_unavailable_target())
+        self.assertNotIn("same_template", workflow.skipped_tasks)
 
     def test_福利目录稳定缺失目标时允许收敛(self):
         rows = []

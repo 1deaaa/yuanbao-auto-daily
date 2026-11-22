@@ -16,6 +16,7 @@ from .constants import (
     TASK_ENTRY_SCROLL_MAX_ATTEMPTS,
 )
 from .models import (
+    Bounds,
     Node,
     Observation,
     ToolResult,
@@ -33,12 +34,26 @@ from .welfare import (
 class WorkflowEntriesMixin:
     """按职责拆分的混入类；方法实现与原主类完全一致。"""
 
-    @staticmethod
-    def _usable_entry_node(node: Node) -> bool:
+    def _entry_node_bounds(self, node: Node) -> Bounds | None:
+        """读取任务控件边界；过大的祖先容器不作为入口定位依据。"""
+        if node.bounds.area > 0:
+            return node.bounds
+        parent = node.parent_bounds
+        if parent is None or parent.area <= 0:
+            return None
+        width = int(getattr(self.executor, "width", 0))
+        height = int(getattr(self.executor, "height", 0))
+        max_area = width * height * 0.35 if width > 0 and height > 0 else 400_000
+        if parent.area > max_area:
+            return None
+        return parent
+
+
+    def _usable_entry_node(self, node: Node) -> bool:
         """过滤邀请任务和活动页语义，避免把相邻卡片当成当前任务行。"""
         return bool(
             node.enabled
-            and node_interaction_bounds(node).area > 0
+            and self._entry_node_bounds(node) is not None
             and "邀请新用户" not in node.searchable
             and not any(
                 marker in node.searchable.lower() for marker in ACTIVITY_PAGE_MARKERS
@@ -70,9 +85,15 @@ class WorkflowEntriesMixin:
         height = int(getattr(self.executor, "height", 0))
         nodes = [node for node in observation.nodes if self._usable_entry_node(node)]
         if width <= 0:
-            width = max((node_interaction_bounds(node).right for node in nodes), default=0)
+            width = max(
+                (bounds.right for node in nodes if (bounds := self._entry_node_bounds(node))),
+                default=0,
+            )
         if height <= 0:
-            height = max((node_interaction_bounds(node).bottom for node in nodes), default=0)
+            height = max(
+                (bounds.bottom for node in nodes if (bounds := self._entry_node_bounds(node))),
+                default=0,
+            )
         if width <= 0 or height <= 0:
             return None
         if self.target == "question":
@@ -101,6 +122,9 @@ class WorkflowEntriesMixin:
             if cards:
                 card = cards[0]
                 return card.bounds.center[0], card.bounds.center[1], max(90, card.bounds.height // 3)
+            # 做同款入口是推荐卡片，不是任务标题行。若本轮无障碍树没有暴露
+            # 卡片或行动按钮，不能把点击校正到标题行；由视觉模型按截图选择。
+            return None
         if action is None and row is None:
             return None
         return self._entry_click_point(action, row, width)
@@ -111,7 +135,9 @@ class WorkflowEntriesMixin:
         row_candidates: list[tuple[int, Node]] = []
         max_row_height = 260
         for node in nodes:
-            bounds = node_interaction_bounds(node)
+            bounds = self._entry_node_bounds(node)
+            if bounds is None:
+                continue
             if bounds.height > max_row_height:
                 continue
             for marker_index, marker in enumerate(row_markers):
@@ -126,8 +152,8 @@ class WorkflowEntriesMixin:
             row_candidates,
             key=lambda item: (
                 item[0],
-                node_interaction_bounds(item[1]).top,
-                node_interaction_bounds(item[1]).area,
+                self._entry_node_bounds(item[1]).top,
+                self._entry_node_bounds(item[1]).area,
             ),
             default=(0, None),
         )[1]
@@ -138,6 +164,7 @@ class WorkflowEntriesMixin:
         actions = [
             node
             for node in nodes
+            if self._entry_node_bounds(node) is not None
             if any(self._matches_entry_marker(node, marker) for marker in action_markers)
         ]
         if not actions:
@@ -148,17 +175,18 @@ class WorkflowEntriesMixin:
             return max(
                 actions,
                 key=lambda node: (
-                    node_interaction_bounds(node).center[1],
-                    node_interaction_bounds(node).center[0],
+                    self._entry_node_bounds(node).center[1],
+                    self._entry_node_bounds(node).center[0],
                 ),
             )
-        row_bounds = node_interaction_bounds(row)
+        row_bounds = self._entry_node_bounds(row)
+        assert row_bounds is not None
         nearby = [
             node
             for node in actions
             if node is not row
             and abs(
-                node_interaction_bounds(node).center[1] - row_bounds.center[1]
+                self._entry_node_bounds(node).center[1] - row_bounds.center[1]
             )
             <= max(180, row_bounds.height + 80)
         ]
@@ -170,7 +198,7 @@ class WorkflowEntriesMixin:
                 node
                 for node in nearby
                 if row_bounds.top - band
-                <= node_interaction_bounds(node).center[1]
+                <= self._entry_node_bounds(node).center[1]
                 <= row_bounds.bottom + band
             ]
         if not nearby:
@@ -179,9 +207,9 @@ class WorkflowEntriesMixin:
             nearby,
             key=lambda node: (
                 abs(
-                    node_interaction_bounds(node).center[1] - row_bounds.center[1]
+                    self._entry_node_bounds(node).center[1] - row_bounds.center[1]
                 ),
-                -node_interaction_bounds(node).center[0],
+                -self._entry_node_bounds(node).center[0],
             ),
         )
 
@@ -191,10 +219,11 @@ class WorkflowEntriesMixin:
         """合成入口点击坐标与纵向容差。"""
         anchor = action or row
         assert anchor is not None
-        anchor_bounds = node_interaction_bounds(anchor)
+        anchor_bounds = self._entry_node_bounds(anchor)
+        assert anchor_bounds is not None
         x, y = anchor_bounds.center
-        action_bounds = node_interaction_bounds(action) if action is not None else None
-        row_bounds = node_interaction_bounds(row) if row is not None else None
+        action_bounds = self._entry_node_bounds(action) if action is not None else None
+        row_bounds = self._entry_node_bounds(row) if row is not None else None
         # 只有右侧的小行动节点才直接使用其中心；整行节点的中心通常落在
         # x=450 左右，必须改用右侧行动列。没有行动节点时同样只借用行的 y。
         if (
@@ -239,7 +268,10 @@ class WorkflowEntriesMixin:
             row = self._same_template_row(observation)
         if row is None:
             return []
-        floor = node_interaction_bounds(row).bottom
+        row_bounds = self._entry_node_bounds(row)
+        if row_bounds is None:
+            return []
+        floor = row_bounds.bottom
         cards = [
             node
             for node in observation.nodes
@@ -257,7 +289,8 @@ class WorkflowEntriesMixin:
         for node in observation.nodes:
             if not self._usable_entry_node(node):
                 continue
-            bounds = node_interaction_bounds(node)
+            bounds = self._entry_node_bounds(node)
+            assert bounds is not None
             if bounds.height > 260:
                 continue
             if any(self._matches_entry_marker(node, marker) for marker in markers):
@@ -301,7 +334,9 @@ class WorkflowEntriesMixin:
         row = self._same_template_row(observation)
         if row is None:
             return None
-        row_bounds = node_interaction_bounds(row)
+        row_bounds = self._entry_node_bounds(row)
+        if row_bounds is None:
+            return None
         band = max(40, row_bounds.height)
         for node in observation.nodes:
             if node is row or not node.enabled or node.bounds.area <= 0:
@@ -368,13 +403,9 @@ class WorkflowEntriesMixin:
             args.update({"x": card.bounds.center[0], "y": card.bounds.center[1]})
             print("模型点击未落在模板卡片，已按当前可见的推荐模板卡片重新定位")
             return None
-        hint = self.template_card_hint(observation)
-        return ToolResult(
-            False,
-            "请点击福利中心中“做同款”任务入口或推荐模板卡片"
-            + (f"；{hint}" if hint else ""),
-            {"visual_replan": True},
-        )
+        # WebView 的无障碍树可能只暴露部分文字、漏掉图片卡片。没有当前卡片
+        # 语义证据时，视觉模型是唯一能看到入口的组件；不要用不完整的树拦截它。
+        return None
 
     def _question_cards(self, observation: Observation) -> list[Node]:
         """列出趣问元宝卡片里的推荐问题入口（点击卡片即完成一次提问）。"""
@@ -421,6 +452,32 @@ class WorkflowEntriesMixin:
         ):
             return None
 
+        if self.target == "question" and not self.substate.get("question_chat_prepared"):
+            prepare = getattr(self.executor, "prepare_question_task_entry", None)
+            # 首次进入趣问时清理旧会话；若福利页回读未增长，下一轮保留
+            # 当前普通聊天上下文重试，避免反复新建临时会话导致任务计数不落账。
+            if callable(prepare) and self.prompt_retry_serial == 0:
+                prepared = prepare(observation)
+                if prepared.stage == "welfare":
+                    self.substate["question_chat_prepared"] = True
+                    observation = prepared
+            elif self.prompt_retry_serial > 0:
+                self.substate["question_chat_prepared"] = True
+
+        if (
+            self.target == "question"
+            and not self._question_cards(observation)
+            and bool(observation.image)
+            and self.entry_scroll_attempts.get("question_card", 0) < 2
+            and any(
+                any(marker.lower() in node.searchable for marker in TASK_ENTRY_ROW_MARKERS["question"])
+                for node in observation.nodes
+            )
+        ):
+            # 推荐问题卡片优先于任务行；让 local_entry_action 的滚动分支先
+            # 执行，避免直接进入普通聊天后福利计数不落账。
+            return None
+
         point = self._task_entry_point(observation)
         if point is None:
             return None
@@ -441,6 +498,31 @@ class WorkflowEntriesMixin:
             or not observation.nodes
         ):
             return None
+        if (
+            self.target == "question"
+            and not self._question_cards(observation)
+            and any(
+                any(marker.lower() in node.searchable for marker in TASK_ENTRY_ROW_MARKERS["question"])
+                for node in observation.nodes
+            )
+        ):
+            # 新版趣问的真实入口是推荐问题卡片，通常位于每日任务行上方；
+            # 任务页滚动到下方时先有限向上回滚，让卡片进入当前视口。
+            attempts = self.entry_scroll_attempts.get("question_card", 0)
+            if attempts < 2:
+                self.entry_scroll_attempts["question_card"] = attempts + 1
+                print(
+                    "趣问推荐问题卡片不在视口内，向上滚动定位"
+                    f"（{attempts + 1}/2）"
+                )
+                width, height = int(self.executor.width), int(self.executor.height)
+                return "swipe", {
+                    "x1": width // 2,
+                    "y1": round(height * 0.36),
+                    "x2": width // 2,
+                    "y2": round(height * 0.84),
+                    "duration_ms": 500,
+                }
         markers = TASK_ENTRY_ROW_MARKERS[self.target]
         if not any(
             node.bounds.area == 0
@@ -550,9 +632,35 @@ class WorkflowEntriesMixin:
         任务行、行动按钮和推荐模板按钮都是稳定语义，本地定位比“让模型先点、
         再被本地改写”更准，也省一次视觉请求；只有读不到语义时才交给模型。
         """
+        if self.phase == "open_exchange" and observation.stage == "welfare":
+            mall = self._welfare_exchange_entry_node(observation)
+            if mall is None or mall.bounds.area <= 0:
+                attempts = self.entry_scroll_attempts.get("exchange", 0)
+                if attempts < 2:
+                    self.entry_scroll_attempts["exchange"] = attempts + 1
+                    width, height = int(self.executor.width), int(self.executor.height)
+                    if width > 0 and height > 0:
+                        print(
+                            "兑换商城入口可能在福利页顶部，先本地回顶定位"
+                            f"（{attempts + 1}/2）"
+                        )
+                        return "swipe", {
+                            "x1": width // 2,
+                            "y1": round(height * 0.35),
+                            "x2": width // 2,
+                            "y2": round(height * 0.85),
+                            "duration_ms": 500,
+                        }
         if self.phase == "open_target" and self.target == "same_template":
-            # 做同款的入口是任意一张推荐模板卡片，选哪一张属于视觉决策，
-            # 仍由模型按最新截图挑选；这里只负责把离屏的任务行带回视口。
+            # 新版福利页优先暴露每日任务行右侧的“做同款”按钮；只有任务行
+            # 没有可用行动节点时，才把推荐模板卡片交给视觉模型选择。
+            row_action = self._same_template_row_action(observation)
+            if row_action is not None:
+                print("使用无障碍语义定位做同款任务行入口")
+                return "tap", {
+                    "x": row_action.bounds.center[0],
+                    "y": row_action.bounds.center[1],
+                }
             scroll_action = self._offscreen_entry_scroll_action(observation)
             if scroll_action is not None:
                 return scroll_action
@@ -607,7 +715,12 @@ class WorkflowEntriesMixin:
             return None
         config = getattr(self.executor, "config", None)
         card_name = getattr(config, "card_name", DEFAULT_CARD_NAME)
-        if has_visible_exchange_product(observation, card_name):
+        # 福利页下方也可能直接展示会员卡等促销商品；这不能证明已经进入商城。
+        # 只有页面阶段已经是 exchange，且当前商城视口显示目标商品时，才抑制
+        # 福利页入口识别。welfare 阶段始终按“兑换商城”语义查找导航入口。
+        if observation.stage == "exchange" and has_visible_exchange_product(
+            observation, card_name
+        ):
             return None
         node = find_semantic_node(observation.nodes, "兑换商城", exact=True)
         if node is None:

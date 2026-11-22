@@ -29,7 +29,7 @@ DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_RUN_TIME = "00:05"
 
 
-DEFAULT_TEST_PROMPT = "###!!!### Connectivity test only. No writing needed. Reply only ok."
+DEFAULT_TEST_PROMPT = "What is 2 plus 2? Reply with just the number."
 
 
 DEFAULT_TEST_IMAGE = str(ROOT / "测试题目.png")
@@ -88,7 +88,6 @@ LOCAL_DETERMINISTIC_TOOLS = frozenset(
         "return_to_welfare",
         "open_exchange",
         "redeem_qq_card",
-        "confirm_exchange",
         "open_prize_records",
         "use_bound_reward",
         "confirm_reward_use",
@@ -192,6 +191,69 @@ VISUAL_NAVIGATION_MAX_STEPS = 12
 
 
 VISUAL_REPLAN_MAX_ATTEMPTS = 8
+
+
+# 页面已经偏离阶段预期时，不再让本地配方反复重试；立即交给 VLM 接管。
+# 接管不是“一次自由动作”，而是在预算内连续多步按最新截图决策。
+VLM_TAKEOVER_STEP_LIMIT = 18
+
+
+# 固定任务完成后，再给新增任务一个有界巡查窗口。新增任务由视觉模型
+# 按当前福利页识别和执行；只做应用内、无外部影响的任务。
+EXTRA_TASK_STEP_LIMIT = 24
+
+
+EXTRA_TASK_REPORT_LIMIT = 4
+
+
+EXTRA_TASK_FORBIDDEN_MARKERS = (
+    "邀请",
+    "好友",
+    "助力",
+    "分享",
+    "拉新",
+    "组队",
+    "外部",
+    "下载",
+    "微信",
+    "qq群",
+    "绑定",
+    "授权",
+    "支付",
+    "充值",
+    "实名",
+)
+
+
+LOCAL_FAILURE_TAKEOVER_THRESHOLD = 2
+
+
+# 任务完成回写福利页需要短暂等待；轮询页面计数通常比固定 sleep 更快。
+PROGRESS_REFRESH_TIMEOUT = 10.0
+
+
+PROGRESS_REFRESH_POLL_INTERVAL = 0.8
+
+
+# 兑换时出现这些文案说明当前商品不是 QQ 超级会员卡。确认前必须拒绝，
+# 已经打开的详情页要退出，不能把“确认”当成通用按钮盲点。
+EXCHANGE_FOREIGN_PRODUCT_MARKERS = (
+    "绿钻",
+    "qq音乐",
+    "豪华绿钻",
+    "黄钻",
+    "音乐会员",
+    "酷狗",
+    "网易云",
+    "爱奇艺",
+    "腾讯视频",
+    "芒果tv",
+    "优酷",
+    "喜马拉雅",
+)
+
+
+EXCHANGE_TARGET_MARKERS = ("超级会员", "3天卡")
 
 
 # 只在福利任务目录连续多次没有任何语义/布局变化时收敛“目标不存在”；
@@ -330,16 +392,33 @@ WELFARE_ENTRY_FALLBACK_Y_RATIO = 0.364
 # 福利页主卡轮播内容和颜色会变化，只按固定主卡槽位的“去体验”按钮定位。
 
 
-DAILY_ABILITY_RULE_VERSION = 4
+DAILY_ABILITY_RULE_VERSION = 5
 
 
 DAILY_ABILITY_RULE_NAME = "main_carousel_experience_completed"
+
+
+DAILY_ABILITY_UNAVAILABLE_EVIDENCE = "main_carousel_slot_absent_after_bounded_checks_v2"
 
 
 DAILY_ABILITY_BUTTON_X_RATIO = 0.62
 
 
 DAILY_ABILITY_BUTTON_Y_RATIO = 0.516
+
+
+# 新版主轮播卡可能显示“AI录音笔”，行动文案为“去提问”，按钮位于顶部卡片
+# 右侧；仅在视觉模型明确报告这是语音能力卡时使用此固定槽位后备坐标。
+DAILY_ABILITY_VOICE_BUTTON_X_RATIO = 0.856
+
+
+DAILY_ABILITY_VOICE_BUTTON_Y_RATIO = 0.256
+
+
+DAILY_ABILITY_TOP_BUTTON_X_RATIO = 0.856
+
+
+DAILY_ABILITY_TOP_BUTTON_Y_RATIO = 0.256
 
 
 DAILY_ABILITY_CARD_MIN_Y_RATIO = 0.40
@@ -394,6 +473,17 @@ WRITING_SUBMIT_VERIFY_ATTEMPTS = 8
 
 
 WRITING_SUBMIT_VERIFY_INTERVAL = 0.5
+
+
+# 元宝聊天附件面板在收起键盘或返回新建会话时可能延迟重绘；关闭动作必须
+# 有界重复并重新读取页面，不能把一次返回键视为已经收起。
+ATTACHMENT_SHEET_DISMISS_ATTEMPTS = 3
+
+
+ATTACHMENT_SHEET_SETTLE_ATTEMPTS = 4
+
+
+ATTACHMENT_SHEET_SETTLE_INTERVAL = 0.35
 
 
 MAX_HISTORY_SUMMARY_CHARS = 1200

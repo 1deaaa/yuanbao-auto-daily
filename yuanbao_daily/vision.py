@@ -29,7 +29,6 @@ from .models import (
 )
 from .tools import TOOL_DEFINITIONS
 from .ui import (
-    encode_adb_input_text,
     normalize_tool_arguments,
 )
 

@@ -26,6 +26,7 @@ from .constants import (
     DEFAULT_TEST_AUDIO,
     DEFAULT_TEST_IMAGE,
     DEFAULT_TEST_PROMPT,
+    EXTRA_TASK_STEP_LIMIT,
     FAILURE_EXIT_STATUS,
     FORCED_DAILY_TASKS,
     IMAGE_TASKS,
@@ -59,9 +60,13 @@ from .errors import (
 )
 from .executor import ToolExecutor
 from .models import Bounds, Node, Observation, ToolResult
-from .reporting import build_failure_report, show_failure_alert
+from .reporting import (
+    build_failure_report,
+    copy_failure_report_to_clipboard,
+    show_failure_alert,
+)
 from .runner import main, next_run_at, run_daemon, run_once
-from .runner_loop import TaskLoop, run_task_loop
+from .runner_loop import Action, TaskLoop, run_task_loop
 from .runner_startup import Session, start_session
 from .state import read_daily_state, write_daily_state
 from .tools import TOOL_DEFINITIONS
@@ -86,6 +91,7 @@ from .welfare import (
     has_authoritative_local_task_catalog,
     has_complete_new_welfare_task_catalog,
     has_visible_exchange_product,
+    is_daily_ability_experience_activity,
     is_daily_ability_experience_visible,
     is_new_welfare_page,
     is_new_welfare_webview,
@@ -97,6 +103,7 @@ from .welfare import (
 from .workflow import Workflow
 
 __all__ = [
+    "Action",
     "AgentError",
     "AppUnresponsiveError",
     "Bounds",
@@ -113,6 +120,7 @@ __all__ = [
     "DEFAULT_TEST_IMAGE",
     "DEFAULT_TEST_PROMPT",
     "Device",
+    "EXTRA_TASK_STEP_LIMIT",
     "FAILURE_EXIT_STATUS",
     "FORCED_DAILY_TASKS",
     "IMAGE_TASKS",
@@ -147,6 +155,7 @@ __all__ = [
     "Workflow",
     "action_signature",
     "build_failure_report",
+    "copy_failure_report_to_clipboard",
     "compact_ui",
     "daily_ability_card_status",
     "detect_stage",
@@ -157,6 +166,7 @@ __all__ = [
     "has_complete_new_welfare_task_catalog",
     "has_visible_exchange_product",
     "is_adb_transport_failure",
+    "is_daily_ability_experience_activity",
     "is_daily_ability_experience_visible",
     "is_new_welfare_page",
     "is_new_welfare_webview",

@@ -8,6 +8,7 @@ from datetime import datetime
 from .constants import (
     DAILY_ABILITY_RULE_NAME,
     DAILY_ABILITY_RULE_VERSION,
+    DAILY_ABILITY_UNAVAILABLE_EVIDENCE,
     DAILY_TASK_MODE_ABILITY_STATION,
     TASK_ENTRY_ROW_MARKERS,
     TASK_LABELS,
@@ -25,9 +26,8 @@ from .state import (
     write_daily_state,
 )
 from .welfare import (
-    has_complete_new_welfare_task_catalog,
-    merge_supplemental_task_progress,
     parse_local_welfare_progress,
+    is_welfare_activity,
 )
 
 
@@ -40,6 +40,8 @@ class WorkflowStateMixin:
         self.terminal_restore = False
         self.daily_ability_done = False
         self.daily_ability_evidence = None
+        self.daily_ability_unavailable = False
+        self.daily_ability_unavailable_evidence = None
         self.daily_ability_click_attempts = 0
         self.daily_ability_button_checks = 0
         self.daily_ability_verification_checks = 0
@@ -102,6 +104,16 @@ class WorkflowStateMixin:
                     "本轮将重新点击“去体验”"
                 )
             self.state_restored = True
+        saved_ability_unavailable = state.get("daily_ability_unavailable")
+        if (
+            not self.daily_ability_done
+            and saved_ability_unavailable is True
+            and state.get("daily_ability_unavailable_evidence")
+            == DAILY_ABILITY_UNAVAILABLE_EVIDENCE
+        ):
+            self.daily_ability_unavailable = True
+            self.daily_ability_unavailable_evidence = DAILY_ABILITY_UNAVAILABLE_EVIDENCE
+            self.state_restored = True
         saved_targets = state.get("task_targets")
         if isinstance(saved_targets, dict):
             self.task_targets = {
@@ -128,11 +140,11 @@ class WorkflowStateMixin:
             restored_skips = {
                 value for value in skipped if isinstance(value, str) and value in TASK_ORDER
             }
-            self.skipped_tasks = (
-                restored_skips & self.confirmed_unavailable_tasks
-                if self.config.force_all_daily_tasks
-                else restored_skips
-            )
+            self.skipped_tasks = restored_skips
+        if self.config.force_all_daily_tasks:
+            # 固定任务即使在上次运行中被误标为未提供，也必须重新按今日页面进度核验。
+            self.skipped_tasks.clear()
+            self.confirmed_unavailable_tasks.clear()
         if (
             "same_template" in self.skipped_tasks
             and "same_template" not in self.confirmed_unavailable_tasks
@@ -183,6 +195,10 @@ class WorkflowStateMixin:
                     else None
                 ),
                 "daily_ability_evidence": self.daily_ability_evidence,
+                "daily_ability_unavailable": self.daily_ability_unavailable,
+                "daily_ability_unavailable_evidence": (
+                    self.daily_ability_unavailable_evidence
+                ),
                 "task_progress": {
                     key: self.progress.get(key) for key in TASK_ORDER
                 },
@@ -214,11 +230,12 @@ class WorkflowStateMixin:
 
     def _select_next(self) -> None:
         self._clear_recovery("任务推进")
+        self.prompt_retry_serial = 0
         # 切换任务时清掉上一轮留下的测试短语标记：否则拍题这类不需要
         # input_test_prompt 的任务会继承上一个任务的标记，发送校验把
         # 应用自己填好的拍照题干误判成“不是固定测试文本”而一直拒绝提交。
         self._reset_prompt_variant()
-        if not self.daily_ability_done:
+        if not self.daily_ability_done and not self.daily_ability_unavailable:
             self.target = None
             self.phase = "daily_ability"
             self.expected_count = None
@@ -239,6 +256,14 @@ class WorkflowStateMixin:
                 return
         self.target = None
         self.expected_count = None
+        if self.config.scan_extra_tasks and not self.extra_tasks_done:
+            if self.phase != "extra_tasks":
+                self.extra_task_steps = 0
+                self.extra_task_reports = 0
+                print("固定任务已完成，进入新增任务巡查（排除邀请和外部影响）")
+            self.phase = "extra_tasks"
+            self.substate = {}
+            return
         self.phase = "open_exchange"
         self.substate = {}
 
@@ -296,19 +321,31 @@ class WorkflowStateMixin:
 
 
     def reconcile_return_to_welfare(self, observation: Observation) -> bool:
-        """返回阶段观测到福利页时立即推进，抵抗 WebView 返回后的结果竞态。"""
-        if self.phase != "return" or observation.stage != "welfare":
+        """返回阶段观测到福利页时转入报告，等待页面计数确认任务结果。"""
+        if (
+            self.phase != "return"
+            or observation.stage != "welfare"
+            or not is_welfare_activity(observation.activity)
+        ):
             return False
-        self._advance_after_task()
-        print("已观测到福利中心页面，完成返回阶段并推进下一任务")
+        self.phase = "report"
+        self.substate = {}
+        self.progress_refresh_pending = True
+        print("已观测到福利中心页面，转入任务进度报告并等待页面计数确认")
         return True
 
 
     def _complete_task_assertions(self) -> ToolResult:
-        if (
-            self.daily_ability_done is not True
-            or self.daily_ability_evidence != DAILY_ABILITY_RULE_NAME
-        ):
+        ability_completed = (
+            self.daily_ability_done is True
+            and self.daily_ability_evidence == DAILY_ABILITY_RULE_NAME
+        )
+        ability_unavailable = (
+            self.daily_ability_unavailable is True
+            and self.daily_ability_unavailable_evidence
+            == DAILY_ABILITY_UNAVAILABLE_EVIDENCE
+        )
+        if not ability_completed and not ability_unavailable:
             return ToolResult(False, "主轮播卡尚未由页面状态确认‘已完成’")
         incomplete = [
             TASK_LABELS[key]
@@ -324,6 +361,16 @@ class WorkflowStateMixin:
         if self.phase != "complete":
             return ToolResult(False, "尚未完成元宝首页收尾导航")
         self.finished = True
+        if ability_unavailable:
+            if reward_unavailable:
+                return ToolResult(
+                    True,
+                    "今日固定任务已完成；能力站入口未由今日福利页提供，未记为完成；QQ超级会员卡积分不足，已安全跳过兑换",
+                )
+            return ToolResult(
+                True,
+                "今日固定任务与奖品使用均已完成；能力站入口未由今日福利页提供，未记为完成",
+            )
         if reward_unavailable:
             return ToolResult(True, "每日任务已完成；QQ超级会员3天卡积分不足，已安全跳过兑换")
         return ToolResult(True, "每日任务与奖品使用均已完成，本轮进入下一次等待")
@@ -344,14 +391,8 @@ class WorkflowStateMixin:
         if any(any(marker.lower() in text for marker in target_markers) for text in visible):
             return False
         if self.config.force_all_daily_tasks:
-            # 强制模式不能因失败跳过；只有本日首次报告已用完整目录确认任务
-            # 缺席，且当前仍能读取完整目录时，才允许稳定滚动后记为“页面未提供”。
-            if self.target not in self.confirmed_unavailable_tasks:
-                return False
-            report = merge_supplemental_task_progress(
-                observation, parse_local_welfare_progress(observation)
-            )
-            return has_complete_new_welfare_task_catalog(observation, report)
+            # 用户要求所有固定每日任务都必须尝试；缺少节点或完整目录不构成完成证据。
+            return False
         other_rows = 0
         for key, row_markers in TASK_ENTRY_ROW_MARKERS.items():
             if key == self.target:

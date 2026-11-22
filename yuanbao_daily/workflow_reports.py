@@ -6,6 +6,7 @@ from typing import Any
 import time
 
 from .constants import (
+    EXTRA_TASK_REPORT_LIMIT,
     FORCED_DAILY_TASKS,
     NEW_WELFARE_DAILY_TASKS,
     TASK_LABELS,
@@ -48,6 +49,12 @@ class WorkflowReportsMixin:
         available = local_report.get("available_tasks")
         if isinstance(available, list):
             report["available_tasks"] = list(available)
+        if self.config.force_all_daily_tasks and not all(
+            isinstance(report.get(key), int) for key in FORCED_DAILY_TASKS
+        ):
+            # 任一固定任务进度没有从树中确切读到时，避免把部分结果误当完整快照；
+            # 调用方随后让视觉模型根据当前截图补读。
+            return None
         return report
 
     @staticmethod
@@ -80,20 +87,15 @@ class WorkflowReportsMixin:
         reported_available = merged.get("available_tasks")
         if new_welfare_page:
             merged["available_tasks"] = list(NEW_WELFARE_DAILY_TASKS)
-            # 趣问元宝如今也是福利页的固定卡片任务，若当前层级读到了
-            # (x/N)，保留页面实数；读不到才临时按 0 处理。
-            merged["question"] = (
-                local_report.get("question")
-                if isinstance(local_report.get("question"), int)
-                else 0
-            )
-            if "question" in local_report:
+            if isinstance(local_report.get("question"), int):
                 merged["available_tasks"].insert(0, "question")
+                merged["question"] = local_report["question"]
+            for key in NEW_WELFARE_DAILY_TASKS:
+                if isinstance(local_report.get(key), int):
+                    merged[key] = local_report[key]
             if isinstance(local_report.get("same_template"), int):
                 merged["available_tasks"].append("same_template")
                 merged["same_template"] = local_report["same_template"]
-            else:
-                merged["same_template"] = 0
         elif (
             isinstance(local_available, list)
             and has_authoritative_local_task_catalog(observation, local_report)
@@ -132,7 +134,7 @@ class WorkflowReportsMixin:
                 previous = self.progress.get(key)
                 value = args.get(key, previous if previous is not None else 0)
                 values[key] = int(value)
-        except (KeyError, TypeError, ValueError) as exc:
+        except (KeyError, TypeError, ValueError):
             return ToolResult(False, "report_tasks 缺少固定进度字段")
         if any(
             value < 0 or value > TASK_TARGET_COUNTS.get(key, 3)
@@ -148,8 +150,11 @@ class WorkflowReportsMixin:
         if observation is not None and self.phase == "report":
             # 趣问元宝的目标次数写在卡片进度里（(0/3) 或 (0/4)），每天可能变化，
             # 以页面为准，不能写死。
+            reported_question_target = args.get("question_target")
+            if isinstance(reported_question_target, int) and 1 <= reported_question_target <= TASK_TARGET_COUNTS["question"]:
+                self.task_targets["question"] = reported_question_target
             question_target = parse_question_card_target(observation)
-            if question_target is not None:
+            if question_target is not None and "question_target" not in args:
                 self.task_targets["question"] = question_target
         if self.config.force_all_daily_tasks:
             # 视觉报告仍用于读取当前可见进度；任务目录只决定入口可见性，不能
@@ -170,24 +175,35 @@ class WorkflowReportsMixin:
                 and not observation.nodes
                 and getattr(self.executor, "_welfare_task_catalog_scrolled", False)
             )
-            if new_welfare_page and not complete_catalog and not empty_catalog_scrolled:
+            if (
+                new_welfare_page
+                and not complete_catalog
+                and not empty_catalog_scrolled
+                and not (
+                    self.config.force_all_daily_tasks
+                    and getattr(self.executor, "_welfare_task_catalog_scrolled", False)
+                )
+            ):
                 return ToolResult(
                     False,
                     "新版每日任务目录尚未完整显示；先滚动到写作、拍题和P图任务及其进度后再报告",
                     {"stage": "welfare", "visual_replan": True},
                 )
-            if complete_catalog and local_report is not None:
-                authoritative_keys = {
-                    key
-                    for key in NEW_WELFARE_DAILY_TASKS
-                    if isinstance(local_report.get(key), int)
-                }
-                if isinstance(local_report.get("same_template"), int):
-                    authoritative_keys.add("same_template")
-                # 强制任务模式下不接受“失败即跳过”；但完整福利目录已读且
-                # “做同款”整行和进度都不存在，是页面明确未提供该任务的证据。
-                # 入口阶段仍要做稳定滚动确认后才允许收敛。
-                if self.config.force_all_daily_tasks:
+            if self.config.force_all_daily_tasks:
+                # 目录不完整时以本次视觉报告为准，覆盖可能过期的当日状态，
+                # 未能确认完成的任务保持待办，后续仍会尝试执行。
+                authoritative_keys = set(FORCED_DAILY_TASKS)
+                visual_available = args.get("available_tasks")
+                if (
+                    isinstance(visual_available, list)
+                    and set(NEW_WELFARE_DAILY_TASKS).issubset(visual_available)
+                    and "question" in visual_available
+                    and "same_template" not in visual_available
+                ):
+                    # 视觉模型已报告完整的四项固定任务目录，且明确没有做同款；
+                    # 这是当前页面的缺席证据，不需要继续盲目滚动。
+                    self.confirmed_unavailable_tasks.add("same_template")
+                if complete_catalog and local_report is not None:
                     available_local = local_report.get("available_tasks", [])
                     if (
                         isinstance(available_local, list)
@@ -197,6 +213,11 @@ class WorkflowReportsMixin:
                         self.confirmed_unavailable_tasks.add("same_template")
                     else:
                         self.confirmed_unavailable_tasks.discard("same_template")
+            elif complete_catalog and local_report is not None:
+                authoritative_keys.update(
+                    key for key in TASK_ORDER
+                    if isinstance(local_report.get(key), int)
+                )
             elif empty_catalog_scrolled:
                 authoritative_keys = set(NEW_WELFARE_DAILY_TASKS)
                 if local_report is not None and isinstance(
@@ -205,6 +226,10 @@ class WorkflowReportsMixin:
                     authoritative_keys.add("same_template")
         if available is not None:
             self.skipped_tasks = set(TASK_ORDER) - set(available)
+        if self.config.force_all_daily_tasks:
+            self.skipped_tasks.clear()
+            if "same_template" in self.confirmed_unavailable_tasks:
+                self.skipped_tasks.add("same_template")
         merged_values = {}
         for key, value in values.items():
             if key in authoritative_keys:
@@ -221,6 +246,13 @@ class WorkflowReportsMixin:
             current = merged_values[self.target]
             if current < self.expected_count:
                 self._merge_progress(merged_values, authoritative_keys)
+                # 页面没有回写本次结果时，下一次文字任务必须换一个唯一短语；
+                # 元宝会忽略完全相同的问题，重复原短语不会推动福利计数。
+                if self.target in {"question", "writing"}:
+                    self.prompt_retry_serial += 1
+                # 入口可能经过活动页或视觉重规划后才重新定位；清空本轮
+                # 的聊天准备标记，下一次趣问必须重新建立空白会话。
+                self.substate = {}
                 self.phase = "open_target"
                 return ToolResult(
                     False,
@@ -252,6 +284,65 @@ class WorkflowReportsMixin:
         self._select_next()
         return ToolResult(True, "已更新福利中心任务进度")
 
+
+    def _parse_extra_tasks_report(
+        self, args: dict[str, Any], observation: Observation
+    ) -> ToolResult:
+        """记录新增任务巡查结果；只在福利页接受，避免在任务页提前收尾。"""
+        if self.phase != "extra_tasks":
+            return ToolResult(False, "当前不在新增任务巡查阶段")
+        if observation.stage != "welfare":
+            return ToolResult(
+                False,
+                "新增任务报告必须在福利中心页面调用；先返回福利中心再报告",
+                {"stage": observation.stage, "visual_replan": True},
+            )
+        done = args.get("done")
+        remaining = args.get("remaining_tasks")
+        excluded = args.get("excluded_tasks")
+        if not isinstance(done, bool):
+            return ToolResult(False, "report_extra_tasks 必须包含布尔 done 字段")
+        if not isinstance(remaining, list) or not isinstance(excluded, list):
+            return ToolResult(False, "remaining_tasks 和 excluded_tasks 必须是字符串数组")
+        remaining = [
+            str(value).strip()[:120]
+            for value in remaining[:12]
+            if str(value).strip()
+        ]
+        excluded = [
+            str(value).strip()[:120]
+            for value in excluded[:12]
+            if str(value).strip()
+        ]
+        self.extra_task_reports += 1
+        self.extra_task_notes = [
+            f"剩余新增任务：{'、'.join(remaining) or '无'}",
+            f"排除任务：{'、'.join(excluded) or '无'}",
+        ]
+        summary = str(args.get("summary") or "").strip()[:240]
+        if summary:
+            self.extra_task_notes.append(f"说明：{summary}")
+        if (
+            done
+            or not remaining
+            or self.extra_task_reports >= EXTRA_TASK_REPORT_LIMIT
+        ):
+            self.extra_tasks_done = True
+            self.extra_task_steps = 0
+            self.phase = "open_exchange"
+            self.substate = {}
+            return ToolResult(
+                True,
+                "新增任务巡查结束，进入兑换商城",
+                {"stage": "welfare", "extra_tasks_done": True},
+            )
+        # 模型报告还有剩余任务并继续做：给它一个新的有界窗口。
+        self.extra_task_steps = 0
+        return ToolResult(
+            True,
+            "已记录剩余新增任务，继续在应用内完成；完成后回到福利中心再次报告",
+            {"stage": "welfare", "remaining_tasks": remaining},
+        )
 
     def _parse_exchange_report(
         self, args: dict[str, Any], observation: Observation

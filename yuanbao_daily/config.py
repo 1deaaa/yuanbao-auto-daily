@@ -6,7 +6,6 @@ import re
 from pathlib import Path
 import os
 from dataclasses import dataclass
-from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from dotenv import load_dotenv
 
@@ -23,7 +22,6 @@ from .constants import (
     DEFAULT_REASONING_EFFORT,
     DEFAULT_RETRY_COOLDOWN,
     DEFAULT_RUN_TIME,
-    DEFAULT_STATE_PATH,
     DEFAULT_STOP_WAYDROID_AFTER_RUN,
     DEFAULT_TEST_AUDIO,
     DEFAULT_TEST_IMAGE,
@@ -109,6 +107,7 @@ class Config:
     prompt_path: Path
     state_path: Path
     force_all_daily_tasks: bool
+    scan_extra_tasks: bool
 
     @classmethod
     def from_env(cls, env_path: Path = ROOT / ".env") -> "Config":
@@ -168,6 +167,9 @@ class Config:
             prompt_path=prompt_path,
             state_path=state_path,
             force_all_daily_tasks=_env_bool("FORCE_ALL_DAILY_TASKS", False),
+            # 固定任务完成后由视觉模型巡查新增任务；默认开启。只做应用内、
+            # 无外部影响的任务，邀请/外部 App/分享类会被明确排除。
+            scan_extra_tasks=_env_bool("SCAN_EXTRA_TASKS", True),
         )
         if not config.test_prompt or len(config.test_prompt) > 200:
             raise AgentError("TEST_PROMPT 为空或过长")

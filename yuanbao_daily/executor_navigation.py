@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import time
 
@@ -47,10 +47,29 @@ class _WelfareEntryState:
     last_entry_tap_at: float | None = None
     drawer_tap_attempts: int = 0
     last_drawer_tap_at: float | None = None
+    drawer_scroll_attempts: int = 0
 
 
 class ExecutorNavigationMixin:
     """按职责拆分的混入类；方法实现与原主类完全一致。"""
+
+    @staticmethod
+    def _confirmed_welfare_observation(observation: Observation) -> bool:
+        """只有福利 WebView Activity 才能确认真正回到福利中心。"""
+        return observation.stage == "welfare" and is_welfare_activity(
+            observation.activity
+        )
+
+    @staticmethod
+    def _is_nested_app_activity(observation: Observation) -> bool:
+        """识别元宝首页之外的内部 Activity，供返回福利路径消费页面栈。"""
+        activity = observation.activity.lower()
+        return (
+            observation.stage in {"app", "chat", "unknown"}
+            and PACKAGE_NAME in activity
+            and "home.v2" not in activity
+            and not is_welfare_activity(activity)
+        )
 
     def _navigate_to_ours_until(self, deadline: float) -> Observation:
         """兼容旧版“我们”页；新版聊天首页是等价的有效落点。"""
@@ -234,12 +253,41 @@ class ExecutorNavigationMixin:
                         raise AgentError(f"无法回到元宝主页，应用重启失败：{restart_error}") from restart_error
         raise AgentError(f"无法回到元宝主页：{last_error or '未知错误'}")
 
+    def prepare_question_task_entry(self, observation: Observation) -> Observation:
+        """在点击趣问入口前清空上一轮聊天，再回到同一福利任务页。"""
+        if observation.stage != "welfare":
+            return observation
+        home = self._go_to_ours()
+        marker = find_node(home.nodes, "新建对话", exact=True)
+        target = None
+        if marker is not None:
+            bounds = marker.interaction_bounds
+            parents = [
+                node
+                for node in home.nodes
+                if node.enabled
+                and node.clickable
+                and node.bounds.area >= bounds.area
+                and node.bounds.left <= bounds.center[0] <= node.bounds.right
+                and node.bounds.top <= bounds.center[1] <= node.bounds.bottom
+            ]
+            target = min(parents, key=lambda node: node.bounds.area, default=None)
+        if target is not None:
+            self._tap_node(target)
+        elif PACKAGE_NAME in home.activity.lower() and "home.v2." in home.activity.lower():
+            self._tap_point(self.width - 72, 105)
+        else:
+            return observation
+        time.sleep(0.8)
+        print("趣问任务入口前已清空上一轮聊天会话")
+        return self._go_to_welfare()
+
 
     @staticmethod
     def _welfare_entry_node(observation: Observation) -> Node | None:
         """定位福利入口，兼容“福利中心”“元宝福利中心”“[icon] 福利中心”等文案。"""
         exact = find_node(observation.nodes, "福利中心", exact=True)
-        if exact is not None:
+        if exact is not None and exact.bounds.area > 0:
             return exact
         # 新版聊天首页把入口改成了带图标前缀的横幅文案；只有首页允许模糊匹配，
         # 避免在聊天记录或其它嵌套页面误点同名文本。横幅上有两个含“福利中心”
@@ -404,8 +452,22 @@ class ExecutorNavigationMixin:
                 # 福利专题页和任务列表共用 WebView Activity；先按页面语义返回，
                 # 避免把专题页交给“我们”页导航逻辑反复重启应用。
                 observation = self._close_activity_page(observation)
-                if observation.stage == "welfare":
+                if self._confirmed_welfare_observation(observation):
                     return observation
+            if self._is_nested_app_activity(observation):
+                # 模板详情、能力结果等元宝内部 Activity 可能连续占用多层返回栈。
+                # 逐层消费这些页面；一旦 Activity 已切回福利 WebView，立即返回，
+                # 避免绕行“我们”页把已经恢复的福利页再次返回到首页。
+                for _ in range(3):
+                    self.device.input("keyevent", "KEYCODE_BACK")
+                    time.sleep(1.2)
+                    observation = self.observe()
+                    if is_welfare_activity(observation.activity):
+                        if observation.stage != "welfare":
+                            observation = replace(observation, stage="welfare")
+                        return observation
+                    if not self._is_nested_app_activity(observation):
+                        break
             # 新版聊天首页把福利入口做成了横幅；当前页已有可用入口时不再强制
             # 绕行“我们”页，避免抽屉改版后启动流程整体失败。
             if (
@@ -425,7 +487,7 @@ class ExecutorNavigationMixin:
             while time.monotonic() < deadline:
                 observation = self.observe()
                 last_observation = observation
-                if observation.stage == "welfare":
+                if self._confirmed_welfare_observation(observation):
                     return observation
                 webview_observation = self._welfare_webview_observation(
                     observation, entry_state.last_entry_tap_at
@@ -482,7 +544,7 @@ class ExecutorNavigationMixin:
         # 入口本身也可能在抽屉恢复期间暂时缺失；最多等待几秒后再使用已知布局坐标。
         entry_deadline = time.monotonic() + min(8, WELFARE_LOAD_TIMEOUT)
         while time.monotonic() < entry_deadline:
-            if observation.stage == "welfare":
+            if self._confirmed_welfare_observation(observation):
                 return observation
             webview_observation = self._welfare_webview_observation(
                 observation, state.last_entry_tap_at
@@ -512,6 +574,30 @@ class ExecutorNavigationMixin:
             entry_node = self._welfare_entry_click_node(observation)
             drawer_node = self._welfare_drawer_toggle_node(observation)
             return_node = self._welfare_return_node(observation)
+            if (
+                self._drawer_is_open(observation)
+                and entry_node is None
+                and return_node is None
+                and state.drawer_scroll_attempts < 4
+            ):
+                # 抽屉会记住历史会话滚动位置；先把左侧菜单滚回顶部，
+                # 福利中心入口通常就在新建对话下方的固定区域。
+                self.device.input(
+                    "swipe",
+                    str(max(80, self.width // 5)),
+                    str(round(self.height * 0.18)),
+                    str(max(80, self.width // 5)),
+                    str(round(self.height * 0.78)),
+                    "600",
+                )
+                state.drawer_scroll_attempts += 1
+                print(
+                    "福利入口在抽屉历史滚动位置之外，正在回顶"
+                    f"（{state.drawer_scroll_attempts}/4）"
+                )
+                time.sleep(0.8)
+                observation = self.observe()
+                continue
             now = time.monotonic()
             if entry_node is not None and state.last_entry_tap_at is None:
                 self._tap_node(entry_node)

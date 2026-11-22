@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-import base64
 import hashlib
 import json
 import re
@@ -96,30 +94,6 @@ def png_pixel(image: bytes, x: int, y: int) -> tuple[int, int, int, int] | None:
         return values if channels == 4 else (*values, 255)
     except (IndexError, struct.error, ValueError, zlib.error):
         return None
-
-
-# 任务的固定子步骤集中维护。入口坐标和任务进度仍交给视觉模型，
-# 进入具体能力页后的动作由本地执行器按这里的配方稳定完成。
-# 入口缓存只在当前运行期间有效，不写入磁盘。布局变化或语义校验失败时，
-# 入口不再缓存坐标：读不到语义时下一步由视觉模型重新定位。
-# “做同款”模板列表也在 WebView 活动里渲染，包含活动规则/参与方式等活动页
-# 语义；用它定位任务行会误触活动横幅，因此语义入口不使用该标题。
-    # 先列右侧行动按钮，再列任务标题。新版 WebView 只把这些文本节点
-    # 暴露出来且 clickable=false；点击行动按钮的中心比点击标题稳定。
-# 福利 WebView 有时只暴露任务标题，不暴露右侧行动按钮；有时又把整行
-# 暴露成一个覆盖整行的 TextView。两种情况下都应以任务行的纵坐标为锚点，
-# 点击右侧行动列，而不是点击标题节点中心。
-# 福利页改版后每日任务区顶部插入了签到卡与邀请/创作横幅，旧固定行坐标
-# 已整体下移，继续盲点会误触“已完成”等非入口行。本字典保留为空作为扩展点；
-# 入口一律走语义或视觉定位，不再使用固定行坐标。
-        # 环境变量优先于 .env，便于 systemd、容器和临时测试覆盖配置。
-            # 只自动确认元宝首次协议页；登录、验证码和扫码仍需人工完成。
-            # 兑换目标固定为三天卡，避免配置或模型误选其它商品。
-        # KDE Wayland/XWayland 对置顶和强制聚焦的支持取决于窗口管理器；
-        # 这些增强失败时仍必须进入 mainloop，让报告窗口保持常驻。
-        # 没有图形会话或 Tk 后端异常时，不能覆盖原始任务错误。
-    # WebView/Compose 重绘期间，文字节点偶尔暂时变成 [0,0][0,0]。
-    # 保留最近的可见父级区域，让语义校验仍能约束视觉点击范围。
 
 
 def node_interaction_bounds(node: Node) -> Bounds:
@@ -289,8 +263,14 @@ def state_signature(ui: str, image: bytes, activity: str) -> str:
 
 
 def encode_adb_input_text(value: str) -> str:
-    """编码 adb shell input text 的空格和井号，避免被远端 shell 截断。"""
-    return value.replace("%", "%25").replace(" ", "%s").replace("#", r"\#")
+    """编码 adb shell input text 的空格、井号和括号，避免远端 shell 解析。"""
+    return (
+        value.replace("%", "%25")
+        .replace(" ", "%s")
+        .replace("#", r"\#")
+        .replace("(", r"\(")
+        .replace(")", r"\)")
+    )
 
 
 def normalize_tool_arguments(name: str, args: dict[str, Any]) -> dict[str, Any]:

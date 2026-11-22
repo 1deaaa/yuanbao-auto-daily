@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import contextlib
 from xml.etree import ElementTree as ET
 from pathlib import Path
 import re
 import subprocess
 import time
-from typing import Any
 
 from .constants import (
     ADB_TRANSPORT_FAILURE_MARKERS,
@@ -31,8 +29,6 @@ from .constants import (
     UI_DUMP_TIMEOUT,
     WAYDROID_POLL_INTERVAL,
     WAYDROID_READY_TIMEOUT,
-    WAYDROID_START_TIMEOUT,
-    WAYDROID_STOP_TIMEOUT,
 )
 from .errors import (
     AgentError,

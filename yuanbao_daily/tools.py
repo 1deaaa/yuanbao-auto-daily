@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from .constants import TASK_ORDER, TASK_TARGET_COUNTS
@@ -21,14 +20,19 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "function": {
             "name": "open_daily_ability",
             "description": (
-                "能力站主轮播卡的内容和颜色每天会变化。若最新截图确认主卡固定位置显示"
-                "‘去体验’，将 button_visible 设为 true；执行器只点击主卡固定按钮位置并把体验页交给模型。"
+                "能力站主轮播卡的内容和颜色每天会变化。福利页顶部第一张主轮播卡（例如‘AI精讲’、"
+                "‘AI录音笔’）右侧出现‘去体验’或‘去提问’时，都必须将 button_visible 设为 true、"
+                "top_card_visible 设为 true；"
+                "如果主卡是‘AI录音笔/录音笔/语音’，同时将 voice_card_visible 设为 true，执行器会在体验页注入短语音；"
+                "不要把顶部主卡的‘去提问’误判为普通趣问任务入口。"
                 "顶部横幅里的同名按钮不算；未确认可见时设为 false。"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "button_visible": {"type": "boolean"},
+                    "top_card_visible": {"type": "boolean"},
+                    "voice_card_visible": {"type": "boolean"},
                 },
                 "required": ["button_visible"],
                 "additionalProperties": False,
@@ -78,12 +82,14 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "name": "report_tasks",
             "description": (
                 "只读报告福利中心最新截图中的每日任务目录和实际计数。报告阶段的恢复进度可能过期，"
-                "必须逐项读取当前页面，不得复制上下文或历史中的数字。2.88.0 新版目录固定为写作、"
-                "拍题、P图三项；若福利页出现‘做同款’任务并明确显示已完成 x/3，须一并纳入；"
-                "没有进度的推荐模板和邀请新用户不属于每日任务。"
-                "只有在编排器已滚动到每日任务区域后，才能按当前截图报告进度。"
-                "趣问元宝卡片的进度写作 (x/4)，x 是今天已完成的次数，"
-                "按实际数字报告，不要套用 3 次上限。"
+                "必须逐项读取当前页面，不得复制上下文或历史中的数字。强制任务模式下趣问元宝、"
+                "写作、拍题、P图和做同款五项都要尝试；available_tasks 只填写当前截图明确可见、"
+                "且有每日进度的任务。某项暂时未显示或无障碍树缺少节点时，不得直接标记完成；"
+                "程序完成有界滚动后若截图明确没有该任务，才由编排器确认页面未提供。"
+                "没有每日进度的邀请新用户不属于任务。只有在编排器已滚动到每日任务区域后，"
+                "才能按当前截图报告进度。趣问元宝目标次数以页面显示的分母为准，按实际数字报告，"
+                "不要套用固定次数；如果当前截图明确显示趣问元宝分母，另外填写 question_target，"
+                "不得使用旧历史分母。"
             ),
             "parameters": {
                 "type": "object",
@@ -96,6 +102,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "question": {
                         "type": "integer",
                         "minimum": 0,
+                        "maximum": TASK_TARGET_COUNTS["question"],
+                    },
+                    "question_target": {
+                        "type": "integer",
+                        "minimum": 1,
                         "maximum": TASK_TARGET_COUNTS["question"],
                     },
                     "writing": {
@@ -127,6 +138,38 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "photo_question",
                     "same_template",
                 ],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "report_extra_tasks",
+            "description": (
+                "固定每日任务完成后的新增任务巡查报告。只允许在福利中心页面调用。"
+                "列出当前福利页里仍可执行的额外任务，以及因邀请好友、外部 App、"
+                "分享/绑定/支付等外部影响而排除的任务。done=true 表示没有更多"
+                "值得执行的新增任务，准备进入兑换；done=false 表示还需继续完成。"
+                "不要为了凑数报告已完成的固定任务。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "remaining_tasks": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 12,
+                    },
+                    "excluded_tasks": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 12,
+                    },
+                    "done": {"type": "boolean"},
+                    "summary": {"type": "string"},
+                },
+                "required": ["remaining_tasks", "excluded_tasks", "done"],
                 "additionalProperties": False,
             },
         },
@@ -308,8 +351,27 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "confirm_exchange",
-            "description": "确认兑换弹窗；只有目标商品已被定位后才能调用。",
-            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+            "description": (
+                "确认兑换。只有最新截图中的详情页/确认弹窗明确显示“QQ超级会员3天卡”时才能调用，"
+                "并必须在 product_name 中逐字填写页面显示的商品名称。"
+                "如果页面显示 QQ音乐/绿钻/黄钻或任何其它商品，或无法确认商品名称，"
+                "不要调用本工具，改用 press_back 返回商城重新选择。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "product_name": {
+                        "type": "string",
+                        "description": "当前确认页显示的商品名称，逐字抄写，不得改写。",
+                    },
+                    "target_visible": {
+                        "type": "boolean",
+                        "description": "当前截图是否明确显示 QQ超级会员3天卡。",
+                    },
+                },
+                "required": ["product_name", "target_visible"],
+                "additionalProperties": False,
+            },
         },
     },
     {

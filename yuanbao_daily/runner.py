@@ -5,11 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 import argparse
 import contextlib
-import json
 import sys
 import time
 from datetime import datetime, timedelta
-from typing import Any
 from zoneinfo import ZoneInfo
 
 from .device import is_adb_transport_failure
@@ -18,51 +16,21 @@ from .config import (
     parse_run_time,
 )
 from .constants import (
-    DAILY_ABILITY_EXPERIENCE_TOOLS,
-    DAILY_ABILITY_RULE_NAME,
-    DAILY_ABILITY_RULE_VERSION,
-    DAILY_ABILITY_TOOLS,
     FAILURE_EXIT_STATUS,
-    LOCAL_DETERMINISTIC_TOOLS,
-    PACKAGE_NAME,
     ROOT,
-    STABLE_MISSING_TASK_SCROLLS,
-    VISUAL_EXCHANGE_TOOLS,
-    VISUAL_NAVIGATION_MAX_STEPS,
-    VISUAL_NAVIGATION_TOOLS,
-    VISUAL_REPLAN_MAX_ATTEMPTS,
 )
-from .executor import ToolExecutor
 from .device import Device
 from .waydroid_runtime import WaydroidRuntime
-from .workflow import Workflow
 from .errors import (
     AgentError,
-    AppUnresponsiveError,
     ManualActionRequired,
-    ModelAccessError,
     RetryLimitExceeded,
 )
-from .models import (
-    Observation,
-    ToolResult,
-)
 from .reporting import (
-    build_failure_report,
     show_failure_alert,
 )
 from .runner_loop import run_task_loop
 from .runner_startup import Session, start_session
-from .vision import VisionModel
-from .welfare import (
-    daily_ability_card_status,
-    is_daily_ability_experience_visible,
-)
-from .ui import (
-    action_signature,
-    repeated_action_is_stuck,
-    state_signature,
-)
 
 def run_once(config: Config) -> None:
     """跑一轮每日任务：启动会话 → 执行任务 → 收尾并释放设备。"""

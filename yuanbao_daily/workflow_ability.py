@@ -11,9 +11,11 @@ from typing import Any
 from .constants import (
     DAILY_ABILITY_BUTTON_CHECK_LIMIT,
     DAILY_ABILITY_RULE_NAME,
+    DAILY_ABILITY_UNAVAILABLE_EVIDENCE,
     DAILY_ABILITY_VERIFY_CHECK_LIMIT,
 )
 from .models import ToolResult
+from .welfare import is_welfare_activity
 
 
 class WorkflowAbilityMixin:
@@ -23,12 +25,40 @@ class WorkflowAbilityMixin:
         self, name: str, result: ToolResult
     ) -> ToolResult:
         """主卡点击后的状态迁移：确认点击证据并进入体验阶段。"""
+        if result.data.get("welfare_navigation_only") is True:
+            return result
         if (
             name == "open_daily_ability"
             and result.data.get("ability_card_visible") is False
         ):
             self.daily_ability_button_checks += 1
             if self.daily_ability_button_checks > DAILY_ABILITY_BUTTON_CHECK_LIMIT:
+                confirmed_welfare_absence = (
+                    result.data.get("ability_card_checked") is True
+                    and result.data.get("stage") == "welfare"
+                    and is_welfare_activity(str(result.data.get("activity", "")))
+                )
+                if confirmed_welfare_absence:
+                    self.daily_ability_unavailable = True
+                    self.daily_ability_unavailable_evidence = (
+                        DAILY_ABILITY_UNAVAILABLE_EVIDENCE
+                    )
+                    self.daily_ability_button_checks = 0
+                    self._persist_task_state()
+                    self.phase = "report"
+                    self.substate = {}
+                    print(
+                        "今日福利页经有界检查未提供能力站主卡入口；"
+                        "保留未完成状态并继续固定每日任务"
+                    )
+                    return ToolResult(
+                        True,
+                        "能力站入口今日未由福利页提供；未记为完成，继续报告固定每日任务",
+                        {
+                            "stage": "welfare",
+                            "ability_station_unavailable": True,
+                        },
+                    )
                 return ToolResult(
                     False,
                     "多次检查仍未确认主轮播卡‘去体验’按钮，未点击其它卡片",

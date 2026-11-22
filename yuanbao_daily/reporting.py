@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import contextlib
 import json
 import os
@@ -90,6 +89,23 @@ def build_failure_report(config: Config | None, error: BaseException) -> str:
     return "\n".join(lines)
 
 
+def copy_failure_report_to_clipboard(root: Any, report: str) -> None:
+    """将脱敏后的失败报告写入桌面剪贴板。"""
+    root.clipboard_clear()
+    root.clipboard_append(report)
+    # 让 Tk 立即处理剪贴板请求，窗口关闭后 KDE 剪贴板管理器仍可接管内容。
+    root.update()
+
+
+def _set_copy_button_text_if_alive(root: Any, button: Any, value: str) -> None:
+    """失败窗口关闭后，忽略已销毁控件上的延迟回调。"""
+    try:
+        if root.winfo_exists() and button.winfo_exists():
+            button.config(text=value)
+    except Exception:
+        return
+
+
 def show_failure_alert(config: Config | None, error: BaseException) -> None:
     """弹出置顶且阻塞的失败窗口，必须由用户手动关闭。"""
     report = build_failure_report(config, error)
@@ -131,13 +147,31 @@ def show_failure_alert(config: Config | None, error: BaseException) -> None:
         scrollbar.config(command=text.yview)
         text.insert("1.0", report)
         text.config(state="disabled")
-        close_button = tk.Button(
+        def copy_report() -> None:
+            try:
+                copy_failure_report_to_clipboard(root, report)
+                _set_copy_button_text_if_alive(root, copy_button, "已复制报错")
+                with contextlib.suppress(Exception):
+                    root.after(
+                        1500,
+                        lambda: _set_copy_button_text_if_alive(
+                            root, copy_button, "复制报错"
+                        ),
+                    )
+            except Exception as exc:
+                _set_copy_button_text_if_alive(root, copy_button, "复制失败")
+                print(
+                    f"复制失败报告到剪贴板失败：{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+
+        copy_button = tk.Button(
             frame,
-            text="关闭失败窗口",
-            command=root.destroy,
+            text="复制报错",
+            command=copy_report,
             height=2,
         )
-        close_button.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        copy_button.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         root.protocol("WM_DELETE_WINDOW", root.destroy)
         root.mainloop()
     except Exception as exc:

@@ -6,8 +6,6 @@ from typing import Any
 
 from .constants import (
     DAILY_ABILITY_EXPERIENCE_STEP_LIMIT,
-    DAILY_ABILITY_EXPERIENCE_TOOLS,
-    DAILY_ABILITY_TOOLS,
     IMAGE_TASKS,
     PACKAGE_NAME,
     TASK_ENTRY_MARKERS,
@@ -27,6 +25,7 @@ from .ui import (
     find_voice_press_point,
     node_interaction_bounds,
 )
+from .workflow_policy import PHASE_ALLOWED_TOOLS
 
 
 class WorkflowRecoveryMixin:
@@ -49,9 +48,8 @@ class WorkflowRecoveryMixin:
     ) -> tuple[str, dict[str, int]] | None:
         """视觉重规划失败后，使用当前层级明确暴露的语义控件救援一次。
 
-        这不是页面坐标后备：节点边界和文案都来自本轮观测。只有返回福利中心
-        或兑换商城这类唯一语义入口被无障碍树明确暴露时才启用，其他变化仍交给
-        VLMM 根据截图判断。
+        点击位置来自本轮观测；兑换入口离屏时转交已有的本地语义导航回顶并重新
+        定位，其他页面变化仍交给 VLMM 根据截图判断。
         """
         if self.phase == "return":
             if observation.stage != "welfare":
@@ -105,10 +103,15 @@ class WorkflowRecoveryMixin:
         if self.phase == "open_exchange":
             node = self._welfare_exchange_entry_node(observation)
             if node is not None:
-                bounds = node_interaction_bounds(node)
+                # 兑换文案有时只有整屏 WebView 父级边界；不能把父级中心
+                # 当作入口坐标，否则会误点邀请等相邻任务。
+                bounds = node.bounds
                 if bounds.area > 0:
                     print("视觉重规划失败，使用当前观测中的福利页“兑换商城”语义入口")
                     return "tap", {"x": bounds.center[0], "y": bounds.center[1]}
+            if observation.stage == "welfare":
+                print("兑换商城入口当前不在视口内，改用本地语义导航回顶并重新定位")
+                return "open_exchange", {}
         return None
 
 
@@ -154,50 +157,8 @@ class WorkflowRecoveryMixin:
 
 
     def _valid_phase(self, name: str) -> str | None:
-        allowed: dict[str, set[str]] = {
-            "navigate_welfare": {
-                "open_welfare",
-                "report_tasks",
-                "return_to_welfare",
-                "tap",
-                "swipe",
-                "press_back",
-            },
-            "report": {"report_tasks"},
-            "daily_ability": DAILY_ABILITY_TOOLS,
-            "daily_ability_experience": DAILY_ABILITY_EXPERIENCE_TOOLS,
-            "daily_ability_wait": {"wait_5s"},
-            "verify_daily_ability": {"verify_daily_ability"},
-            "verify_daily_ability_wait": {"wait_5s"},
-            "open_target": {"tap", "swipe", "press_back"},
-            "perform": {
-                "tap",
-                "swipe",
-                "press_back",
-                "input_test_prompt",
-                "send_message",
-                "wait_5s",
-                "select_local_image",
-                "confirm_image",
-            },
-            "claim": {"claim_reward"},
-            "return": {"return_to_welfare", "tap", "swipe", "press_back"},
-            "open_exchange": {
-                "open_exchange",
-                "tap",
-                "swipe",
-                "press_back",
-                "report_exchange",
-            },
-            "redeem": {"redeem_qq_card"},
-            "exchange_confirm": {"confirm_exchange"},
-            "prize_records": {"open_prize_records"},
-            "use_reward": {"use_bound_reward"},
-            "use_confirm": {"confirm_reward_use"},
-            "return_home": {"return_to_home"},
-            "complete": {"complete_task"},
-        }
-        if name not in allowed.get(self.phase, set()):
+        allowed = PHASE_ALLOWED_TOOLS.get(self.phase, frozenset())
+        if name not in allowed:
             return f"当前阶段 {self.phase} 不应调用 {name}"
         return None
 
@@ -214,9 +175,8 @@ class WorkflowRecoveryMixin:
 
     def expected_tool(self, observation: Observation) -> str | None:
         """返回本地状态已经确定的下一步工具，入口坐标仍交给模型定位。"""
-        # 卡住恢复期间不强制任何工具，让 VLM 根据恢复提示自由决策
-        # （tap/swipe/press_back/input/... 均可），这正是智能恢复的意义。
-        if self.recovering:
+        # 接管/恢复期间不强制任何工具，让 VLM 根据最新截图自由决策。
+        if self.recovering or self.takeover:
             return None
         if (
             self.phase == "daily_ability_experience"
@@ -240,6 +200,12 @@ class WorkflowRecoveryMixin:
                 f"（{self.daily_ability_experience_steps} 步）"
             )
             return "return_to_welfare"
+        if self.phase == "verify_daily_ability" and not is_welfare_activity(
+            observation.activity
+        ):
+            # 核验主卡只能在福利 WebView 进行；体验页、聊天首页或系统页面
+            # 先返回福利中心，避免 verify_daily_ability 在错误页面上熔断。
+            return "return_to_welfare"
         fixed_phases = {
             "daily_ability_wait": "wait_5s",
             "verify_daily_ability": "verify_daily_ability",
@@ -257,6 +223,7 @@ class WorkflowRecoveryMixin:
             ),
             "redeem": "redeem_qq_card",
             "exchange_confirm": "confirm_exchange",
+            "exchange_back": "press_back",
             "prize_records": "open_prize_records",
             "use_reward": "use_bound_reward",
             "use_confirm": "confirm_reward_use",
@@ -269,6 +236,10 @@ class WorkflowRecoveryMixin:
             return None
 
         kind = self._task_kind()
+        if kind == "question" and self.substate.get("question_card_clicked"):
+            if not self.substate.get("waited"):
+                return "wait_5s"
+            return None
         if kind in TEXT_TASKS and not self.substate.get("input"):
             return "input_test_prompt"
         if kind in IMAGE_TASKS and not self.substate.get("image"):
@@ -308,6 +279,11 @@ class WorkflowRecoveryMixin:
             name for name, completed in self.substate.items() if completed
         ) or "无"
         coordinate_hint = ""
+        if self.phase == "report" and self.config.force_all_daily_tasks:
+            coordinate_hint = (
+                "强制任务模式要求五项固定每日任务全部执行；无障碍树缺项时依据当前截图报告，"
+                "不得因为暂时不可见或目录不完整而标记完成或跳过。"
+            )
         if self.phase == "daily_ability":
             coordinate_hint = (
                 "能力卡标题、颜色和具体功能会轮换，不作筛选；只点击‘元宝能力站’主轮播卡固定位置、"
@@ -328,10 +304,18 @@ class WorkflowRecoveryMixin:
         if self.phase == "open_target" and self.target in TASK_ENTRY_MARKERS:
             width = getattr(self.executor, "width", 0)
             height = getattr(self.executor, "height", 0)
-            coordinate_hint = (
-                f"屏幕原始像素为 {width}x{height}；当前目标按钮位于福利中心任务列表，"
-                "不要点击顶部积分卡的同名按钮。"
-            )
+            if self.target == "same_template":
+                coordinate_hint = (
+                    f"屏幕原始像素为 {width}x{height}；当前目标是福利页上方“做同款”"
+                    "推荐模板区域，点击该区域进度文案下方的一张模板卡片。"
+                    "不要点击下方每日任务行、邀请入口或积分/兑换区域；如果模板卡片被浮层遮挡，"
+                    "先关闭浮层并重新观察。"
+                )
+            else:
+                coordinate_hint = (
+                    f"屏幕原始像素为 {width}x{height}；当前目标按钮位于福利中心任务列表，"
+                    "不要点击顶部积分卡的同名按钮。"
+                )
         if self.phase == "open_exchange":
             if self.substate.get("entry_clicked"):
                 coordinate_hint = (
@@ -346,6 +330,7 @@ class WorkflowRecoveryMixin:
                 )
         return (
             f"阶段={self.phase}; 能力站每日大任务已完成={self.daily_ability_done}; "
+            f"能力站入口今日页面未提供={self.daily_ability_unavailable}; "
             f"强制执行全部任务={self.config.force_all_daily_tasks}; "
             f"当前目标={self.target or '无'}; "
             f"任务进度={progress}; 当前子步骤已完成={substate}; "
@@ -359,7 +344,7 @@ class WorkflowRecoveryMixin:
     def _ignored_welfare_tap(args: dict[str, Any], observation: Observation) -> bool:
         """在福利中心拦截唯一明确忽略的邀请任务整行点击。"""
         try:
-            x, y = int(args["x"]), int(args["y"])
+            y = int(args["y"])
         except (KeyError, TypeError, ValueError):
             return False
         for node in observation.nodes:
@@ -458,6 +443,8 @@ class WorkflowRecoveryMixin:
 
     def _perform_complete(self) -> bool:
         kind = self._task_kind()
+        if kind == "question" and self.substate.get("question_card_clicked"):
+            return bool(self.substate.get("waited"))
         required = TASK_STEPS.get(kind)
         return bool(required) and all(self.substate.get(name, False) for name in required)
 
@@ -467,7 +454,10 @@ class WorkflowRecoveryMixin:
         if self.target not in TEXT_TASKS:
             return None
         count = self.expected_count or 1
-        return f"{self.target.replace('_', '-')}-{count}"
+        variant = f"{self.target.replace('_', '-')}-{count}-run{self.prompt_session_nonce}"
+        if self.prompt_retry_serial:
+            variant += f"-retry{self.prompt_retry_serial}"
+        return variant
 
 
     def daily_ability_voice_action(
@@ -491,6 +481,14 @@ class WorkflowRecoveryMixin:
 
     def _target_entry_ready(self, result: ToolResult) -> bool:
         """确认视觉点击已经到达当前任务页，而不是接受残留层级。"""
+        raw_stage = str(result.data.get("stage") or "")
+        if self.target in {"image", "photo_question"} and raw_stage in {
+            "picker",
+            "photo_preview",
+        }:
+            # 图片入口可能同时返回上一轮聊天的残留 entry_evidence；系统选择器
+            # 是更强的当前页面证据，不能被旧层级字段覆盖。
+            return True
         evidence = result.data.get("entry_evidence")
         if not isinstance(evidence, dict):
             # 假执行器和旧兼容调用没有附带证据时保留原有行为；真实执行器

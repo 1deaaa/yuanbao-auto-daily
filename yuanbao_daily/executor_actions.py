@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 import time
 
@@ -16,7 +17,8 @@ from .models import (
     Observation,
     ToolResult,
 )
-from .ui import find_voice_press_point, png_pixel
+from .ui import find_voice_press_point
+from .welfare import is_welfare_activity
 
 
 class ExecutorActionsMixin:
@@ -57,7 +59,7 @@ class ExecutorActionsMixin:
         x, y = int(args["x"]), int(args["y"])
         if x >= self.width or y >= self.height or x < 0 or y < 0:
             raise AgentError(f"坐标越界：{x},{y}")
-        before_tap = self.observe()
+        before_tap = self._initial_observation()
         experience_navigation_expected = ability_experience_action and self._daily_ability_navigation_button_visible(
             before_tap
         )
@@ -98,6 +100,18 @@ class ExecutorActionsMixin:
         if was_welfare_context:
             after_tap = self._observe_after_entry_tap()
         stage = after_tap.stage
+        if stage == "welfare" and was_welfare_context:
+            # 福利 WebView 的旧层级可能在第一次点击后继续返回，导致入口循环。
+            # 清掉福利上下文后按本轮已验证的原始入口位置重试一次，让下一次
+            # 观测按真实 Activity/聊天层级判断；最多一次，避免重复误点。
+            self._welfare_context = False
+            time.sleep(0.5)
+            self._tap_point(x, y)
+            time.sleep(1.0)
+            after_retry = self.observe()
+            if after_retry.stage != "welfare":
+                after_tap = after_retry
+                stage = after_retry.stage
         if stage != "welfare":
             self._welfare_context = False
         if stage == "welfare" and was_welfare_context:
@@ -122,7 +136,7 @@ class ExecutorActionsMixin:
         控件位置由本地按“按住说话”语义定位，模型只负责表达意图，避免它在
         多变布局上猜错长按对象而误触其它控件。
         """
-        observation = self.observe()
+        observation = self._initial_observation()
         point = find_voice_press_point(observation.nodes)
         if point is None:
             return self._result(
@@ -152,7 +166,7 @@ class ExecutorActionsMixin:
         inject_audio: bool = False,
     ) -> ToolResult:
         """长按页面控件；语音场景额外注入一段短测试语音。"""
-        observation = self.observe()
+        observation = self._initial_observation()
         if not (0 <= x < self.width and 0 <= y < self.height):
             raise AgentError(f"长按坐标越界：{x},{y}")
         covered = self._foreground_label_covering_tap(
@@ -218,21 +232,81 @@ class ExecutorActionsMixin:
 
 
     def _do_open_daily_ability(self, args: dict[str, Any]) -> ToolResult:
-        return self._open_daily_ability(args, self.observe())
+        return self._open_daily_ability(args, self._initial_observation())
 
 
     def _do_input_test_prompt(self, args: dict[str, Any]) -> ToolResult:
-        return self._input_fixed_prompt(self.observe())
+        return self._input_fixed_prompt(self._initial_observation())
 
 
     def _do_send_message(self, args: dict[str, Any]) -> ToolResult:
-        observation = self.observe()
+        observation = self._initial_observation()
+        screenshot_chat_fallback = False
+        keyboard_shown = getattr(self.device, "keyboard_shown", None)
+        if callable(keyboard_shown) and keyboard_shown():
+            if self.prompt_variant:
+                # 趣问页面按返回键收起键盘时，元宝会把附件底部面板展开；
+                # 保留键盘，由 _find_send 按当前输入框相对位置定位箭头。
+                pass
+            else:
+                # 写作页等其它页面仍先收起键盘，再按当前层级重新定位提交控件。
+                self.device.input("keyevent", "KEYCODE_BACK")
+                time.sleep(0.4)
+                observation = self.observe()
+        # 附件面板可能在输入文本完成后再次出现；发送动作必须在当前层级
+        # 重新收起它，不能只依赖 input_test_prompt 阶段的早期清理。
+        attachment_prepared = False
+        if not attachment_prepared and self._dismiss_chat_attachment_sheet(observation):
+            observation = self.observe()
+            if self._chat_attachment_sheet_visible(observation):
+                # 关闭动画结束后面板可能又弹回一次；在最终发送前再拖动当前
+                # 横杆，避免把一次过渡帧当成已经关闭。
+                observation = self._drag_chat_attachment_sheet_down(observation)
+                if self._chat_attachment_sheet_visible(observation):
+                    return self._result(
+                        False,
+                        "聊天页附件面板仍遮挡发送入口，已停止本次点击，请重新观察后再发送",
+                        stage=observation.stage,
+                    )
+        if self.prompt_variant and observation.stage != "writing":
+            # 附件面板关闭后可能仍报告为 app/chat，但无障碍树没有恢复输入框；
+            # 只要截图确认已经是正常聊天页，就统一走发送箭头截图兜底。
+            if self._find_input(observation) is None:
+                marker_nodes = self._chat_attachment_marker_nodes(observation)
+                visual_state = self._chat_attachment_sheet_visual_state(
+                    observation, marker_nodes
+                )
+                if visual_state is False:
+                    screenshot_chat_fallback = True
+                else:
+                    return self._result(
+                        False,
+                        "当前仍未确认聊天输入层，已停止发送并等待页面重新稳定",
+                        stage=observation.stage,
+                    )
         if observation.stage in {"chat", "writing"}:
             input_node = self._find_input(observation)
             input_text = input_node.text.strip() if input_node is not None else ""
             variant = getattr(self, "prompt_variant", None)
             if observation.stage == "writing" or variant:
-                if input_text != self._fixed_prompt().strip():
+                expected_prompt = self._fixed_prompt().strip()
+                # 发送动作可能在 Compose 重绘前已经提交成功，下一次观测却
+                # 只看到空输入框或占位状态。若当前会话已经出现本轮问题，
+                # 直接把它视为已发送，禁止再次点击发送按钮。
+                sent_message_visible = any(
+                    node.bounds.area > 0
+                    and node.text.strip() == expected_prompt
+                    and not node.class_name.lower().endswith("edittext")
+                    for node in observation.nodes
+                )
+                if sent_message_visible:
+                    self.pending_generation = True
+                    return self._result(
+                        True,
+                        "当前会话已出现本轮提问消息，确认发送完成；下一步必须调用 wait_5s",
+                        stage=observation.stage,
+                    )
+                if input_text != expected_prompt:
                     return self._result(
                         False,
                         "当前输入框内容与本轮固定测试文本不一致，已拒绝提交",
@@ -240,7 +314,9 @@ class ExecutorActionsMixin:
                     )
             elif not input_text:
                 return self._result(False, "输入框为空，必须先调用 input_test_prompt")
-        button = self._find_send(observation)
+        # 截图兜底表示无障碍树仍包含面板/缩略图节点；这些残留小图标可能
+        # 被 _find_send 误判为箭头，直接使用本轮聊天截图对应的位置。
+        button = None if screenshot_chat_fallback else self._find_send(observation)
         if button is None:
             if observation.stage == "writing":
                 return self._result(
@@ -249,6 +325,18 @@ class ExecutorActionsMixin:
                     stage=observation.stage,
                 )
             input_node = self._find_input(observation)
+            if screenshot_chat_fallback:
+                fallback_x = round(self.width * 0.926)
+                keyboard_visible = getattr(self.device, "keyboard_shown", None)
+                keyboard_visible = bool(keyboard_visible()) if callable(keyboard_visible) else False
+                fallback_y = round(self.height * (0.531 if keyboard_visible else 0.896))
+                self._tap_point(fallback_x, fallback_y)
+                self.pending_generation = True
+                return self._result(
+                    True,
+                    "无障碍树滞后，已按最新聊天截图点击发送箭头，下一步必须调用 wait_5s",
+                    stage=observation.stage,
+                )
             if input_node is not None:
                 # 输入框通常延伸到屏幕底部；发送箭头位于其右下角，而不是输入框中心。
                 fallback_y = min(
@@ -284,6 +372,54 @@ class ExecutorActionsMixin:
             return self._result(
                 True,
                 "已确认本轮写作消息进入会话，下一步必须调用 wait_5s",
+                stage=after.stage,
+            )
+        if self.prompt_variant:
+            # 聊天页的附件面板/滞后无障碍树可能让点击发送箭头变成空操作。
+            # 只有当前输入框已经清空（或最新树已明确进入生成态）才标记发送成功，
+            # 否则返回失败让外层先收起面板后重试，不能把未提交消息计入任务。
+            after = self.observe()
+            retried_send = False
+            expected_prompt = self._fixed_prompt().strip()
+            for attempt in range(WRITING_SUBMIT_VERIFY_ATTEMPTS):
+                if not self._stale_welfare_tree(after):
+                    after_input = self._find_input(after)
+                    input_cleared = (
+                        after_input is not None and not after_input.text.strip()
+                    )
+                    sent_message_visible = any(
+                        node.bounds.area > 0
+                        and node.text.strip() == expected_prompt
+                        and not node.class_name.lower().endswith("edittext")
+                        for node in after.nodes
+                    )
+                    if input_cleared or sent_message_visible:
+                        self.pending_generation = True
+                        return self._result(
+                            True,
+                            "已确认本轮提问消息进入会话，下一步必须调用 wait_5s",
+                            stage=after.stage,
+                        )
+                if not retried_send and attempt == 0:
+                    # Compose 发送箭头偶尔在首个点击后仍保留输入内容；重新按
+                    # 当前树定位一次，避免把未提交的问题误标为成功。
+                    if self._dismiss_chat_attachment_sheet(after):
+                        after = self.observe()
+                        if self._chat_attachment_sheet_visible(after):
+                            return self._result(
+                                False,
+                                "聊天页附件面板仍遮挡发送入口，已停止重试点击",
+                                stage=after.stage,
+                            )
+                    retry_button = self._find_send(after)
+                    if retry_button is not None:
+                        self._tap_node(retry_button)
+                    retried_send = True
+                time.sleep(WRITING_SUBMIT_VERIFY_INTERVAL)
+                after = self.observe()
+            return self._result(
+                False,
+                "发送后固定测试文本仍停留在输入框，未确认消息提交；先处理附件面板后重试",
                 stage=after.stage,
             )
         self.pending_generation = True
@@ -323,7 +459,7 @@ class ExecutorActionsMixin:
 
     def _do_claim_reward(self, args: dict[str, Any]) -> ToolResult:
         for attempt in range(3):
-            observation = self.observe()
+            observation = self._initial_observation() if attempt == 0 else self.observe()
             if self._dismiss_reward_popup(observation):
                 return self._result(True, "已收下任务奖励", stage=self.observe().stage)
             if attempt < 2:
@@ -332,17 +468,41 @@ class ExecutorActionsMixin:
 
 
     def _do_return_to_welfare(self, args: dict[str, Any]) -> ToolResult:
-        after = self._go_to_welfare()
+        def normalize_empty_webview(observation: Observation) -> Observation:
+            if (
+                observation.stage in {"", "unknown", "app", "chat"}
+                and is_welfare_activity(observation.activity)
+            ):
+                return replace(observation, stage="welfare")
+            return observation
+
+        # 返回后的 WebView 可能先只有 Activity、截图而没有可访问树；导航函数
+        # 已经完成福利入口路径，此时先接受空树，下一步再等目录异步渲染，避免
+        # 把真实福利页误报成仍在聊天首页。
+        after = normalize_empty_webview(self._go_to_welfare())
         # 奖励遮罩可能在生成完成数秒后才注入 WebView；返回福利页时
         # 再做一次有界本地收尾，避免下一任务的视觉定位看到奖励弹窗。
         for attempt in range(3):
             if self._dismiss_reward_popup(after):
-                after = self.observe()
+                after = normalize_empty_webview(self.observe())
                 break
             if attempt < 2:
                 time.sleep(2)
-                after = self.observe()
-        return self._result(True, "已返回福利中心并刷新任务页面", stage=after.stage)
+                after = normalize_empty_webview(self.observe())
+        if after.stage != "welfare" or not is_welfare_activity(after.activity):
+            return self._result(
+                False,
+                "未确认已回到福利中心，当前仍是聊天或其它页面；不会推进任务报告",
+                stage=after.stage,
+                activity=after.activity,
+                visual_replan=True,
+            )
+        return self._result(
+            True,
+            "已返回福利中心并刷新任务页面",
+            stage=after.stage,
+            activity=after.activity,
+        )
 
 
     def _do_open_exchange(self, args: dict[str, Any]) -> ToolResult:
@@ -356,13 +516,71 @@ class ExecutorActionsMixin:
     def _do_confirm_exchange(self, args: dict[str, Any]) -> ToolResult:
         if not self.exchange_target_clicked:
             return self._result(False, "尚未定位并点击目标商品，拒绝确认兑换")
+        observation = self._initial_observation()
+        target_visible, foreign_visible = self.exchange_product_evidence(observation)
+        reported_name = str(args.get("product_name") or "").strip()
+        model_verified = bool(reported_name) and self.product_name_matches(reported_name)
+        if reported_name and not model_verified:
+            after = self._leave_exchange_detail()
+            return self._result(
+                False,
+                f"确认页商品“{reported_name}”不是目标卡，已退出确认页，未执行兑换",
+                stage=after.stage,
+                visual_replan=True,
+            )
+        if foreign_visible and not target_visible:
+            after = self._leave_exchange_detail()
+            return self._result(
+                False,
+                "确认页出现其它会员/音乐商品且没有目标卡，已退出确认页，未执行兑换",
+                stage=after.stage,
+                visual_replan=True,
+            )
+        if not (
+            target_visible
+            or model_verified
+            or getattr(self, "exchange_target_confirmed", False)
+        ):
+            return self._result(
+                False,
+                "无法确认当前确认页属于 QQ超级会员3天卡，拒绝盲点确认",
+                stage=observation.stage,
+                visual_replan=True,
+            )
         # 商品列表的“兑换”会先进入详情页；先点击详情页的“立即兑换”。
         clicked = self._tap_text_button("立即兑换")
         after = self.observe()
-        # 某些版本在详情页后还会出现二次确认弹窗。
+        target_after, foreign_after = self.exchange_product_evidence(after)
+        if foreign_after and not target_after:
+            after = self._leave_exchange_detail()
+            return self._result(
+                False,
+                "确认过程中页面出现了其它会员/音乐商品，已退出，未执行兑换",
+                stage=after.stage,
+                visual_replan=True,
+            )
+        # 某些版本在详情页后还会出现二次确认弹窗。只有目标商品仍有
+        # 本地/模型证据时才允许点击确认，且不再使用泛化的“确认”兜底。
         if self._has_evidence(after, "确认兑换", "确定兑换"):
-            clicked = self._tap_text_button("确认兑换", "确定兑换", "确认") or clicked
+            if not (target_after or model_verified or self.exchange_target_confirmed):
+                after = self._leave_exchange_detail()
+                return self._result(
+                    False,
+                    "确认弹窗没有目标商品证据，已退出，未执行兑换",
+                    stage=after.stage,
+                    visual_replan=True,
+                )
+            clicked = self._tap_text_button("确认兑换", "确定兑换") or clicked
             after = self.observe()
+            target_final, foreign_final = self.exchange_product_evidence(after)
+            if foreign_final and not target_final:
+                after = self._leave_exchange_detail()
+                return self._result(
+                    False,
+                    "确认后页面显示的是其它会员/音乐商品，已退出，未记为兑换成功",
+                    stage=after.stage,
+                    visual_replan=True,
+                )
         explicit_success = self._has_exchange_success(after)
         debit = self._exchange_debit_evidence(after)
         if not clicked and not explicit_success and debit is None:

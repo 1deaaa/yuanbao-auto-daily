@@ -23,7 +23,7 @@ from .executor_content import ExecutorContentMixin
 from .executor_exchange import ExecutorExchangeMixin
 from .executor_navigation import ExecutorNavigationMixin
 from .executor_observation import ExecutorObservationMixin
-from .models import Bounds, Node, Observation, ToolResult
+from .models import Observation, ToolResult
 
 
 class ToolExecutor(
@@ -50,6 +50,7 @@ class ToolExecutor(
         self.reward_use_confirmed = False
         self.image_pushed = False
         self.exchange_target_clicked = False
+        self.exchange_target_confirmed = False
         self.exchange_confirmed = False
         self.prize_records_opened = False
         self.reward_use_clicked = False
@@ -68,23 +69,37 @@ class ToolExecutor(
         self._welfare_context = False
         self._welfare_supplemental_task_progress: dict[str, int] = {}
         self._daily_ability_experience_navigation = False
+        self.current_task_kind: str | None = None
+        self.current_task_expected_count: int | None = None
+        self.image_attempt_serial = 0
 
-    def execute(self, name: str, args: dict[str, Any]) -> ToolResult:
+    def execute(
+        self,
+        name: str,
+        args: dict[str, Any],
+        observation: Observation | None = None,
+    ) -> ToolResult:
         """按工具名分派到独立处理方法；参数与运行期错误在此统一收敛。"""
-        guarded = self._guard_generation(name)
-        if guarded is not None:
-            if name == "tap":
-                self._daily_ability_experience_navigation = False
-            return guarded
-        handler = self._TOOL_HANDLERS.get(name)
-        if handler is None:
-            return self._result(False, f"未知工具：{name}")
+        # 复用工作流本轮已经截取的观测，避免同一动作开始前再 dump 一次。
+        # 动作内部需要确认新页面的地方仍会显式调用 observe()。
+        self._step_observation = observation
         try:
-            return getattr(self, handler)(args)
-        except (KeyError, TypeError, ValueError) as exc:
-            return self._result(False, f"工具参数错误：{type(exc).__name__}")
-        except ManualActionRequired:
-            # 登录和协议确认不能靠重试解决，也不能被降级成普通工具失败。
-            raise
-        except AgentError as exc:
-            return self._result(False, str(exc)[:240])
+            guarded = self._guard_generation(name)
+            if guarded is not None:
+                if name == "tap":
+                    self._daily_ability_experience_navigation = False
+                return guarded
+            handler = self._TOOL_HANDLERS.get(name)
+            if handler is None:
+                return self._result(False, f"未知工具：{name}")
+            try:
+                return getattr(self, handler)(args)
+            except (KeyError, TypeError, ValueError) as exc:
+                return self._result(False, f"工具参数错误：{type(exc).__name__}")
+            except ManualActionRequired:
+                # 登录和协议确认不能靠重试解决，也不能被降级成普通工具失败。
+                raise
+            except AgentError as exc:
+                return self._result(False, str(exc)[:240])
+        finally:
+            self._step_observation = None

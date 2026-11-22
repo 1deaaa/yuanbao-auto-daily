@@ -7,8 +7,6 @@
 from __future__ import annotations
 
 import contextlib
-import time
-from typing import Any
 
 from .config import Config
 from .constants import (
@@ -24,6 +22,7 @@ from .executor import ToolExecutor
 from .models import Observation
 from .vision import VisionModel
 from .workflow import Workflow
+from .welfare import is_welfare_activity
 
 
 class Session:
@@ -76,13 +75,17 @@ def start_session(config: Config, runtime: WaydroidRuntime) -> Session:
             # 启动后的首个页面入口也交给 VLMM；页面文案、入口位置和返回路径
             # 都可能随 WebView 改版变化，本地不再复用福利入口坐标。
             startup_observation = executor.observe_startup()
-            if startup_observation.stage == "welfare":
+            if (
+                startup_observation.stage == "welfare"
+                and is_welfare_activity(startup_observation.activity)
+            ):
                 if workflow.terminal_restore:
                     # 本地状态显示全部完成时，也要先读一次福利页任务目录，
                     # 确认没有把没做的任务误记成已完成。
                     workflow.phase = "report"
-                elif workflow.daily_ability_done:
-                    # 同日恢复仍重新读取任务目录，页面改版或任务移除不沿用旧 target。
+                elif workflow.daily_ability_done or workflow.daily_ability_unavailable:
+                    # 同日恢复仍重新读取任务目录；已确认页面未提供能力入口时，
+                    # 继续固定每日任务，不再重复空转能力站阶段。
                     workflow.phase = "report"
                 else:
                     workflow.phase = "daily_ability"

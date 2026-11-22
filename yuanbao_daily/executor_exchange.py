@@ -7,6 +7,9 @@ import re
 import time
 
 from .constants import (
+    DEFAULT_CARD_NAME,
+    EXCHANGE_FOREIGN_PRODUCT_MARKERS,
+    EXCHANGE_TARGET_MARKERS,
     WELFARE_ACTIVITY_MARKERS,
     WELFARE_REWARD_BUTTON_Y_RATIO,
 )
@@ -30,6 +33,65 @@ from .welfare import (
 
 class ExecutorExchangeMixin:
     """按职责拆分的混入类；方法实现与原主类完全一致。"""
+
+    @staticmethod
+    def _normalized_product_text(value: str) -> str:
+        return re.sub(r"\s+", "", value or "").lower()
+
+    def product_name_matches(self, value: str) -> bool:
+        """页面/模型报告的商品名是否就是目标 QQ 超级会员 3 天卡。"""
+        normalized = self._normalized_product_text(value)
+        if not normalized:
+            return False
+        if any(
+            self._normalized_product_text(marker) in normalized
+            for marker in EXCHANGE_FOREIGN_PRODUCT_MARKERS
+        ):
+            return False
+        target = self._normalized_product_text(
+            getattr(self.config, "card_name", DEFAULT_CARD_NAME)
+        )
+        return target in normalized or all(
+            self._normalized_product_text(marker) in normalized
+            for marker in EXCHANGE_TARGET_MARKERS
+        )
+
+    def exchange_product_evidence(
+        self, observation: Observation
+    ) -> tuple[bool, bool]:
+        """返回（当前视口是否看到目标卡, 是否看到其它会员/音乐商品）。
+
+        只看有可见边界的节点；WebView 重绘时的零边界/离屏残留文本不能
+        作为商品身份证据。
+        """
+        content = " ".join(
+            f"{node.text} {node.content_desc}"
+            for node in observation.nodes
+            if node.enabled and node.bounds.area > 0
+        )
+        normalized = self._normalized_product_text(content)
+        target_visible = all(
+            self._normalized_product_text(marker) in normalized
+            for marker in EXCHANGE_TARGET_MARKERS
+        )
+        foreign_visible = any(
+            self._normalized_product_text(marker) in normalized
+            for marker in EXCHANGE_FOREIGN_PRODUCT_MARKERS
+        )
+        return target_visible, foreign_visible
+
+    def _leave_exchange_detail(self) -> Observation:
+        """退出错误商品详情/确认弹窗，回到兑换商城。"""
+        observation = self.observe()
+        for label in ("取消", "关闭"):
+            node = find_node(observation.nodes, label, exact=True)
+            if node is not None:
+                self._tap_node(node)
+                time.sleep(1)
+                return self.observe()
+        self.device.input("keyevent", "KEYCODE_BACK")
+        time.sleep(1)
+        return self.observe()
 
     def _open_exchange(self) -> ToolResult:
         observation = self._go_to_welfare()
@@ -163,6 +225,29 @@ class ExecutorExchangeMixin:
             self._tap_node(text_button)
             time.sleep(2)
             return True
+        if reward_amount:
+            # 当前新版奖励遮罩会把绿色“开启签到提醒”暴露成通用 button；
+            # 已读到奖励金额时优先关闭遮罩，避免误打开通知设置页。
+            self._tap_point(self.width // 2, round(self.height * 0.71))
+            time.sleep(1)
+            return True
+        in_welfare_surface = (
+            observation.stage == "welfare"
+            or any(
+                marker in observation.activity.lower()
+                for marker in WELFARE_ACTIVITY_MARKERS
+            )
+        )
+        if in_welfare_surface:
+            # 新版“恭喜获得”遮罩的关闭 X 必须先于无障碍树里的通用 button
+            # 处理，否则会误点“开启签到提醒”并跳到通知设置页。
+            x = self.width // 2
+            close_y = round(self.height * 0.71)
+            close_pixel = png_pixel(observation.image, x, close_y)
+            if close_pixel is not None and all(channel >= 240 for channel in close_pixel[:3]):
+                self._tap_point(x, close_y)
+                time.sleep(1)
+                return True
         button = find_node(observation.nodes, "button", exact=True)
         if reward_amount and button is not None:
             self._tap_node(button)
@@ -170,13 +255,7 @@ class ExecutorExchangeMixin:
             return True
         # WebView 奖励遮罩常完全不进入无障碍树。当前手机布局中，
         # 绿色“开心收下”按钮中心是可验证的亮绿色像素，普通任务行该位置为深色。
-        if (
-            observation.stage == "welfare"
-            or any(
-                marker in observation.activity.lower()
-                for marker in WELFARE_ACTIVITY_MARKERS
-            )
-        ):
+        if in_welfare_surface:
             x = self.width // 2
             y = round(self.height * WELFARE_REWARD_BUTTON_Y_RATIO)
             pixel = png_pixel(observation.image, x, y)
@@ -186,8 +265,10 @@ class ExecutorExchangeMixin:
                 and pixel[1] >= pixel[0] * 2
                 and pixel[1] >= pixel[2] * 1.25
             ):
-                self._tap_point(x, y)
-                time.sleep(2)
+                # 福利页“恭喜获得”遮罩的绿色按钮会打开通知设置；奖励已经
+                # 发放，统一点击底部 X 收起遮罩，避免跳出业务页。
+                self._tap_point(x, round(self.height * 0.71))
+                time.sleep(1)
                 return True
         return False
 
@@ -195,44 +276,97 @@ class ExecutorExchangeMixin:
     def _find_card_and_button(
         self, observation: Observation, card_name: str | None = None
     ) -> tuple[Node, Node] | None:
+        """只把目标商品标题与其同一列下方的“兑换”按钮配对。
+
+        旧实现会先找任意目标文案，再取纵向最近的“兑换”按钮；当目标文案
+        出现在顶部横幅/活动介绍里时，最近的按钮可能是相邻的其它商品
+        （例如 QQ 音乐绿钻）。这里要求按钮与标题横向重叠或中心对齐，
+        并排除宽横幅和同时含其它会员商品的标题。
+        """
         wanted_card = card_name or self.reward_card_name
-        product = find_node(observation.nodes, wanted_card, exact=True)
-        if product is None:
-            product = find_node(observation.nodes, wanted_card)
-        if product is None:
-            return None
-        buttons = [
+        target_norm = self._normalized_product_text(wanted_card)
+        screen_area = max(1, self.width * self.height)
+        visible = [
             node
             for node in observation.nodes
-            if node.enabled
-            and node.bounds.area > 0
-            and (node.text == "兑换" or node.content_desc == "兑换")
+            if node.enabled and node.bounds.area > 0
         ]
-        if not buttons:
-            return None
-        px, py = product.bounds.center
-        same_card = [
+        titles: list[tuple[int, Node]] = []
+        for node in visible:
+            fields = (node.text, node.content_desc)
+            labels = [self._normalized_product_text(field) for field in fields]
+            exact = any(label == target_norm for label in labels)
+            label = self._normalized_product_text(f"{node.text} {node.content_desc}")
+            if not exact and target_norm not in label:
+                continue
+            bounds = node.bounds
+            if bounds.height > self.height * 0.30 or bounds.area > screen_area * 0.45:
+                # 整块容器/横幅里的商品文案不能作为商品卡锚点。
+                continue
+            if any(
+                self._normalized_product_text(marker) in label
+                for marker in EXCHANGE_FOREIGN_PRODUCT_MARKERS
+            ):
+                # “目标卡 + QQ音乐绿钻”组合包不是单纯的目标商品。
+                continue
+            titles.append((0 if exact else 1, node))
+        buttons = [
             node
-            for node in buttons
-            if abs(node.bounds.center[0] - px) < 220 and node.bounds.center[1] >= product.bounds.bottom
+            for node in visible
+            if node.text.strip() == "兑换" or node.content_desc.strip() == "兑换"
         ]
-        if not same_card:
-            # 商品卡片可能仍在视口边缘，不能把别的商品按钮误配给它。
+        if not titles or not buttons:
             return None
-        return product, min(same_card, key=lambda node: abs(node.bounds.center[1] - py))
+        candidates: list[tuple[tuple[int, int, int], Node, Node]] = []
+        for rank, title in titles:
+            title_bounds = title.bounds
+            for button in buttons:
+                button_bounds = button.bounds
+                if button_bounds.top < title_bounds.bottom - 20:
+                    continue
+                if button_bounds.top > title_bounds.bottom + 420:
+                    continue
+                overlap = min(title_bounds.right, button_bounds.right) - max(
+                    title_bounds.left, button_bounds.left
+                )
+                if overlap <= 0:
+                    tolerance = max(100, min(220, title_bounds.width // 2 + 80))
+                    if abs(button_bounds.center[0] - title_bounds.center[0]) > tolerance:
+                        continue
+                if (
+                    title_bounds.width > self.width * 0.60
+                    and abs(
+                        button_bounds.center[0] - title_bounds.center[0]
+                    )
+                    > max(90, button_bounds.width * 0.35)
+                ):
+                    # 跨两列的横幅/活动说明即使含商品名，也不能与某一列
+                    # 的按钮配对；真正单列商品卡的按钮会与标题居中对齐。
+                    continue
+                score = (
+                    rank,
+                    abs(button_bounds.center[1] - title_bounds.bottom),
+                    abs(button_bounds.center[0] - title_bounds.center[0]),
+                )
+                candidates.append((score, title, button))
+        if not candidates:
+            return None
+        _, title, button = min(candidates, key=lambda item: item[0])
+        return title, button
 
 
     def _read_exchange_points(self, observation: Observation) -> int | None:
         """读取兑换页顶部的当前积分，无法确认时返回 None。"""
         labelled: list[tuple[int, int]] = []
         plain: list[tuple[int, int]] = []
+        ordered = list(observation.nodes)
         point_labels = [
             node
-            for node in observation.nodes
-            if node.bounds.area > 0 and "我的积分" in node.searchable
+            for node in ordered
+            if "我的积分" in node.searchable
         ]
         numeric_nodes: list[tuple[Node, int]] = []
-        for node in observation.nodes:
+        for node in ordered:
             # 新版兑换页把“我的积分”固定在 y=128 左右；保留标题栏下方
             # 的固定积分栏，不能用旧版 y=120 的边界误删真实积分。
             if node.bounds.area <= 0 or node.bounds.top > 220:
@@ -257,6 +391,23 @@ class ExecutorExchangeMixin:
             ]
             if nearby:
                 return min(nearby, key=lambda item: item[0])[1]
+
+            # WebView 重绘期间标题和余额可能全部变成零边界，但节点顺序仍
+            # 保留 DOM 顺序。只有在当前树明确出现“我的积分”标题时，才从
+            # 标题后的短窗口读取第一个纯数字，避免把商品价格当成余额。
+            for label in point_labels:
+                try:
+                    label_index = ordered.index(label)
+                except ValueError:
+                    continue
+                inline = re.search(r"我的积分\s*[:：]?\s*(\d[\d,]*)", label.text)
+                if inline is not None:
+                    return int(inline.group(1).replace(",", ""))
+                for candidate in ordered[label_index + 1 : label_index + 6]:
+                    value = candidate.text.strip().replace(",", "")
+                    match = re.fullmatch(r"(\d+)(?:\s*积分)?", value)
+                    if match is not None:
+                        return int(match.group(1))
         candidates = labelled or plain
         if not candidates:
             return None
@@ -303,7 +454,7 @@ class ExecutorExchangeMixin:
 
 
     def _redeem_card(self) -> ToolResult:
-        observation = self.observe()
+        observation = self._initial_observation()
         if observation.stage != "exchange":
             result = self._open_exchange()
             if not result.ok:
@@ -317,6 +468,8 @@ class ExecutorExchangeMixin:
                 observation = self.observe()
         self.reward_card_name = self.config.card_name
         self.reward_unavailable = False
+        self.exchange_target_clicked = False
+        self.exchange_target_confirmed = False
         recovered = self._recover_exchange_state(observation)
         if recovered == "used":
             return self._result(
@@ -385,8 +538,27 @@ class ExecutorExchangeMixin:
             )
         self._tap_node(button)
         time.sleep(2)
+        after = self.observe()
+        target_visible, foreign_visible = self.exchange_product_evidence(after)
+        if foreign_visible and not target_visible:
+            after = self._leave_exchange_detail()
+            return self._result(
+                False,
+                "点击兑换后打开的页面不是目标卡（检测到其它会员/音乐商品），"
+                "已退出详情页，未执行任何确认",
+                stage=after.stage,
+                visual_replan=True,
+            )
+        detail_evidence = self._has_evidence(after, "立即兑换", "确认兑换", "确定兑换")
         self.exchange_target_clicked = True
-        return self._result(True, f"已点击目标商品“{self.reward_card_name}”的兑换按钮", stage=self.observe().stage)
+        self.exchange_target_confirmed = target_visible and detail_evidence
+        return self._result(
+            True,
+            f"已点击目标商品“{self.reward_card_name}”的兑换按钮"
+            + ("，详情页已确认目标商品" if self.exchange_target_confirmed else ""),
+            stage=after.stage,
+            target_confirmed=self.exchange_target_confirmed,
+        )
 
 
     def _find_reward_use_button(self, observation: Observation) -> Node | None:
@@ -412,6 +584,10 @@ class ExecutorExchangeMixin:
             if abs(node.bounds.center[0] - px) < 260
             and node.bounds.center[1] >= product.bounds.top - 30
         ]
+        if not same_card and len(buttons) != 1:
+            # 奖品记录可能同时展示多张卡；无法把按钮与目标卡配对时
+            # 不能退化成“点第一个使用按钮”。
+            return None
         return min(same_card or buttons, key=lambda node: abs(node.bounds.center[1] - py))
 
 

@@ -9,7 +9,8 @@ from __future__ import annotations
 from typing import Any
 
 from .constants import (
-    DAILY_ABILITY_TOOLS,
+    EXTRA_TASK_FORBIDDEN_MARKERS,
+    PACKAGE_NAME,
     TASK_STEPS,
     TEXT_TASKS,
     VISUAL_NAVIGATION_TOOLS,
@@ -17,6 +18,8 @@ from .constants import (
 from .errors import AgentError, ManualActionRequired
 from .models import Observation, ToolResult
 from .ui import find_node
+from .welfare import is_welfare_activity
+from .workflow_policy import PHASE_ALLOWED_TOOLS
 
 
 class WorkflowGuardsMixin:
@@ -27,12 +30,24 @@ class WorkflowGuardsMixin:
     ) -> ToolResult | None:
         """福利页出现延迟奖励弹窗时先收下，避免它挡住业务动作。"""
         if (
-            self.phase not in {"report", "open_target", "open_exchange"}
+            self.phase
+            not in {
+                "report",
+                "open_target",
+                "open_exchange",
+                "daily_ability",
+                "daily_ability_wait",
+                "verify_daily_ability",
+                "verify_daily_ability_wait",
+            }
             or observation.stage != "welfare"
         ):
             return None
         dismiss_reward = getattr(self.executor, "_dismiss_reward_popup", None)
         if callable(dismiss_reward) and dismiss_reward(observation):
+            # 奖励遮罩关闭动画期间，WebView 无障碍树可能短暂被识别为 app；
+            # 保留福利上下文，让下一次观测按 WelfareWebActivity 归一回 welfare。
+            setattr(self.executor, "_welfare_context", True)
             return ToolResult(
                 True,
                 "已收下延迟出现的任务奖励；本次业务动作未执行，请根据最新页面继续",
@@ -40,13 +55,18 @@ class WorkflowGuardsMixin:
             )
         return None
 
-    def _dispatch_recovery(
+    def _dispatch_freeform(
         self, name: str, args: dict[str, Any], observation: Observation
     ) -> ToolResult:
-        """卡住恢复期间 VLM 自由决策：跳过阶段白名单与常规前置条件。"""
+        """恢复/接管期间 VLM 自由决策：跳过阶段白名单与常规前置条件。"""
         if name == "report_tasks":
+            report_args = (
+                args
+                if self.config.force_all_daily_tasks
+                else self._merge_local_report(args, observation)
+            )
             result = self._parse_report(
-                self._merge_local_report(args, observation), observation
+                report_args, observation
             )
         elif name == "verify_daily_ability":
             result = self._parse_daily_ability_verification(args, observation)
@@ -80,22 +100,133 @@ class WorkflowGuardsMixin:
                         "视觉恢复未触发入口，已按当前页面语义导航回福利中心",
                         {"stage": "welfare"},
                     )
-        self.finish_recovery(f"{name} 执行成功")
+        if self.recovering:
+            self.finish_recovery(f"{name} 执行成功")
         if name in {"report_tasks", "complete_task"}:
             return result
         return self._after_successful_action(name, args, result)
 
-    def _guard_phase_allowlist(self, name: str) -> ToolResult | None:
-        """能力站与核验阶段的工具白名单。"""
-        if not self.recovering and self.phase == "daily_ability":
-            if name not in DAILY_ABILITY_TOOLS:
-                return ToolResult(False, "当前阶段只允许点击主轮播卡固定位置的‘去体验’")
-        elif (
-            not self.recovering
-            and self.phase == "verify_daily_ability"
-            and name != "verify_daily_ability"
+    def _guard_confirm_exchange(
+        self, name: str, args: dict[str, Any], observation: Observation
+    ) -> ToolResult | None:
+        """兑换确认门禁：商品身份不明或不是目标卡时绝不点击确认。"""
+        if self.phase != "exchange_confirm" or name != "confirm_exchange":
+            return None
+        if args.get("target_visible") is not True:
+            return self._reject_exchange_confirm(
+                "视觉模型没有确认当前确认页显示目标卡"
+            )
+        product_name = str(args.get("product_name") or "").strip()
+        matcher = getattr(self.executor, "product_name_matches", None)
+        if not product_name or not callable(matcher) or not matcher(product_name):
+            return self._reject_exchange_confirm(
+                f"确认页商品“{product_name or '未知'}”不是 {self.config.card_name}"
+            )
+        evidence = getattr(self.executor, "exchange_product_evidence", None)
+        if callable(evidence):
+            target_visible, foreign_visible = evidence(observation)
+            if foreign_visible and not target_visible:
+                return self._reject_exchange_confirm(
+                    "当前页面出现其它会员/绿钻商品，未看到目标卡"
+                )
+        args["_verified_target_name"] = self.config.card_name
+        return None
+
+    def _reject_exchange_confirm(self, reason: str) -> ToolResult:
+        """安全退出确认页，回到商城重新选择；不写入任何兑换成功状态。"""
+        print(f"拒绝兑换确认：{reason}")
+        self.executor.exchange_target_clicked = False
+        self.executor.exchange_target_confirmed = False
+        self.phase = "exchange_back"
+        self.substate = {}
+        return ToolResult(
+            False,
+            f"拒绝确认兑换：{reason}。必须先返回商城重新核对目标商品",
+            {"visual_replan": True, "exchange_rejected": True},
+        )
+
+    def _guard_extra_task_safety(
+        self, name: str, args: dict[str, Any], observation: Observation
+    ) -> ToolResult | None:
+        """新增任务只做应用内、无外部影响的动作。"""
+        if self.phase != "extra_tasks":
+            return None
+        if name in {
+            "press_back",
+            "return_to_welfare",
+            "open_welfare",
+            "report_extra_tasks",
+        }:
+            return None
+        activity = observation.activity or ""
+        activity_lower = activity.lower()
+        if (
+            activity
+            and PACKAGE_NAME not in activity_lower
+            and not is_welfare_activity(activity_lower)
+            and observation.stage not in {"picker", "photo_preview"}
         ):
-            return ToolResult(False, "体验页面处理后必须先核验主轮播卡是否显示‘已完成’")
+            return ToolResult(
+                False,
+                "新增任务不允许打开外部应用或产生外部影响；请先返回元宝福利中心",
+                {"stage": observation.stage, "visual_replan": True},
+            )
+        if observation.stage == "exchange":
+            # 新增任务巡查永远不进入兑换流程；兑换只由固定流程完成后执行，
+            # 且目标只有 QQ超级会员3天卡。
+            return ToolResult(
+                False,
+                "新增任务巡查不进入兑换流程；请返回福利中心继续巡查或调用 report_extra_tasks",
+                {"stage": observation.stage, "visual_replan": True},
+            )
+        if name == "tap":
+            try:
+                x, y = int(args["x"]), int(args["y"])
+            except (KeyError, TypeError, ValueError):
+                return None
+            for node in observation.nodes:
+                if not node.enabled or node.bounds.area <= 0:
+                    continue
+                exchange_label = any(
+                    marker in node.searchable
+                    for marker in ("兑换商城", "立即兑换", "确认兑换", "确定兑换")
+                ) or node.text.strip() == "兑换"
+                if not exchange_label and not any(
+                    marker in node.searchable
+                    for marker in EXTRA_TASK_FORBIDDEN_MARKERS
+                ):
+                    continue
+                bounds = node.interaction_bounds
+                if (
+                    bounds.left - 45 <= x <= bounds.right + 45
+                    and bounds.top - 45 <= y <= bounds.bottom + 45
+                ):
+                    return ToolResult(
+                        False,
+                        "该点击涉及兑换、邀请好友、分享、绑定或外部影响，"
+                        "新增任务巡查已拒绝执行",
+                        {"stage": observation.stage, "visual_replan": True},
+                    )
+        return None
+
+    def _guard_phase_allowlist(self, name: str) -> ToolResult | None:
+        """能力站与核验阶段的最小工具集；接管/恢复期间不限制。"""
+        if self.recovering or self.takeover:
+            return None
+        if self.phase == "daily_ability":
+            allowed = PHASE_ALLOWED_TOOLS["daily_ability"]
+            if name not in allowed:
+                return ToolResult(
+                    False,
+                    "当前阶段只允许点击主轮播卡的体验入口，或先用导航工具处理页面",
+                )
+        elif self.phase == "verify_daily_ability":
+            allowed = PHASE_ALLOWED_TOOLS["verify_daily_ability"]
+            if name not in allowed:
+                return ToolResult(
+                    False,
+                    "必须先核验主轮播卡是否显示‘已完成’，或先用导航工具回到福利页",
+                )
         return None
 
     def _guard_exchange_navigation(
@@ -112,7 +243,7 @@ class WorkflowGuardsMixin:
                     {"stage": observation.stage, "visual_replan": True},
                 )
             if name in VISUAL_NAVIGATION_TOOLS:
-                result = self.executor.execute(name, args)
+                result = self._run_executor(name, args, observation)
                 if not result.ok:
                     return result
                 stage = result.data.get("stage", "")

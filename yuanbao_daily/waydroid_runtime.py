@@ -9,10 +9,6 @@ import time
 from typing import Any
 
 from .constants import (
-    APP_ANR_WINDOW_MARKERS,
-    APP_READY_POLL_INTERVAL,
-    APP_READY_TIMEOUT,
-    APP_RESOLVE_POLL_INTERVAL,
     APP_RESOLVE_TIMEOUT,
     APPSTORE_PACKAGE_NAME,
     PACKAGE_NAME,
@@ -22,7 +18,7 @@ from .constants import (
     WAYDROID_STOP_TIMEOUT,
 )
 from .device import Device
-from .errors import AgentError, AppUnresponsiveError, ManualActionRequired
+from .errors import AgentError
 
 
 class WaydroidRuntime:

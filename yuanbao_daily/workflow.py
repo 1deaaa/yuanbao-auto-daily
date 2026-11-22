@@ -6,46 +6,31 @@
 - ``workflow_entries`` 任务行语义与入口定位；
 - ``workflow_guards`` 动作前置条件、阶段白名单与已知误触的处理；
 - ``workflow_reports`` 福利页进度、兑换读数与能力站核验；
-- ``workflow_recovery`` 卡住恢复、语义救援与阶段白名单。
+- ``workflow_recovery`` 语义救援与阶段白名单；
+- ``workflow_policy`` 本地快路径适用条件与模型工具边界；
+- ``workflow_takeover`` 页面漂移后的持续 VLM 接管。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
+import inspect
+import uuid
 
 from .config import Config
 from .constants import (
     DAILY_ABILITY_EXPERIENCE_ACTION_MARKERS,
-    DAILY_ABILITY_EXPERIENCE_TOOLS,
-    DAILY_ABILITY_RULE_NAME,
-    DAILY_ABILITY_RULE_VERSION,
-    DAILY_ABILITY_TOOLS,
-    DAILY_TASK_MODE_ABILITY_STATION,
-    FORCED_DAILY_TASKS,
     IMAGE_TASKS,
-    LOCAL_DETERMINISTIC_TOOLS,
-    NEW_WELFARE_DAILY_TASKS,
-    TASK_LABELS,
     TASK_ORDER,
-    TASK_STATE_SCHEMA,
-    TASK_STEPS,
     TEXT_TASKS,
-    VISUAL_EXCHANGE_TOOLS,
     VISUAL_NAVIGATION_TOOLS,
 )
 from .errors import AgentError, ManualActionRequired
 from .executor import ToolExecutor
-from .models import Node, Observation, ToolResult
-from .state import read_daily_state, write_daily_state
-from .ui import find_node, find_semantic_node, node_interaction_bounds
+from .models import Observation, ToolResult
 from .welfare import (
-    has_authoritative_local_task_catalog,
-    has_complete_new_welfare_task_catalog,
-    has_visible_exchange_product,
-    is_new_welfare_page,
-    merge_supplemental_task_progress,
-    parse_local_welfare_progress,
+    is_welfare_activity,
 )
 from .workflow_ability import WorkflowAbilityMixin
 from .workflow_entries import WorkflowEntriesMixin
@@ -53,6 +38,7 @@ from .workflow_guards import WorkflowGuardsMixin
 from .workflow_recovery import WorkflowRecoveryMixin
 from .workflow_reports import WorkflowReportsMixin
 from .workflow_state import WorkflowStateMixin
+from .workflow_takeover import WorkflowTakeoverMixin
 
 
 @dataclass
@@ -63,6 +49,7 @@ class Workflow(
     WorkflowGuardsMixin,
     WorkflowReportsMixin,
     WorkflowRecoveryMixin,
+    WorkflowTakeoverMixin,
 ):
     """组合各编排能力；对外只暴露 ``dispatch`` 工具入口。"""
 
@@ -70,6 +57,8 @@ class Workflow(
     executor: ToolExecutor
     daily_ability_done: bool = False
     daily_ability_evidence: str | None = None
+    daily_ability_unavailable: bool = False
+    daily_ability_unavailable_evidence: str | None = None
     daily_ability_click_attempts: int = 0
     daily_ability_button_checks: int = 0
     daily_ability_verification_checks: int = 0
@@ -82,6 +71,11 @@ class Workflow(
     target: str | None = None
     substate: dict[str, bool] = field(default_factory=dict)
     expected_count: int | None = None
+    prompt_retry_serial: int = 0
+    prompt_session_nonce: str = field(
+        default_factory=lambda: uuid.uuid4().hex[:8]
+    )
+    progress_refresh_pending: bool = False
     finished: bool = False
     entry_scroll_attempts: dict[str, int] = field(default_factory=dict)
     state_restored: bool = False
@@ -93,20 +87,41 @@ class Workflow(
     recover_phase: str | None = None
     recover_target: str | None = None
     recover_attempts: int = 0
+    takeover: bool = False
+    takeover_phase: str | None = None
+    takeover_target: str | None = None
+    takeover_reason: str = ""
+    takeover_steps: int = 0
+    local_failure_streak: int = 0
+    last_local_failure: str = ""
+    extra_task_steps: int = 0
+    extra_task_reports: int = 0
+    extra_tasks_done: bool = False
+    extra_task_notes: list[str] = field(default_factory=list)
 
     def dispatch(self, name: str, args: dict[str, Any], observation: Observation) -> ToolResult:
         """执行一个工具动作；前置条件与阶段约束由守卫层逐条判定。"""
         dismissed = self._dismiss_reward_if_needed(name, observation)
         if dismissed is not None:
             return dismissed
-        # 卡住恢复期间必须先允许模型处理遮挡层、返回键或重新定位；如果先套用
-        # 正常阶段白名单，verify_daily_ability 会把恢复动作直接拦截，恢复机制
-        # 实际上无法工作。
+        # 不可逆的兑换确认即使处于接管模式也必须先核对商品身份。
+        confirm_error = self._guard_confirm_exchange(name, args, observation)
+        if confirm_error is not None:
+            return confirm_error
+        extra_safety_error = self._guard_extra_task_safety(
+            name, args, observation
+        )
+        if extra_safety_error is not None:
+            return extra_safety_error
+        # 卡住恢复/接管期间必须先允许模型处理遮挡层、返回键或重新定位；
+        # 如果先套用正常阶段白名单，恢复动作会被直接拦截。
         allowlist_error = self._guard_phase_allowlist(name)
         if allowlist_error is not None:
             return allowlist_error
+        if self.takeover:
+            return self._dispatch_freeform(name, args, observation)
         if self.recovering:
-            return self._dispatch_recovery(name, args, observation)
+            return self._dispatch_freeform(name, args, observation)
         if (
             self.phase == "navigate_welfare"
             and name == "report_tasks"
@@ -122,6 +137,16 @@ class Workflow(
             return exchange_error
         if self.phase == "open_exchange" and name == "report_exchange":
             return self._parse_exchange_report(args, observation)
+        if name == "report_extra_tasks":
+            if self.phase != "extra_tasks":
+                return ToolResult(
+                    False, "report_extra_tasks 只在新增任务巡查阶段使用"
+                )
+            return self._parse_extra_tasks_report(args, observation)
+        if name == "select_local_image":
+            set_context = getattr(self.executor, "set_task_context", None)
+            if callable(set_context):
+                set_context(self.target, self.expected_count)
         phase_error = self._valid_phase(name)
         if phase_error:
             return ToolResult(False, phase_error)
@@ -151,8 +176,13 @@ class Workflow(
         if precondition_error is not None:
             return precondition_error
         if name == "report_tasks":
+            report_args = (
+                args
+                if self.config.force_all_daily_tasks
+                else self._merge_local_report(args, observation)
+            )
             return self._parse_report(
-                self._merge_local_report(args, observation), observation
+                report_args, observation
             )
         if name == "verify_daily_ability":
             result = self._parse_daily_ability_verification(args, observation)
@@ -165,6 +195,24 @@ class Workflow(
             set_variant = getattr(self.executor, "set_prompt_variant", None)
             if callable(set_variant):
                 set_variant(self._prompt_variant())
+            # 输入动作必须幂等：页面可能已经保留上一轮成功填入的固定问题，
+            # 但状态迁移在重绘/恢复时尚未写入 input。直接确认现有文本，避免
+            # 在同一聊天页重复输入并耗尽整轮步骤。
+            if self.phase == "perform" and self.target in TEXT_TASKS:
+                find_input = getattr(self.executor, "_find_input", None)
+                fixed_prompt = getattr(self.executor, "_fixed_prompt", None)
+                if callable(find_input) and callable(fixed_prompt):
+                    input_node = find_input(observation)
+                    expected = str(fixed_prompt()).strip()
+                    if input_node is not None and input_node.text.strip() == expected:
+                        result = ToolResult(
+                            True,
+                            "当前输入框已是本轮固定测试文本，直接确认输入完成",
+                            {"stage": observation.stage, "input_confirmed": True},
+                        )
+                        return self._after_successful_action(
+                            name, args, result, observation
+                        )
         result = self._execute_observed(name, args, observation)
         if (
             self.phase == "return"
@@ -219,6 +267,40 @@ class Workflow(
                 "仅当没有抽屉入口时才尝试旧版“我们”页路径",
                 {"stage": result.data.get("stage", ""), "visual_replan": True},
             )
+        if (
+            result.data.get("stage") == "welfare"
+            and name in {"return_to_welfare", "open_welfare"}
+            and self.phase
+            in {
+                "open_target",
+                "perform",
+                "claim",
+                "redeem",
+                "prize_records",
+                "use_reward",
+                "use_confirm",
+            }
+        ):
+            # 接管时模型可能直接放弃当前子流程回到福利中心。先重新读取
+            # 页面计数，再决定是补做当前任务还是进入下一阶段，不能继续
+            # 在旧阶段按旧子步骤失败。
+            if self.phase in {"redeem", "prize_records", "use_reward", "use_confirm"}:
+                self.executor.exchange_target_clicked = False
+                self.executor.exchange_target_confirmed = False
+            self.phase = "report"
+            self.substate = {}
+            self.progress_refresh_pending = True
+            return result
+        if (
+            self.phase == "open_target"
+            and self.target in IMAGE_TASKS
+            and result.data.get("stage") in {"picker", "photo_preview"}
+        ):
+            # 系统选图/相机预览已经是图片任务目标页；忽略点击结果中可能残留的
+            # 聊天 entry_evidence，直接进入本地选图步骤。
+            self.phase = "perform"
+            self.substate = {}
+            return result
         if self.phase == "open_target" and name in {"tap", "press_back"}:
             if not self._target_entry_ready(result):
                 # 点击后没有当前目标页证据，不能把残留 WebView、活动页或错误
@@ -234,6 +316,16 @@ class Workflow(
                 )
             self.phase = "perform"
             self.substate = {}
+            if (
+                self.target == "question"
+                and name == "tap"
+                and self._tap_hits_question_card(args, observation)
+            ):
+                # 新版趣问推荐问题卡点击后即提交一次提问；不能再把卡片内容
+                # 覆盖成固定测试文本，否则福利页不会增加趣问计数。
+                self.substate["question_card_clicked"] = True
+                self.substate["sent"] = True
+                return result
             if self.target == "same_template" and name == "tap":
                 self.substate["entry_clicked"] = True
                 activity = str(result.data.get("activity", "")).lower()
@@ -247,7 +339,9 @@ class Workflow(
             if self.terminal_restore:
                 # 先读一次福利页任务目录再决定是否直接收尾。
                 self.phase = "report"
-            elif self.daily_ability_done:
+            elif self.daily_ability_done or self.daily_ability_unavailable:
+                # 同日状态已确认能力站入口未由福利页提供时，重启后直接恢复
+                # 固定任务报告，不重复执行已穷尽的入口检查。
                 self.phase = "report"
             else:
                 self.phase = "daily_ability"
@@ -284,7 +378,24 @@ class Workflow(
         elif self.phase == "return" and (
             name == "return_to_welfare" or result.data.get("stage") == "welfare"
         ):
-            self._advance_after_task()
+            if (
+                ("stage" in result.data and result.data.get("stage") != "welfare")
+                or (
+                    "activity" in result.data
+                    and not is_welfare_activity(str(result.data.get("activity", "")))
+                )
+            ):
+                return ToolResult(
+                    False,
+                    "返回动作未确认福利 WebView，保持返回阶段继续导航",
+                    {"stage": result.data.get("stage", ""), "visual_replan": True},
+                )
+            # 返回福利页只证明导航成功，不能证明任务计数已经增加。
+            # 元宝会出现消息已生成但福利页计数尚未回写、甚至提交失败不计数的情况；
+            # 先回到 report 重新读取当前页面，只有页面实数确认后才推进任务。
+            self.phase = "report"
+            self.substate = {}
+            self.progress_refresh_pending = True
         elif self.phase == "open_exchange" and name == "tap":
             stage = result.data.get("stage", "")
             if stage != "exchange":
@@ -314,6 +425,34 @@ class Workflow(
                 self.phase = "exchange_confirm"
         elif self.phase == "exchange_confirm" and name == "confirm_exchange":
             self.phase = "prize_records"
+        elif self.phase == "exchange_confirm" and name in {
+            "press_back",
+            "return_to_welfare",
+            "open_exchange",
+        }:
+            # 确认页不是目标商品时由模型或本地守卫退回；回到商城后重新
+            # 定位目标卡，回到福利页则重新打开商城。
+            self.executor.exchange_target_clicked = False
+            self.executor.exchange_target_confirmed = False
+            stage = result.data.get("stage")
+            if name == "open_exchange" and stage == "exchange":
+                self.phase = "redeem"
+            else:
+                self.phase = "open_exchange" if stage == "welfare" else "redeem"
+            self.substate = {}
+        elif self.phase == "exchange_back" and name in {
+            "press_back",
+            "return_to_welfare",
+            "open_exchange",
+        }:
+            self.executor.exchange_target_clicked = False
+            self.executor.exchange_target_confirmed = False
+            self.phase = (
+                "open_exchange"
+                if result.data.get("stage") == "welfare"
+                else "redeem"
+            )
+            self.substate = {}
         elif self.phase == "prize_records" and name == "open_prize_records":
             self.phase = "use_reward"
         elif self.phase == "use_reward" and name == "use_bound_reward":
@@ -321,6 +460,9 @@ class Workflow(
         elif self.phase == "use_confirm" and name == "confirm_reward_use":
             if self.executor.reward_use_confirmed:
                 self.phase = "return_home"
+        elif self.phase == "use_confirm" and name == "press_back":
+            self.executor.reward_use_clicked = False
+            self.phase = "use_reward"
         elif self.phase == "return_home" and name == "return_to_home":
             self.phase = "complete"
         return result
@@ -336,7 +478,20 @@ class Workflow(
                 return opener(args, observation)
         if name == "continue_daily_ability":
             return self._continue_daily_ability(args, observation)
-        return self.executor.execute(name, args)
+        return self._run_executor(name, args, observation)
+
+    def _run_executor(
+        self, name: str, args: dict[str, Any], observation: Observation
+    ) -> ToolResult:
+        """把本轮已经截取的观测传给执行器，避免同一动作再 dump 一次页面。"""
+        execute = self.executor.execute
+        try:
+            parameters = inspect.signature(execute).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        if "observation" in parameters:
+            return execute(name, args, observation=observation)
+        return execute(name, args)
 
 
     @staticmethod

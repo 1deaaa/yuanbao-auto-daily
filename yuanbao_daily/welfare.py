@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import re
 from typing import Any, Iterable
 
@@ -50,8 +49,19 @@ def is_daily_ability_experience_visible(observation: Observation) -> bool:
     return False
 
 
+def is_daily_ability_experience_activity(observation: Observation) -> bool:
+    """识别已离开福利 WebView 的元宝能力体验 Activity。"""
+    if observation.stage != "app":
+        return False
+    activity = observation.activity.lower()
+    if not activity or PACKAGE_NAME not in activity or is_welfare_activity(activity):
+        return False
+    # 聊天首页在无障碍树短暂缺失时也可能被归为 app，不能把它当成体验页。
+    return "home.v2.ybhomeactivityv2" not in activity
+
+
 def daily_ability_card_status(observation: Observation) -> str | None:
-    """从主轮播卡固定按钮区域读取已完成/去体验状态。"""
+    """从主轮播卡读取已完成/去体验状态，兼容顶部语音能力卡。"""
     visible = [node for node in observation.nodes if node.enabled and node.bounds.area > 0]
     width = max(900, max((node.bounds.right for node in visible), default=0))
     height = max(1600, max((node.bounds.bottom for node in visible), default=0))
@@ -62,12 +72,74 @@ def daily_ability_card_status(observation: Observation) -> str | None:
         and width * 0.48 <= node.bounds.center[0] <= width * 0.78
         and height * 0.45 <= node.bounds.center[1] <= height * 0.65
     ]
-    if not candidates:
-        return None
-    return min(
-        (node.text.strip() for node in candidates),
-        key=lambda value: 0 if value == "已完成" else 1,
+    has_top_card_header = any(
+        re.sub(r"\s+", "", node.text.strip())
+        and re.sub(r"\s+", "", node.text.strip()) not in {
+            "已完成",
+            "去提问",
+            "去体验",
+            "规则",
+            "积分",
+            "奖品记录",
+            "兑换商城",
+            "签到提醒",
+        }
+        and not re.fullmatch(
+            r"\d+(?:\.\d+)?", re.sub(r"\s+", "", node.text.strip())
+        )
+        and node.bounds.left >= width * 0.12
+        and node.bounds.center[0] <= width * 0.78
+        and node.bounds.center[1] <= height * 0.20
+        for node in visible
     )
+    completed_today = [
+        node
+        for node in visible
+        if node.text.strip() == "今日已完成"
+        and node.bounds.center[0] >= width * 0.65
+        and node.bounds.center[1] <= height * 0.45
+    ]
+    if completed_today:
+        return "已完成"
+    if candidates:
+        if any(node.text.strip() == "已完成" for node in candidates):
+            return "已完成"
+        # 滚动后的固定任务行按钮也可能落在主卡坐标带；“去体验”只有
+        # 同时存在顶部主卡标题时才算能力站入口。
+        return "去体验" if has_top_card_header else None
+    if not candidates:
+        top_actions = [
+            node
+            for node in visible
+            if node.text.strip() in {"已完成", "去提问", "去体验"}
+            and node.bounds.center[0] >= width * 0.65
+            and node.bounds.center[1] <= height * 0.45
+        ]
+        if top_actions and has_top_card_header:
+            if any(node.text.strip() == "已完成" for node in top_actions):
+                return "已完成"
+            return "去体验"
+        voice_card = any(
+            any(marker in node.searchable for marker in ("ai录音笔", "录音笔", "语音"))
+            and node.bounds.center[1] <= height * 0.30
+            for node in visible
+        )
+        if voice_card:
+            voice_actions = [
+                node.text.strip()
+                for node in visible
+                if node.text.strip() in {"已完成", "去提问", "去体验"}
+                and node.bounds.center[0] >= width * 0.65
+                and node.bounds.center[1] <= height * 0.45
+            ]
+            if "已完成" in voice_actions:
+                return "已完成"
+            if voice_actions:
+                # 工作流内部仍以“去体验”表示“可打开能力体验”；实际按钮
+                # 文案由执行层按语音卡语义定位为“去提问”。
+                return "去体验"
+        return None
+    return None
 
 
 def has_visible_exchange_product(
@@ -117,38 +189,55 @@ def is_new_welfare_webview(nodes: Iterable[Node], activity: str) -> bool:
 def _question_card_progress_parts(
     observation: Observation,
 ) -> tuple[int, int] | None:
-    """读取趣问元宝卡片的 (已完成/目标) 数字。"""
+    """读取趣问元宝卡片或每日任务行的 (已完成/目标) 数字。"""
     if observation.stage != "welfare" or not observation.nodes:
         return None
     title = find_node(observation.nodes, QUESTION_CARD_TITLE)
-    if title is None:
-        return None
-    title_bounds = title.interaction_bounds
-    parts: list[tuple[int, str]] = []
-    for node in observation.nodes:
-        text = node.text.strip()
-        if not text or node is title or node.bounds.area <= 0:
-            continue
-        if not (
-            title_bounds.top - 24
-            <= node.bounds.top
-            <= title_bounds.bottom + 24
-        ):
-            continue
-        if node.bounds.left < title_bounds.right - 8:
-            continue
-        parts.append((node.bounds.left, text))
-    parts.sort()
-    joined = ""
-    for _, part in parts:
-        joined += part
-        match = re.search(r"([0-9])\s*/\s*([0-9])", joined)
+    if title is not None and title.bounds.height > 0:
+        title_bounds = title.interaction_bounds
+        parts: list[tuple[int, str]] = []
+        for node in observation.nodes:
+            text = node.text.strip()
+            if not text or node is title or node.bounds.area <= 0:
+                continue
+            if not (
+                title_bounds.top - 24
+                <= node.bounds.top
+                <= title_bounds.bottom + 24
+            ):
+                continue
+            if node.bounds.left < title_bounds.right - 8:
+                continue
+            parts.append((node.bounds.left, text))
+        parts.sort()
+        joined = ""
+        for _, part in parts:
+            joined += part
+            match = re.search(r"([0-9])\s*/\s*([0-9])", joined)
+            if match is not None:
+                return int(match.group(1)), int(match.group(2))
+        # 某些 WebView 版本把整个计数合并到标题文本。
+        match = re.search(r"([0-9])\s*/\s*([0-9])", title.text)
         if match is not None:
             return int(match.group(1)), int(match.group(2))
-    # 某些 WebView 版本把整个计数合并到标题文本。
-    match = re.search(r"([0-9])\s*/\s*([0-9])", title.text)
-    if match is not None:
-        return int(match.group(1)), int(match.group(2))
+
+    # 旧式福利页不渲染推荐问题卡片，而是直接显示“问元宝任意问题，
+    # 已完成 x/N”任务行。该分母每天可能变化，不能继续使用默认目标次数。
+    question_markers = tuple(
+        dict.fromkeys(
+            (*TASK_ENTRY_ROW_MARKERS["question"], *LEGACY_DAILY_QUESTION_MARKERS)
+        )
+    )
+    for node in observation.nodes:
+        if node.bounds.area <= 0 or not any(
+            marker.lower() in node.searchable for marker in question_markers
+        ):
+            continue
+        match = re.search(r"(?:已完成|完成)?\s*([0-9]+)\s*/\s*([0-9]+)", node.searchable)
+        if match is not None:
+            current, target = (int(match.group(1)), int(match.group(2)))
+            if 0 <= current <= target and target > 0:
+                return current, target
     return None
 
 
@@ -178,10 +267,17 @@ def parse_local_welfare_progress(observation: Observation) -> dict[str, Any] | N
     if question_progress is not None:
         progress["question"] = question_progress
         available.append("question")
-    count_pattern = re.compile(r"(?:已完成|完成)?\s*([0-3])\s*/\s*3")
+    count_patterns = {
+        "question": re.compile(r"(?:已完成|完成)?\s*([0-9]+)\s*/\s*([0-9]+)"),
+        "writing": re.compile(r"(?:已完成|完成)?\s*([0-3])\s*/\s*3"),
+        "image": re.compile(r"(?:已完成|完成)?\s*([0-3])\s*/\s*3"),
+        "photo_question": re.compile(r"(?:已完成|完成)?\s*([0-3])\s*/\s*3"),
+        "same_template": re.compile(r"(?:已完成|完成)?\s*([0-3])\s*/\s*3"),
+    }
     for key, markers in TASK_ENTRY_ROW_MARKERS.items():
         if key == "question" and "question" in progress:
             continue
+        count_pattern = count_patterns[key]
         label_nodes = [
             node
             for node in searchable_nodes
@@ -194,7 +290,11 @@ def parse_local_welfare_progress(observation: Observation) -> dict[str, Any] | N
         for label in label_nodes:
             match = count_pattern.search(label.searchable)
             if match is not None:
-                progress[key] = int(match.group(1))
+                current = int(match.group(1))
+                target = int(match.group(2)) if key == "question" else 3
+                if key == "question" and (current > target or target <= 0):
+                    continue
+                progress[key] = current
                 break
         if key in progress:
             available.append(key)
@@ -207,6 +307,10 @@ def parse_local_welfare_progress(observation: Observation) -> dict[str, Any] | N
             for candidate in searchable_nodes:
                 candidate_match = count_pattern.search(candidate.searchable)
                 if candidate_match is None:
+                    continue
+                current = int(candidate_match.group(1))
+                target = int(candidate_match.group(2)) if key == "question" else 3
+                if key == "question" and (current > target or target <= 0):
                     continue
                 candidate_bounds = candidate.bounds
                 if candidate_bounds.area <= 0 or label_bounds.area <= 0:
@@ -315,6 +419,10 @@ def detect_stage(nodes: Iterable[Node], activity: str) -> str:
     visible_nodes = [node for node in node_list if node.bounds.area > 0]
     text = " ".join(node.searchable for node in visible_nodes)
     activity_lower = activity.lower()
+    # 聊天首页切换到福利 WebView 的瞬间，uiautomator 可能短暂保留上一页的
+    # hunyuan-bot/__next 和任务文本。首页 Activity 本身不是福利页，不能用这棵
+    # 滞后树短路后续导航，否则会一直读取旧的 1/3 进度而不重新打开福利中心。
+    home_activity = "home.v2.ybhomeactivityv2" in activity_lower
     task_row_markers = tuple(
         marker.lower()
         for markers in TASK_ENTRY_ROW_MARKERS.values()
@@ -324,9 +432,9 @@ def detect_stage(nodes: Iterable[Node], activity: str) -> str:
         any(marker in node.searchable for marker in task_row_markers)
         for node in visible_nodes
     )
-    has_welfare_catalog = task_row_count >= 2 or (
+    has_welfare_catalog = not home_activity and (task_row_count >= 2 or (
         task_row_count >= 1 and "当日凌晨0点更新任务" in text
-    ) or any(marker.lower() in text for marker in LEGACY_DAILY_QUESTION_MARKERS)
+    ) or any(marker.lower() in text for marker in LEGACY_DAILY_QUESTION_MARKERS))
     # 更新遮罩里的功能说明也会出现“拍题”等词，必须先标为应用阻塞层。
     if any(
         node.resource_id.endswith(":id/upgrade_dialog")
@@ -362,7 +470,7 @@ def detect_stage(nodes: Iterable[Node], activity: str) -> str:
         for node in visible_nodes
         if node.text.strip()
     }
-    if is_new_welfare_webview(visible_nodes, activity):
+    if not home_activity and is_new_welfare_webview(visible_nodes, activity):
         # 新版页面的积分栏也带“兑换商城”，但能力站/任务目录才是福利页的
         # 正向证据。真实商城没有这些能力站或每日任务语义时再进入 exchange。
         return "welfare"
@@ -383,11 +491,11 @@ def detect_stage(nodes: Iterable[Node], activity: str) -> str:
     # 具体能力页，随后本地执行器会在错误页面上调用图片选择器。任务目录标题
     # 或多条任务行同时出现时，优先保留福利页语义；真正进入能力页后不会出现
     # 这些完整的任务行标题。
-    if task_row_count >= 2 or (
+    if not home_activity and (task_row_count >= 2 or (
         task_row_count >= 1 and "当日凌晨0点更新任务" in text
-    ):
+    )):
         return "welfare"
-    if any(
+    if not home_activity and any(
         marker in text
         for marker in (
             "每日问元宝得积分",
@@ -399,7 +507,7 @@ def detect_stage(nodes: Iterable[Node], activity: str) -> str:
         )
     ):
         return "welfare"
-    if "兑换商城" in text or "qq超级会员3天卡" in text:
+    if not home_activity and ("兑换商城" in text or "qq超级会员3天卡" in text):
         return "exchange"
     # “我们”页的抽屉中有精确的“福利中心”入口和“任务”菜单；聊天首页的福利横幅
     # （“元宝福利中心”“做任务、得积分、兑福利”）必须排除，否则会被误判为“我们”页。

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from typing import Any
-from typing import Any, Iterable
-from dataclasses import dataclass, field, replace
+from typing import Iterable
+from dataclasses import replace
 import time
 
 from .constants import (
+    ATTACHMENT_SHEET_DISMISS_ATTEMPTS,
+    ATTACHMENT_SHEET_SETTLE_ATTEMPTS,
+    ATTACHMENT_SHEET_SETTLE_INTERVAL,
     DAILY_ABILITY_VERIFY_PREPARE_TIMEOUT,
     PACKAGE_NAME,
     STARTUP_OBSERVE_POLL_INTERVAL,
@@ -37,6 +40,7 @@ from .ui import (
     find_node,
     node_interaction_bounds,
     parse_nodes,
+    png_pixel,
 )
 from .welfare import (
     daily_ability_card_status,
@@ -50,6 +54,13 @@ from .welfare import (
 
 class ExecutorObservationMixin:
     """按职责拆分的混入类；方法实现与原主类完全一致。"""
+
+    def _initial_observation(self) -> Observation:
+        """返回本轮动作开始时的观测；没有缓存时重新观测。"""
+        cached = getattr(self, "_step_observation", None)
+        if isinstance(cached, Observation):
+            return cached
+        return self.observe()
 
     def observe(self) -> Observation:
         # Waydroid/Android 某些实例首次启动应用时会弹出系统兼容性提示；
@@ -374,20 +385,152 @@ class ExecutorObservationMixin:
 
     def _dismiss_chat_attachment_sheet(self, observation: Observation) -> bool:
         """仅当聊天页附件面板的多个专属入口同时可见时收起该面板。"""
+        if not self._chat_attachment_sheet_visible(observation):
+            return False
+        current = observation
+        for attempt in range(ATTACHMENT_SHEET_DISMISS_ATTEMPTS):
+            # 返回键优先处理键盘/输入浮层；页面重绘较慢时，下面的有限轮询会
+            # 等到无障碍树和截图都切换后再继续发送。
+            self.device.input("keyevent", "KEYCODE_BACK")
+            current = self._wait_for_attachment_sheet_settle(current)
+            if not self._chat_attachment_sheet_visible(current):
+                print("已确认聊天页附件面板收起")
+                return True
+            point = self._chat_attachment_backdrop_point(
+                current, self.width, self.height
+            )
+            if point is not None:
+                self._tap_point(*point)
+                current = self._wait_for_attachment_sheet_settle(current)
+                if not self._chat_attachment_sheet_visible(current):
+                    print("已确认聊天页附件面板收起")
+                    return True
+            if self._chat_attachment_sheet_visible(current):
+                current = self._drag_chat_attachment_sheet_down(current)
+                if not self._chat_attachment_sheet_visible(current):
+                    print("已确认聊天页附件面板收起")
+                    return True
+            if attempt + 1 < ATTACHMENT_SHEET_DISMISS_ATTEMPTS:
+                print(
+                    "附件面板仍可见，继续尝试收起"
+                    f"（{attempt + 2}/{ATTACHMENT_SHEET_DISMISS_ATTEMPTS}）"
+                )
+        print("返回键和面板外点击后附件面板仍可见")
+        return True
+
+
+    def _wait_for_attachment_sheet_settle(self, observation: Observation) -> Observation:
+        """等待附件面板状态稳定，避免把延迟无障碍树当成关闭失败。"""
+        current = observation
+        hidden_streak = 0
+        for _ in range(ATTACHMENT_SHEET_SETTLE_ATTEMPTS):
+            time.sleep(ATTACHMENT_SHEET_SETTLE_INTERVAL)
+            current = self.observe()
+            if self._chat_attachment_sheet_visible(current):
+                hidden_streak = 0
+                continue
+            # 无论无障碍节点是否暂时消失，都要求连续两次确认，防止关闭动画
+            # 中短暂隐藏后面板重新弹回。
+            hidden_streak += 1
+            if hidden_streak >= 2:
+                break
+        return current
+
+
+    def _drag_chat_attachment_sheet_down(self, observation: Observation) -> Observation:
+        """从当前面板横杆向下拖动，并返回拖动后的稳定观测。"""
+        marker_nodes = self._chat_attachment_marker_nodes(observation)
+        if len(marker_nodes) < 2:
+            return observation
+        handle_y = max(
+            40,
+            min(self.height - 1, min(node.bounds.top for node in marker_nodes) - 30),
+        )
+        self.device.input(
+            "swipe",
+            str(self.width // 2),
+            str(handle_y),
+            str(self.width // 2),
+            str(max(handle_y + 200, self.height - 100)),
+            "800",
+        )
+        return self._wait_for_attachment_sheet_settle(observation)
+
+
+    def _chat_attachment_sheet_visible(self, observation: Observation) -> bool:
+        """通过附件面板独有的多个可见入口判断遮挡层是否仍在。"""
         if observation.stage not in {"chat", "app"}:
             return False
-        visible_text = " ".join(
-            node.searchable
-            for node in observation.nodes
-            if node.enabled and node.bounds.area > 0
-        )
-        markers = ("进入相册", "联网搜索", "添加文件")
-        if sum(marker in visible_text for marker in markers) < 2:
+        marker_nodes = self._chat_attachment_marker_nodes(observation)
+        if len(marker_nodes) < 2:
             return False
-        self.device.input("keyevent", "KEYCODE_BACK")
-        time.sleep(0.4)
-        print("已收起聊天页附件面板，继续福利中心导航")
-        return True
+        # WebView 返回聊天页后，无障碍树可能永久残留附件面板节点；最新截图
+        # 若已经恢复正常聊天背景，则这些节点只是滞后快照，不能继续拦截发送。
+        visual_state = self._chat_attachment_sheet_visual_state(observation, marker_nodes)
+        return visual_state is not False
+
+
+    @staticmethod
+    def _chat_attachment_marker_nodes(observation: Observation) -> list[Node]:
+        markers = ("进入相册", "联网搜索", "添加文件")
+        return [
+            node
+            for node in observation.nodes
+            if node.enabled
+            and node.bounds.area > 0
+            and any(marker in node.searchable for marker in markers)
+        ]
+
+
+    def _chat_attachment_sheet_visual_state(
+        self, observation: Observation, marker_nodes: list[Node] | None = None
+    ) -> bool | None:
+        """用截图判断附件面板是否仍覆盖聊天页；None 表示无法判断。"""
+        marker_nodes = marker_nodes or self._chat_attachment_marker_nodes(observation)
+        if len(marker_nodes) < 2 or not observation.image:
+            return None
+        panel_top = min(node.bounds.top for node in marker_nodes)
+        top_y = max(40, panel_top - 240)
+        panel_y = min(self.height - 1, panel_top + 300)
+        top = png_pixel(observation.image, self.width // 2, top_y)
+        panel = png_pixel(observation.image, self.width // 2, panel_y)
+        if top is None or panel is None:
+            return None
+        background_luma = sum(top[:3])
+        panel_luma = sum(panel[:3])
+        # 元宝底部面板打开时会把聊天背景压暗，面板本身略亮；正常聊天页
+        # 两个采样区亮度基本一致。阈值留出文字和抗锯齿的波动空间。
+        if panel_luma - background_luma >= 6:
+            return True
+        if panel_luma - background_luma <= 3:
+            return False
+        return None
+
+
+    def _chat_attachment_backdrop_point(
+        self, observation: Observation, width: int, height: int
+    ) -> tuple[int, int] | None:
+        """依据附件面板可见入口的位置，在面板上方选择无遮挡的遮罩区域。"""
+        marker_nodes = self._chat_attachment_marker_nodes(observation)
+        if len(marker_nodes) < 2:
+            return None
+        panel_top = min(node.bounds.top for node in marker_nodes)
+        center_x = width // 2
+        for offset in (40, 64, 88, 112):
+            y = panel_top - offset
+            if not 0 < y < height:
+                continue
+            covered_by_control = any(
+                node.enabled
+                and node.clickable
+                and node.bounds.area <= width * height // 4
+                and node.bounds.left <= center_x <= node.bounds.right
+                and node.bounds.top <= y <= node.bounds.bottom
+                for node in observation.nodes
+            )
+            if not covered_by_control:
+                return center_x, y
+        return None
 
 
     def _entry_evidence(self, observation: Observation) -> dict[str, Any]:
@@ -580,7 +723,11 @@ class ExecutorObservationMixin:
                 "新版福利每日任务目录尚不完整，继续滚动定位"
                 f"（{attempt + 1}/{WELFARE_TASK_CATALOG_SCROLL_MAX_ATTEMPTS}）"
             )
-        raise AgentError("滚动后仍无法从福利页面读取写作、拍题和P图三项每日任务")
+        # 有界滚动后仍未读全目录时，不能把缺失任务推断成已完成或未提供。
+        # 保留最新截图交给视觉模型读取；强制任务模式会继续尝试全部固定任务。
+        self._welfare_task_catalog_scrolled = True
+        print("福利页面滚动后任务目录仍不完整，保留当前截图交由视觉模型读取")
+        return observation
 
 
     def _tap_node(self, node: Node) -> None:

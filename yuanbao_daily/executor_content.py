@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from typing import Any
-from typing import Any, Iterable
+from typing import Iterable
 from pathlib import Path
 import contextlib
+import hashlib
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -19,6 +21,11 @@ from .constants import (
     DAILY_ABILITY_EXPERIENCE_NAVIGATION_MARKERS,
     DAILY_ABILITY_EXPERIENCE_NAVIGATION_POLL_INTERVAL,
     DAILY_ABILITY_EXPERIENCE_NAVIGATION_TIMEOUT,
+    DAILY_ABILITY_TOP_BUTTON_X_RATIO,
+    DAILY_ABILITY_TOP_BUTTON_Y_RATIO,
+    DAILY_ABILITY_VOICE_BUTTON_X_RATIO,
+    DAILY_ABILITY_VOICE_BUTTON_Y_RATIO,
+    PACKAGE_NAME,
 )
 from .errors import (
     AgentError,
@@ -32,6 +39,7 @@ from .ui import (
     encode_adb_input_text,
     find_node,
     node_interaction_bounds,
+    png_pixel,
 )
 from .welfare import (
     is_daily_ability_experience_visible,
@@ -41,7 +49,73 @@ from .welfare import (
 class ExecutorContentMixin:
     """按职责拆分的混入类；方法实现与原主类完全一致。"""
 
+    @staticmethod
+    def _stale_welfare_tree(observation: Observation) -> bool:
+        """识别聊天截图已切换但无障碍树仍停留福利页的竞态。"""
+        return any(
+            node.resource_id.rsplit("/", 1)[-1] in {"hunyuan-bot", "__next"}
+            for node in observation.nodes
+        )
+
+    def _refresh_stale_chat_surface(self, observation: Observation) -> Observation:
+        """关闭残留浮层并重新读取聊天页，避免发送箭头被旧面板吞掉。"""
+        if not self._stale_welfare_tree(observation):
+            return observation
+        self.device.input("keyevent", "KEYCODE_BACK")
+        time.sleep(0.4)
+        return self.observe()
+
+    def _start_new_question_chat(self, observation: Observation) -> Observation:
+        """趣问每轮新建空白会话，避免沿用上一轮消息和附件面板。"""
+        variant = getattr(self, "prompt_variant", None)
+        if (
+            not variant
+            or not variant.startswith("question-")
+            or observation.stage not in {"chat", "app"}
+        ):
+            return observation
+        marker = find_node(observation.nodes, "新建对话", exact=True)
+        if marker is None:
+            activity = observation.activity.lower()
+            if PACKAGE_NAME not in activity and "home.v2." not in activity:
+                return observation
+            self._tap_point(self.width - 72, 105)
+            time.sleep(0.8)
+            print("趣问任务按新版聊天首页右上角入口新建空白对话")
+            return self.observe()
+        marker_bounds = marker.interaction_bounds
+        parents = [
+            node
+            for node in observation.nodes
+            if node.enabled
+            and node.clickable
+            and node.bounds.area >= marker_bounds.area
+            and node.bounds.left <= marker_bounds.center[0] <= node.bounds.right
+            and node.bounds.top <= marker_bounds.center[1] <= node.bounds.bottom
+        ]
+        target = min(parents, key=lambda node: node.bounds.area, default=None)
+        if target is None:
+            self._tap_point(self.width - 72, 105)
+            time.sleep(0.8)
+            print("趣问任务按新版聊天首页右上角入口新建空白对话")
+            return self.observe()
+        self._tap_node(target)
+        time.sleep(0.8)
+        print("趣问任务已新建空白对话，避免复用上一轮会话")
+        return self.observe()
+
     def _input_fixed_prompt(self, observation: Observation) -> ToolResult:
+        observation = self._refresh_stale_chat_surface(observation)
+        # 从拍题/P图返回后，聊天页可能仍打开附件面板；面板会覆盖发送箭头，
+        # 导致“发送成功”其实没有提交消息，福利计数也不会增长。
+        if self._dismiss_chat_attachment_sheet(observation):
+            observation = self.observe()
+            if self._chat_attachment_sheet_visible(observation):
+                return self._result(
+                    False,
+                    "聊天页附件面板未能收起，已停止输入以避免误触面板控件",
+                    stage=observation.stage,
+                )
         if observation.stage == "activity":
             # 福利入口可能误触活动横幅；input 阶段先关回福利中心，让外层重新
             # 定位真正的任务入口，而不是在活动页上等待输入框直到熔断。
@@ -186,11 +260,15 @@ class ExecutorContentMixin:
                 )
             ]
             if anchored:
-                return min(
+                # Compose 输入栏会同时暴露加号容器和真正的发送按钮；两者
+                # 纵向中心可能相同，优先按最右侧控件选择发送箭头，避免
+                # 把附件面板再次打开。
+                return max(
                     anchored,
                     key=lambda node: (
-                        abs(node.bounds.center[1] - input_bounds.center[1]),
+                        node.bounds.right,
                         -node.bounds.area,
+                        -abs(node.bounds.center[1] - input_bounds.center[1]),
                     ),
                 )
             return None
@@ -222,7 +300,27 @@ class ExecutorContentMixin:
     def _fixed_prompt(self) -> str:
         value = self.config.test_prompt
         variant = getattr(self, "prompt_variant", None)
-        return f"{value} {variant}" if variant else value
+        if not variant:
+            return value
+        if variant.startswith("question-"):
+            # 趣问必须保持自然问句正文。内部重试标记只用于生成不同题目，
+            # 不发送给元宝，避免额外后缀影响任务识别。
+            value = value.rstrip()
+            if re.match(r"What is \d+\s*(?:\+|plus)\s*\d+\?", value):
+                seed = int(hashlib.sha256(variant.encode("utf-8")).hexdigest()[:8], 16)
+                # 趣问需要不同题目避免被元宝去重；每题都要求最短回答，
+                # 减少等待生成的时间。
+                natural_questions = (
+                    "Answer with one number: what is 3+5?",
+                    "Answer with one word: name a primary color?",
+                    "Answer with one number: what is 9-4?",
+                    "Answer in one short sentence: give one tip to save water?",
+                    "Answer with one number: what is 6+7?",
+                    "Answer with one word: name a healthy fruit?",
+                )
+                return natural_questions[seed % len(natural_questions)]
+            return value
+        return f"{value} {variant}"
 
 
     def _wait_generation(self) -> ToolResult:
@@ -269,10 +367,39 @@ class ExecutorContentMixin:
             return self._result(False, "消息仍可能在生成，必须先调用 wait_5s 等待右下角终止按钮消失")
         return None
 
+    def set_task_context(self, kind: str | None, expected_count: int | None) -> None:
+        """记录当前图片任务轮次，允许P图更换脱敏图片变体而保持拍题用题目图。"""
+        context = (kind, expected_count)
+        previous = (
+            getattr(self, "current_task_kind", None),
+            getattr(self, "current_task_expected_count", None),
+        )
+        self.current_task_kind = kind
+        self.current_task_expected_count = expected_count
+        if context != previous:
+            self.image_pushed = False
+            self.image_attempt_serial = 0
+        if kind == "image":
+            self.image_attempt_serial = getattr(self, "image_attempt_serial", 0) + 1
+
+    def _current_test_image_path(self) -> Path:
+        config = getattr(self, "config", None)
+        path = getattr(config, "test_image_path", Path("测试题目.png"))
+        if getattr(self, "current_task_kind", None) != "image":
+            return path
+        count = int(getattr(self, "current_task_expected_count", 1) or 1)
+        attempt = int(getattr(self, "image_attempt_serial", 0) or 0)
+        variant_index = max(count - 1, attempt)
+        if variant_index <= 0:
+            return path
+        variant = path.with_name(f"{path.stem}-变体{variant_index}{path.suffix}")
+        return variant if variant.is_file() else path
+
 
     def _ensure_picker_image(self) -> ToolResult:
+        image_path = self._current_test_image_path()
         if not self.image_pushed:
-            self.device.push_image(self.config.test_image_path)
+            self.device.push_image(image_path)
             self.image_pushed = True
             time.sleep(1)
         observation = self.observe()
@@ -415,11 +542,46 @@ class ExecutorContentMixin:
     def _daily_ability_click_point(
         self, args: dict[str, Any], observation: Observation
     ) -> tuple[int, int] | None:
-        """定位固定主卡槽位中的“去体验”，忽略轮播内容和卡片颜色。"""
+        """定位主轮播卡行动按钮，兼容“AI录音笔”的“去提问”文案。"""
         if observation.stage != "welfare" or self.width <= 0 or self.height <= 0:
             return None
         if args.get("button_visible") is not True:
             return None
+
+        if args.get("top_card_visible") is True or args.get("voice_card_visible") is True:
+            voice_actions = [
+                node
+                for node in observation.nodes
+                if node.enabled
+                and node.text.strip() in {"去提问", "去体验"}
+                and node.bounds.area > 0
+                and node.bounds.center[0] >= self.width * 0.65
+                and node.bounds.center[1] <= self.height * 0.45
+            ]
+            if voice_actions:
+                return min(
+                    voice_actions,
+                    key=lambda node: abs(node.bounds.center[1] - self.height * DAILY_ABILITY_VOICE_BUTTON_Y_RATIO),
+                ).bounds.center
+            # WebView 无障碍树可能为空，但顶部主卡的行动槽位仍可由截图确认。
+            return (
+                round(
+                    self.width
+                    * (
+                        DAILY_ABILITY_VOICE_BUTTON_X_RATIO
+                        if args.get("voice_card_visible") is True
+                        else DAILY_ABILITY_TOP_BUTTON_X_RATIO
+                    )
+                ),
+                round(
+                    self.height
+                    * (
+                        DAILY_ABILITY_VOICE_BUTTON_Y_RATIO
+                        if args.get("voice_card_visible") is True
+                        else DAILY_ABILITY_TOP_BUTTON_Y_RATIO
+                    )
+                ),
+            )
 
         target_x = round(self.width * DAILY_ABILITY_BUTTON_X_RATIO)
         target_y = round(self.height * DAILY_ABILITY_BUTTON_Y_RATIO)
@@ -456,6 +618,54 @@ class ExecutorContentMixin:
         # 当前截图确认主卡槽位显示“去体验”，执行器不采纳模型提供的坐标。
         return target_x, target_y
 
+    def _top_daily_ability_action_visible(self, observation: Observation) -> bool:
+        """用顶部主卡行动胶囊的截图像素识别 WebView 零层级入口。"""
+        if observation.stage != "welfare" or not observation.image:
+            return False
+        # 有可见无障碍节点时，页面可能同时存在趣问卡的“去提问”或签到区
+        # 的其它按钮；单个像素不足以证明顶部能力卡存在，只在层级完全为空
+        # 或仅剩零边界残留节点时启用截图兜底。
+        if any(
+            node.enabled
+            and node.bounds.area > 0
+            and (node.text.strip() or node.content_desc.strip())
+            for node in observation.nodes
+        ):
+            return False
+        # 取胶囊文字右侧的背景点，避开按钮中心可能出现的白色文案。
+        x = round(self.width * 0.90)
+        y = round(self.height * 0.25)
+        pixel = png_pixel(observation.image, x, y)
+        if pixel is None:
+            return False
+        red, green, blue = pixel[:3]
+        # 当前顶部行动胶囊为略亮的蓝灰色，福利页普通深色背景明显更暗；
+        # 只作为 VLM 未报告按钮时的有限兜底，不扩展到其它页面或坐标。
+        return 35 <= red <= 90 and green >= red + 5 and blue >= red + 8
+
+    def _top_daily_ability_completed_from_screenshot(
+        self, observation: Observation
+    ) -> bool:
+        """识别主卡右侧“今日已完成”灰色胶囊，兼容 WebView 零层级。"""
+        if observation.stage != "welfare" or not observation.image:
+            return False
+        if any(
+            node.enabled
+            and node.bounds.area > 0
+            and (node.text.strip() or node.content_desc.strip())
+            for node in observation.nodes
+        ):
+            return False
+        pixel = png_pixel(
+            observation.image,
+            round(self.width * 0.84),
+            round(self.height * DAILY_ABILITY_TOP_BUTTON_Y_RATIO),
+        )
+        if pixel is None:
+            return False
+        red, green, blue = pixel[:3]
+        return red >= 50 and green - red <= 12 and blue - red <= 15
+
 
     def _open_daily_ability(
         self, args: dict[str, Any], observation: Observation
@@ -463,18 +673,50 @@ class ExecutorContentMixin:
         """点击主轮播卡固定槽位的“去体验”，随后把体验页面交给视觉模型。"""
         self._welfare_context = True
         if observation.stage != "welfare":
+            # 每日服务可能从上次遗留的聊天会话启动。能力入口点击始终要求
+            # 福利页截图，因此先走已存在的确定性导航，再让下一轮重新识别卡片；
+            # 这次导航不计作能力入口缺席检查。
+            welfare = self._go_to_welfare()
+            if welfare.stage == "welfare":
+                self._welfare_context = True
+                return self._result(
+                    True,
+                    "当前页面原为聊天页，已返回福利中心；下一步重新识别主卡入口",
+                    stage="welfare",
+                    activity=welfare.activity,
+                    welfare_navigation_only=True,
+                )
             return self._result(
                 False,
-                f"主卡体验按钮要求福利页，当前阶段={observation.stage or '未知'}",
-                stage=observation.stage,
+                f"返回福利中心后仍未确认福利页（阶段={welfare.stage or '未知'}）",
+                stage=welfare.stage,
                 visual_replan=True,
             )
         if args.get("button_visible") is not True:
+            if self._top_daily_ability_action_visible(observation):
+                point = self._daily_ability_click_point(
+                    {"button_visible": True, "top_card_visible": True}, observation
+                )
+                if point is not None:
+                    print("截图确认顶部主卡行动入口，按固定主卡槽位继续体验")
+                    self._tap_point(*point)
+                    time.sleep(1.2)
+                    after = self.observe()
+                    return self._result(
+                        True,
+                        "已按截图确认顶部主卡行动入口，将当前体验页面交给视觉模型处理",
+                        stage=after.stage,
+                        ability_station_clicked=True,
+                        ability_station_evidence="top_carousel_action_clicked",
+                        experience_opened=after.stage != "welfare",
+                    )
             return self._result(
                 True,
                 "主轮播卡固定位置当前未确认显示‘去体验’，未点击",
                 stage=observation.stage,
+                activity=observation.activity,
                 ability_card_visible=False,
+                ability_card_checked=True,
             )
         point = self._daily_ability_click_point(args, observation)
         if point is None:
@@ -490,7 +732,11 @@ class ExecutorContentMixin:
         after = self.observe()
         return self._result(
             True,
-            "已点击主轮播卡‘去体验’，将当前体验页面交给视觉模型处理",
+            (
+                "已点击语音主轮播卡‘去提问’，将当前体验页面交给视觉模型处理"
+                if args.get("voice_card_visible") is True
+                else "已点击主轮播卡‘去体验’，将当前体验页面交给视觉模型处理"
+            ),
             stage=after.stage,
             ability_station_clicked=True,
             ability_station_evidence="main_carousel_experience_clicked",
